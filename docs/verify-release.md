@@ -68,8 +68,11 @@ Global verification settings can be overridden for a component:
 [verify.components.tuishou]
 signer_workflow = ".github/workflows/release.yml"
 
-[verify.components.lu-agent]
-signer_workflow = ".github/workflows/agent-release.yml"
+[verify.components.reiki]
+signer_workflow = ".github/workflows/release.yml"
+
+[verify.components.lu]
+signer_workflow = ".github/workflows/release.yml"
 ```
 
 An override changes only the expected signer workflow for that component; it does not

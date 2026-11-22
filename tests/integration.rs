@@ -284,8 +284,12 @@ fn wrong_checksum_fails() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("checksum mismatch"), "stderr={stderr}");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(output.contains("checksum mismatch"), "output={output}");
     assert!(!prefix.join("lu").exists());
 }
 
@@ -394,12 +398,16 @@ fn oversize_download_fails() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        stderr.contains("size limit")
-            || stderr.contains("too large")
-            || stderr.contains("exceeded"),
-        "stderr={stderr}"
+        output.contains("size limit")
+            || output.contains("too large")
+            || output.contains("exceeded"),
+        "output={output}"
     );
     assert!(!prefix.join("lu").exists());
 }
@@ -525,10 +533,14 @@ fn archive_path_traversal_rejected() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        stderr.contains("path traversal") || stderr.contains("archive"),
-        "stderr={stderr}"
+        output.contains("path traversal") || output.contains("archive"),
+        "output={output}"
     );
 }
 
@@ -580,10 +592,14 @@ fn archive_symlink_rejected() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(
-        stderr.contains("symlink") || stderr.contains("link") || stderr.contains("archive"),
-        "stderr={stderr}"
+        output.contains("symlink") || output.contains("link") || output.contains("archive"),
+        "output={output}"
     );
 }
 
@@ -877,8 +893,12 @@ fn major_version_refusal() {
         .output()
         .unwrap();
     assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--allow-major"), "stderr={stderr}");
+    let output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(output.contains("--allow-major"), "output={output}");
 }
 
 #[test]
@@ -905,159 +925,341 @@ fn unknown_config_key_errors() {
     );
 }
 
+fn route_for_default(
+    base: &str,
+    repo: &str,
+    tag: &str,
+    asset: &str,
+    archive: &[u8],
+) -> Vec<(String, Vec<u8>, String)> {
+    setup_release(base, repo, tag, asset, archive)
+}
+
 #[test]
-fn roll_plan_and_failure_stop() {
+fn bare_update_check_reports_every_default_in_table_order() {
     let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let td = tempfile::tempdir().unwrap();
     let home = td.path().join("home");
     fs::create_dir_all(&home).unwrap();
-    let bindir = td.path().join("bin");
-    fs::create_dir_all(&bindir).unwrap();
-    let log = td.path().join("log");
-
-    let fake_lu = bindir.join("lu");
-    // Real Lu 0.4 shape: `lu nodes --json` is an array of node objects; the
-    // version has no leading `v`. Drain/undrain are top-level commands.
-    let nodes = serde_json::json!([{
-        "name": "node1", "version": "0.5.0", "draining": true, "current_job": null,
-        "last_seen": "2026-01-01T00:00:00Z", "harness": "systemd", "labels": [],
-        "cordons": [], "cordon_details": [], "stuck": false, "load1": 0.0
-    }, {
-        "name": "node2", "version": "0.5.0", "draining": true, "current_job": null,
-        "last_seen": "2026-01-01T00:00:00Z", "harness": "systemd", "labels": [],
-        "cordons": [], "cordon_details": [], "stuck": false, "load1": 0.0
-    }, {
-        "name": "node3", "version": "0.5.0", "draining": true, "current_job": null,
-        "last_seen": "2026-01-01T00:00:00Z", "harness": "systemd", "labels": [],
-        "cordons": [], "cordon_details": [], "stuck": false, "load1": 0.0
-    }])
-    .to_string();
-    fs::write(
-        &fake_lu,
-        format!(
-            r#"#!/bin/sh
-echo "lu $@" >> {log}
-if [ "$1" = "nodes" ] && [ "$2" = "--json" ]; then
-  echo '{nodes}'
-  exit 0
-fi
-exit 0
-"#,
-            log = log.display(),
-            nodes = nodes
+    let prefix = td.path().join("prefix");
+    let target = current_target();
+    let tag = "v0.5.0";
+    let specs = [
+        (
+            "ddproxy/reiki",
+            format!("reiki-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("reiki", b"reiki", Some(0o755))]),
         ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake_lu, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-
-    let fake_ssh = bindir.join("ssh");
-    fs::write(
-        &fake_ssh,
-        format!(
-            r#"#!/bin/sh
-echo "ssh $@" >> {log}
-# fail on node2
-for a in "$@"; do
-  if [ "$a" = "node2" ]; then
-    echo "ssh failed" >&2
-    exit 1
-  fi
-done
-exit 0
-"#,
-            log = log.display()
+        (
+            "ddproxy/tuishou-lu",
+            format!("lu-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
         ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
-    }
+        (
+            "ddproxy/tuishou",
+            format!("tuishou-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("tuishou", b"tuishou", Some(0o755))]),
+        ),
+    ];
+    let server = FakeServer::start_with(|base| {
+        let mut routes = Vec::new();
+        for (repo, asset, archive) in &specs {
+            routes.extend(route_for_default(base, repo, tag, asset, archive));
+        }
+        routes
+    });
 
-    let inv = td.path().join("nodes.toml");
-    fs::write(
-        &inv,
-        r#"
-[[node]]
-name = "node1"
-ssh = "node1"
-unit = "lu-agent.service"
-
-[[node]]
-name = "node2"
-ssh = "node2"
-unit = "lu-agent.service"
-
-[[node]]
-name = "node3"
-ssh = "node3"
-unit = "lu-agent.service"
-"#,
-    )
-    .unwrap();
-
-    let path = format!(
-        "{}:{}",
-        bindir.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-
-    // dry-run plan
-    let out = tuishou_cmd()
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("PATH", &path)
-        .args(["roll", "--nodes"])
-        .arg(&inv)
-        .args([
-            "--component",
-            "lu",
-            "--version",
-            "v0.5.0",
-            "--dry-run",
-            "--json",
-        ])
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home);
+    let out = cmd
+        .args(["update", "--check", "--prefix"])
+        .arg(&prefix)
         .output()
         .unwrap();
-    assert!(
-        out.status.success(),
-        "stderr={}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("node1") && stdout.contains("node2") && stdout.contains("node3"));
+    assert_eq!(out.status.code(), Some(0), "stdout={stdout}");
+    let reiki = stdout
+        .find("reiki: not installed (latest v0.5.0)")
+        .expect(&stdout);
+    let lu = stdout
+        .find("lu: not installed (latest v0.5.0)")
+        .expect(&stdout);
+    let tuishou = stdout
+        .find("tuishou: not installed (latest v0.5.0)")
+        .expect(&stdout);
+    assert!(reiki < lu && lu < tuishou, "order wrong: {stdout}");
+}
 
-    // actual roll - should fail on node2 and not touch node3
-    let _ = fs::remove_file(&log);
-    let out = tuishou_cmd()
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("PATH", &path)
-        .args(["roll", "--nodes"])
-        .arg(&inv)
-        .args(["--component", "lu", "--version", "v0.5.0"])
-        .output()
-        .unwrap();
-    assert!(
-        !out.status.success(),
-        "stdout={} stderr={}",
+#[test]
+fn unknown_component_is_a_usage_error_listing_known_names() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let mut cmd = tuishou_cmd();
+    cmd.env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join(".local/state"));
+    let out = cmd.args(["update", "nope", "--check"]).output().unwrap();
+    let combined = format!(
+        "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let log_text = fs::read_to_string(&log).unwrap_or_default();
-    assert!(log_text.contains("lu drain node1"), "log={log_text}");
-    assert!(log_text.contains("lu nodes --json"), "log={log_text}");
-    assert!(log_text.contains("lu drain node2"), "log={log_text}");
-    // node3 must not be touched when a preceding node fails.
-    assert!(!log_text.contains("lu drain node3"), "log={log_text}");
-    // No legacy Lu 0.3 command forms may appear in the roll.
-    assert!(!log_text.contains("lu node "), "log={log_text}");
-    assert!(!log_text.contains("lu node drain"), "log={log_text}");
-    assert!(!log_text.contains("lu node undrain"), "log={log_text}");
-    assert!(!log_text.contains("lu job list"), "log={log_text}");
+    assert_eq!(out.status.code(), Some(2), "{combined}");
+    assert!(combined.contains("unknown component 'nope'"), "{combined}");
+    for name in ["reiki", "lu", "tuishou"] {
+        assert!(combined.contains(name), "{combined}");
+    }
+}
+
+#[test]
+fn check_reports_all_components_when_one_evaluation_fails() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let prefix = td.path().join("prefix");
+    let target = current_target();
+    let tag = "v0.5.0";
+    let specs = [
+        (
+            "ddproxy/tuishou-lu",
+            format!("lu-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
+        ),
+        (
+            "ddproxy/tuishou",
+            format!("tuishou-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("tuishou", b"tuishou", Some(0o755))]),
+        ),
+    ];
+    // No routes for reiki: its evaluation fails while the others still report.
+    let server = FakeServer::start_with(|base| {
+        let mut routes = Vec::new();
+        for (repo, asset, archive) in &specs {
+            routes.extend(route_for_default(base, repo, tag, asset, archive));
+        }
+        routes
+    });
+
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home);
+    let out = cmd
+        .args(["update", "--check", "--prefix"])
+        .arg(&prefix)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout={stdout}");
+    assert!(stdout.contains("reiki: failed ("), "{stdout}");
+    assert!(
+        stdout.contains("lu: not installed (latest v0.5.0)"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("tuishou: not installed (latest v0.5.0)"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn explicit_update_installs_a_not_installed_component() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let prefix = td.path().join("prefix");
+    let target = current_target();
+    let tag = "v0.5.0";
+    let asset = format!("lu-{tag}-{target}.tar.gz");
+    let archive = make_tar_gz(&[("lu", b"new lu", Some(0o755))]);
+    let server = FakeServer::start_with(|base| {
+        setup_release(base, "ddproxy/tuishou-lu", tag, &asset, &archive)
+    });
+
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home);
+    let out = cmd
+        .args(["update", "lu", "--prefix"])
+        .arg(&prefix)
+        .arg("--allow-unattested")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout={stdout}");
+    assert!(stdout.contains("lu: updated - -> v0.5.0"), "{stdout}");
+    assert_eq!(fs::read(prefix.join("lu")).unwrap(), b"new lu");
+}
+
+#[test]
+fn install_all_reports_missing_binaries_without_failing() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let prefix = td.path().join("prefix");
+    let target = current_target();
+    let tag = "v0.5.0";
+    let specs = [
+        (
+            "ddproxy/reiki",
+            format!("reiki-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("other", b"x", Some(0o755))]),
+        ),
+        (
+            "ddproxy/tuishou-lu",
+            format!("lu-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
+        ),
+        (
+            "ddproxy/tuishou",
+            format!("tuishou-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("tuishou", b"tuishou", Some(0o755))]),
+        ),
+    ];
+    let server = FakeServer::start_with(|base| {
+        let mut routes = Vec::new();
+        for (repo, asset, archive) in &specs {
+            routes.extend(route_for_default(base, repo, tag, asset, archive));
+        }
+        routes
+    });
+
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home);
+    let out = cmd
+        .args(["install", "all", "--prefix"])
+        .arg(&prefix)
+        .arg("--allow-unattested")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("reiki: not in this release (archive lacks: reiki)"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("lu: updated - -> v0.5.0"), "{stdout}");
+    assert!(stdout.contains("tuishou: updated - -> v0.5.0"), "{stdout}");
+    assert!(!prefix.join("reiki").exists());
+    assert!(prefix.join("lu").exists());
+    assert!(prefix.join("tuishou").exists());
+}
+
+#[test]
+fn group_writable_config_is_refused() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let config = td.path().join("tuishou.toml");
+    fs::write(&config, "[auto_update]\nenabled = true\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&config, fs::Permissions::from_mode(0o664)).unwrap();
+    }
+
+    let mut cmd = tuishou_cmd();
+    let out = cmd
+        .current_dir(td.path())
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .args(["status"])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{combined}");
+    assert!(combined.contains("untrusted config"), "{combined}");
+}
+
+#[test]
+fn component_repo_override_is_refused() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    fs::write(
+        td.path().join("tuishou.toml"),
+        "[[component]]\nname = \"lu\"\nrepo = \"evil/example\"\n",
+    )
+    .unwrap();
+
+    let mut cmd = tuishou_cmd();
+    let out = cmd
+        .current_dir(td.path())
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .args(["status"])
+        .output()
+        .unwrap();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!out.status.success(), "{combined}");
+    assert!(combined.contains("cannot override repo"), "{combined}");
+}
+
+#[test]
+fn removed_roll_command_is_unknown() {
+    let out = tuishou_cmd()
+        .args(["roll", "--nodes", "nodes.toml", "--dry-run"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("unrecognized subcommand"), "output={text}");
+}
+
+#[test]
+fn removed_roll_is_absent_from_completions_and_man_page() {
+    for args in [vec!["completions", "bash"], vec!["man"]] {
+        let out = tuishou_cmd().args(args).output().unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        assert!(!text.contains("roll --nodes"), "output={text}");
+        assert!(!text.contains("--nodes"), "output={text}");
+        assert!(!text.contains("over ssh"), "output={text}");
+    }
+}
+
+#[test]
+fn removed_roll_config_sections_are_unknown_keys() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    for text in [
+        "[roll]\nenabled = true\n",
+        "[ssh]\nport = 22\n",
+        "[inventory]\npath = \"nodes.toml\"\n",
+        "[[node]]\nname = \"n1\"\nssh = \"n1\"\nunit = \"lu-agent.service\"\n",
+    ] {
+        let td = tempfile::tempdir().unwrap();
+        let home = td.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(td.path().join("tuishou.toml"), text).unwrap();
+        let out = tuishou_cmd()
+            .current_dir(td.path())
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", home.join(".local/state"))
+            .args(["status"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "config={text}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("unknown config key"),
+            "config={text} stderr={stderr}"
+        );
+    }
 }

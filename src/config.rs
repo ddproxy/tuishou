@@ -4,6 +4,7 @@ use crate::error::{Error, Result};
 use crate::version;
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -15,6 +16,10 @@ pub struct ConfigFile {
 
     #[serde(default)]
     pub auto_update: AutoUpdateConfig,
+
+    /// Local controls shared by `update` and `auto-update`.
+    #[serde(default)]
+    pub update: UpdateConfig,
 
     #[serde(default)]
     pub verify: VerifyConfig,
@@ -133,10 +138,15 @@ impl VerifyConfig {
 #[serde(deny_unknown_fields)]
 pub struct ComponentConfig {
     pub name: String,
+    /// Rejected on override: downloads must come from each built-in component's
+    /// GitHub release assets, never from an operator-selected repository/host.
     pub repo: Option<String>,
+    /// Rejected on override for the same reason as `repo`.
     pub asset_pattern: Option<String>,
     pub binaries: Option<Vec<String>>,
     pub service_unit: Option<String>,
+    /// Config file inspected by components that own one (currently Reiki).
+    pub config_path: Option<PathBuf>,
     pub binary_ranges: Option<Vec<BinaryRange>>,
 }
 
@@ -216,6 +226,9 @@ pub struct AutoUpdateConfig {
     pub agent_unit: String,
     /// Controller systemd unit restarted after a verified controller update.
     pub controller_unit: String,
+    /// Overrides the Reiki config file checked before and after a restart.
+    /// The value on the `reiki` component wins when both are set.
+    pub reiki_config_path: Option<PathBuf>,
     /// Deadline for each individual `lu`/`systemctl` child process.
     pub command_timeout: String,
     /// Argument vector (never a shell string). The JSON summary is appended.
@@ -229,7 +242,7 @@ impl Default for AutoUpdateConfig {
             enabled: false,
             prefix: None,
             interval: "10m".to_string(),
-            components: vec!["lu".to_string(), "ting".to_string()],
+            components: vec!["reiki".to_string(), "lu".to_string(), "tuishou".to_string()],
             policy: AutoPolicy::Patch,
             min_release_age: "10m".to_string(),
             channel: Channel::Release,
@@ -245,6 +258,7 @@ impl Default for AutoUpdateConfig {
             node_name: None,
             agent_unit: "lu-agent.service".to_string(),
             controller_unit: "lu.service".to_string(),
+            reiki_config_path: None,
             command_timeout: "30s".to_string(),
             notify_command: Vec::new(),
             notify_after_failures: 3,
@@ -319,6 +333,40 @@ impl AutoUpdateConfig {
     }
 }
 
+/// Local update controls shared by `tuishou update` and `auto-update run`.
+/// Every node runs the update itself; these settings tune when it starts and
+/// whether the fleet has room for another update.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Wait a random duration up to this value before starting a cycle.
+    pub start_delay_max: String,
+    /// Skip a cycle when this many nodes are already draining or offline.
+    pub max_unavailable: Option<usize>,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            start_delay_max: "0".to_string(),
+            max_unavailable: None,
+        }
+    }
+}
+
+impl UpdateConfig {
+    pub fn validate(&self) -> Result<()> {
+        parse_duration(&self.start_delay_max).map_err(|e| {
+            Error::msg(format!(
+                "update.start_delay_max '{}': {e}",
+                self.start_delay_max
+            ))
+        })?;
+        Ok(())
+    }
+}
+
 pub fn default_config_path() -> PathBuf {
     PathBuf::from("tuishou.toml")
 }
@@ -327,10 +375,59 @@ pub fn default_config_path() -> PathBuf {
 pub struct LoadedConfig {
     pub components: Vec<Component>,
     pub auto_update: AutoUpdateConfig,
+    pub update: UpdateConfig,
     pub verify: VerifyConfig,
     /// Path of the config file as loaded; passed to child processes that read
     /// the same controller configuration (for example `lu backup --config`).
     pub config_path: PathBuf,
+}
+
+/// Effective UID of the running process. `/proc/self` is owned by the process
+/// owner on Linux and avoids adding a libc dependency just for `geteuid()`.
+#[cfg(target_os = "linux")]
+fn current_uid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata("/proc/self").ok().map(|m| m.uid())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
+/// Refuse configs that another user can influence. Root-owned configs stay
+/// usable from unprivileged nodes (a common deployment pattern), but group or
+/// other write bits are never acceptable.
+fn check_config_trust(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::metadata(path).map_err(|source| Error::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mode = metadata.mode();
+        if mode & 0o022 != 0 {
+            return Err(Error::ConfigTrust {
+                path: path.to_path_buf(),
+                reason: "must not be writable by group or others".to_string(),
+            });
+        }
+        let owner = metadata.uid();
+        if let Some(uid) = current_uid() {
+            if owner != uid && owner != 0 {
+                return Err(Error::ConfigTrust {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "owner uid {owner} is neither the running user ({uid}) nor root"
+                    ),
+                });
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
@@ -338,6 +435,9 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
     let path = config_path
         .map(PathBuf::from)
         .unwrap_or_else(default_config_path);
+    if path.exists() {
+        check_config_trust(&path)?;
+    }
     let cfg: ConfigFile = if !path.exists() {
         if config_path.is_some() {
             return Err(Error::Read {
@@ -348,6 +448,7 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
         ConfigFile {
             component: Vec::new(),
             auto_update: AutoUpdateConfig::default(),
+            update: UpdateConfig::default(),
             verify: VerifyConfig::default(),
         }
     } else {
@@ -361,50 +462,45 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
         path: path.clone(),
         source: Box::new(e),
     })?;
+    cfg.update.validate().map_err(|e| Error::Config {
+        path: path.clone(),
+        source: Box::new(e),
+    })?;
+    let known = components
+        .iter()
+        .map(|c| c.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ");
     for o in cfg.component {
-        if let Some(existing) = components.iter_mut().find(|c| c.name == o.name) {
-            if let Some(repo) = o.repo {
-                existing.repo = repo;
-            }
-            if let Some(asset_pattern) = o.asset_pattern {
-                existing.asset_pattern = asset_pattern;
-            }
-            if let Some(binaries) = o.binaries {
-                existing.binaries = binaries;
-            }
-            if let Some(binary_ranges) = o.binary_ranges {
-                existing.binary_ranges = binary_ranges;
-            }
-            if o.service_unit.is_some() {
-                existing.service_unit = o.service_unit;
-            }
-        } else {
-            let repo = o.repo.ok_or_else(|| Error::Config {
-                path: path.clone(),
-                source: Box::new(Error::msg(format!("component '{}' missing repo", o.name))),
-            })?;
-            let asset_pattern = o.asset_pattern.ok_or_else(|| Error::Config {
+        if o.repo.is_some() || o.asset_pattern.is_some() {
+            return Err(Error::Config {
                 path: path.clone(),
                 source: Box::new(Error::msg(format!(
-                    "component '{}' missing asset_pattern",
+                    "component '{}' cannot override repo or asset_pattern: downloads come only from built-in GitHub release assets",
                     o.name
                 ))),
-            })?;
-            let binaries = o.binaries.ok_or_else(|| Error::Config {
-                path: path.clone(),
-                source: Box::new(Error::msg(format!(
-                    "component '{}' missing binaries",
-                    o.name
-                ))),
-            })?;
-            components.push(Component {
-                name: o.name,
-                repo,
-                asset_pattern,
-                binaries,
-                service_unit: o.service_unit,
-                binary_ranges: o.binary_ranges.unwrap_or_default(),
             });
+        }
+        let Some(existing) = components.iter_mut().find(|c| c.name == o.name) else {
+            return Err(Error::Config {
+                path: path.clone(),
+                source: Box::new(Error::msg(format!(
+                    "unknown component '{}'; known components: {known}",
+                    o.name
+                ))),
+            });
+        };
+        if let Some(binaries) = o.binaries {
+            existing.binaries = binaries;
+        }
+        if let Some(binary_ranges) = o.binary_ranges {
+            existing.binary_ranges = binary_ranges;
+        }
+        if o.service_unit.is_some() {
+            existing.service_unit = o.service_unit;
+        }
+        if o.config_path.is_some() {
+            existing.config_path = o.config_path;
         }
     }
     cfg.verify
@@ -416,6 +512,7 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
     Ok(LoadedConfig {
         components,
         auto_update: cfg.auto_update,
+        update: cfg.update,
         verify: cfg.verify,
         config_path: path,
     })
@@ -470,6 +567,48 @@ mod tests {
     #[test]
     fn unknown_key_in_auto_update_section_is_rejected() {
         assert!(cfg("[auto_update]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn update_defaults_are_zero_delay_and_no_fleet_limit() {
+        let u = UpdateConfig::default();
+        assert_eq!(u.start_delay_max, "0");
+        assert_eq!(u.max_unavailable, None);
+        u.validate().unwrap();
+        let parsed = cfg("").unwrap();
+        assert_eq!(parsed.update.start_delay_max, "0");
+        assert_eq!(parsed.update.max_unavailable, None);
+    }
+
+    #[test]
+    fn update_section_parses_and_rejects_unknown_keys() {
+        let parsed = cfg("[update]\nstart_delay_max = \"10m\"\nmax_unavailable = 1\n").unwrap();
+        assert_eq!(parsed.update.start_delay_max, "10m");
+        assert_eq!(parsed.update.max_unavailable, Some(1));
+        assert!(cfg("[update]\nbogus = 1\n").is_err());
+        assert!(cfg("[update]\nstart_delay_max = \"later\"\n")
+            .unwrap()
+            .update
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("start_delay_max"));
+    }
+
+    #[test]
+    fn removed_remote_roll_config_sections_are_errors() {
+        for text in [
+            "[roll]\nenabled = true\n",
+            "[ssh]\nport = 22\n",
+            "[inventory]\npath = \"nodes.toml\"\n",
+            "[[node]]\nname = \"n1\"\nssh = \"n1\"\n",
+        ] {
+            let err = cfg(text).unwrap_err().to_string();
+            assert!(
+                err.contains("unknown") || err.contains("unknown field"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub struct NodeStatus {
     pub draining: Option<bool>,
     #[serde(default)]
     pub current_job: Option<serde_json::Value>,
+    #[serde(default)]
+    pub online: Option<bool>,
 }
 
 pub fn parse_nodes(json: &str) -> Result<Vec<NodeStatus>, String> {
@@ -40,6 +42,21 @@ pub fn nodes_report_drained(json: &str, node: &str) -> bool {
     find_node(json, node)
         .map(|n| node_is_drained(&n))
         .unwrap_or(false)
+}
+
+/// A node counts against the fleet limit while it is draining or reported
+/// offline. Unknown state fails closed: only an explicit `online: false` or
+/// `draining: true` is counted, so other node conditions do not block updates.
+pub fn node_is_unavailable(node: &NodeStatus) -> bool {
+    node.draining == Some(true) || node.online == Some(false)
+}
+
+/// Count unavailable nodes in the `lu nodes --json` payload.
+pub fn count_unavailable_nodes(json: &str) -> Result<usize, String> {
+    Ok(parse_nodes(json)?
+        .iter()
+        .filter(|n| node_is_unavailable(n))
+        .count())
 }
 
 pub fn normalize_version(value: &str) -> &str {
@@ -112,6 +129,19 @@ mod tests {
         assert!(!nodes_report_drained(NODES, "n5"));
         assert!(!nodes_report_drained(NODES, "missing"));
         assert!(!nodes_report_drained("{}", "n1"));
+    }
+
+    #[test]
+    fn unavailable_count_includes_draining_and_offline_nodes() {
+        assert_eq!(count_unavailable_nodes(NODES).unwrap(), 1);
+        let json = r#"[
+          {"name":"a","draining":true,"online":true},
+          {"name":"b","draining":false,"online":false},
+          {"name":"c","draining":false,"online":true},
+          {"name":"d"}
+        ]"#;
+        assert_eq!(count_unavailable_nodes(json).unwrap(), 2);
+        assert!(count_unavailable_nodes("not json").is_err());
     }
 
     #[test]

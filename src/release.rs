@@ -209,20 +209,6 @@ fn is_sha1(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-pub fn changelog_heading(body: &str, tag: &str) -> Option<String> {
-    let version = tag.strip_prefix('v').unwrap_or(tag);
-    for line in body.lines() {
-        let trimmed = line.trim();
-        if let Some(heading) = trimmed.strip_prefix('#') {
-            let heading = heading.trim_start_matches('#').trim();
-            if heading.contains(version) {
-                return Some(trimmed.to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

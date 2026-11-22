@@ -29,13 +29,21 @@ pub struct AutoState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComponentResult {
+    /// Fixed-vocabulary status phrase from `report::StatusText`.
     pub result: String,
+    /// Machine-readable form of `result`, used by `auto-update status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_eligible_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_binaries: Vec<String>,
     pub at: String,
 }
 

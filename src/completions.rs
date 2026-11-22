@@ -7,7 +7,6 @@ pub const COMMANDS: &[&str] = &[
     "update",
     "status",
     "rollback",
-    "roll",
     "self-update",
     "auto-update",
     "adopt",
@@ -24,7 +23,7 @@ const GLOBAL_OPTIONS: &[&str] = &[
     "--help",
     "--version",
 ];
-const COMPONENTS: &[&str] = &["lu", "ting", "tuishou", "all"];
+const COMPONENTS: &[&str] = &["reiki", "lu", "tuishou", "all"];
 const AUTO_ACTIONS: &[&str] = &[
     "run",
     "install-timer",
@@ -65,16 +64,6 @@ pub fn command_options(command: &str) -> &'static [&'static str] {
         "update" => &["--check", "--allow-major", "--allow-unattested", "--prefix"],
         "status" => &["--prefix"],
         "rollback" => &["--prefix"],
-        "roll" => &[
-            "--nodes",
-            "--component",
-            "--version",
-            "--batch",
-            "--dry-run",
-            "--force-after",
-            "--allow-major",
-            "--allow-unattested",
-        ],
         "self-update" => &[
             "--version",
             "--prefix",

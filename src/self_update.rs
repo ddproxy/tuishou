@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 pub const SELF_COMPONENT: &str = "tuishou";
 
-/// Component describing our own release archive. A user-supplied config entry
-/// with the same name may override the repository or asset pattern.
+/// Component describing our own release archive. The repository and asset are
+/// built in; a config entry with the same name may only change paths/policy.
 pub fn self_component(components: &[Component]) -> Component {
     components
         .iter()
@@ -18,6 +18,8 @@ pub fn self_component(components: &[Component]) -> Component {
             binaries: vec![SELF_COMPONENT.to_string()],
             service_unit: None,
             binary_ranges: Vec::new(),
+            config_path: None,
+            optional_binaries: Vec::new(),
         })
 }
 

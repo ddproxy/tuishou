@@ -32,7 +32,7 @@ complete -c tuishou -f -a '(__tuishou_complete)'
 
 pub const MAN_PAGE: &str = r#".TH TUISHOU 1 "tuishou" "tuishou" "User Commands"
 .SH NAME
-tuishou \- install, update and roll the Tuishou stack from GitHub releases
+tuishou \- install and update the Tuishou stack from GitHub releases
 .SH SYNOPSIS
 .B tuishou
 [\fIglobal options\fR]
@@ -43,6 +43,10 @@ tuishou \- install, update and roll the Tuishou stack from GitHub releases
 downloads release archives, verifies SHA-256 checksums and in-process Sigstore
 attestations, then installs or updates binaries atomically while keeping the
 previous binary as \fI<name>.prev\fR.
+.PP
+The built-in components are \fBreiki\fR (ddproxy/reiki), \fBlu\fR
+(ddproxy/tuishou-lu) and \fBtuishou\fR (ddproxy/tuishou), in that report order.
+See \fBdocs/components.md\fR for assets, binaries, units and health checks.
 .SH COMMANDS
 .TP
 .B install <component|all>
@@ -50,16 +54,21 @@ Install a component; supports \fB--version\fR, \fB--prefix\fR, \fB--dry-run\fR,
 \fB--allow-unattested\fR and \fB--allow-major\fR.
 .TP
 .B update [component|all]
-Update installed components; \fB--check\fR exits 10 when updates exist.
+Update components; a bare invocation means \fBall\fR. An unknown name is a usage
+error listing the known names. \fB--check\fR exits 0 when nothing installable is
+pending, 10 when an installed component has an installable update, 1 on an
+evaluation error and 2 for usage errors.
 .TP
 .B status
-Show installed and latest versions.
+Show one status line per built-in component in table order. Each line uses one
+fixed phrase: \fBup to date (vX)\fR, \fBupdate available vA -> vB\fR,
+\fBupdated vA -> vB\fR, \fBnot installed (latest vB)\fR,
+\fBnot in this release (archive lacks: <binaries>)\fR, \fBheld (reason)\fR,
+\fBbad version skipped (vX)\fR, \fBskipped (reason)\fR or \fBfailed (reason)\fR.
+\fB--json\fR carries the same data.
 .TP
 .B rollback <component>
 Restore the previous binary for a component.
-.TP
-.B roll --nodes <file|list>
-Run a controlled fleet roll over SSH.
 .TP
 .B self-update
 Update the \fBtuishou\fR binary itself from its own release archive.

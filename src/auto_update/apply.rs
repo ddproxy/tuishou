@@ -14,7 +14,7 @@ use crate::rollback;
 use crate::verify::AttestationVerifier;
 use crate::{lu, state};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::thread;
@@ -178,6 +178,121 @@ fn restart(runner: &dyn ApplyRunner, unit: &str, ctx: &ApplyContext<'_>) -> Resu
     Ok(())
 }
 
+fn drain_and_wait(runner: &dyn ApplyRunner, node: &str, ctx: &ApplyContext<'_>) -> Result<()> {
+    let cmd_timeout = command_timeout(ctx)?;
+    if let Err(e) = checked(runner, "lu", &["drain", node], cmd_timeout) {
+        let _ = undrain(runner, node, ctx);
+        return Err(Error::msg(format!(
+            "failed to drain node {node}: {}",
+            one_line(&e.to_string())
+        )));
+    }
+    journal("agent_drain", &[("node", node)]);
+
+    let drain_timeout = parse_duration(&ctx.cfg.drain_timeout)?;
+    let (drained, drain_error) = poll_until(drain_timeout, || {
+        match checked(runner, "lu", &["nodes", "--json"], cmd_timeout) {
+            Ok(out) => {
+                if lu::nodes_report_drained(&out.stdout, node) {
+                    Ok(true)
+                } else {
+                    journal("agent_drain_pending", &[("node", node)]);
+                    Ok(false)
+                }
+            }
+            Err(e) => {
+                journal(
+                    "agent_drain_poll_failed",
+                    &[("reason", &one_line(&e.to_string()))],
+                );
+                Err(e.to_string())
+            }
+        }
+    });
+    if !drained {
+        let _ = undrain(runner, node, ctx);
+        return Err(Error::msg(format!(
+            "timed out after {} waiting for node {node} to drain{}",
+            ctx.cfg.drain_timeout,
+            detail_suffix(drain_error)
+        )));
+    }
+    journal("agent_drained", &[("node", node)]);
+    Ok(())
+}
+
+fn reiki_config_path(component: &Component, cfg: &AutoUpdateConfig) -> PathBuf {
+    component
+        .config_path()
+        .map(Path::to_path_buf)
+        .or_else(|| cfg.reiki_config_path.clone())
+        .unwrap_or_else(|| PathBuf::from("/var/lib/reiki/reiki.toml"))
+}
+
+fn reiki_check(
+    runner: &dyn ApplyRunner,
+    component: &Component,
+    ctx: &ApplyContext<'_>,
+) -> Result<()> {
+    let path = reiki_config_path(component, ctx.cfg);
+    checked(
+        runner,
+        "reiki",
+        &["check", "--config", &path.to_string_lossy()],
+        command_timeout(ctx)?,
+    )?;
+    journal(
+        "reiki_config_check",
+        &[("config", &one_line(&path.to_string_lossy()))],
+    );
+    Ok(())
+}
+
+fn reiki_healthy(
+    runner: &dyn ApplyRunner,
+    component: &Component,
+    ctx: &ApplyContext<'_>,
+) -> std::result::Result<bool, String> {
+    let unit = component.service_unit.as_deref().unwrap_or("reiki.service");
+    let timeout = command_timeout(ctx).map_err(|e| e.to_string())?;
+    let active = checked(
+        runner,
+        "systemctl",
+        &["is-active", "--quiet", unit],
+        timeout,
+    )
+    .map_err(|e| e.to_string())?;
+    if active.status != 0 {
+        return Ok(false);
+    }
+    reiki_check(runner, component, ctx)
+        .map(|_| true)
+        .map_err(|e| e.to_string())
+}
+
+fn node_runs_lu(runner: &dyn ApplyRunner, node: &str, ctx: &ApplyContext<'_>) -> bool {
+    let timeout = match command_timeout(ctx) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    if let Ok(out) = checked(runner, "lu", &["nodes", "--json"], timeout) {
+        if let Ok(statuses) = lu::parse_nodes(&out.stdout) {
+            if statuses
+                .iter()
+                .any(|s| s.name == node && s.version.as_deref().is_some())
+            {
+                return true;
+            }
+        }
+    }
+    match checked(runner, "lu", &["status", "--json"], timeout) {
+        Ok(out) => {
+            lu::status_reports_version(&out.stdout, "0.0.0") || !out.stdout.trim().is_empty()
+        }
+        Err(_) => false,
+    }
+}
+
 fn node_healthy(
     runner: &dyn ApplyRunner,
     node: &str,
@@ -249,12 +364,12 @@ fn previous_version(component: &Component, prefix: Option<&Path>) -> Option<Stri
 /// Returns `Some(reason)` when the release archive does not contain an agent
 /// binary for this component. Such a release is skipped, not failed: draining
 /// and restarting a node would be pointless and disruptive.
-fn agent_binary_skip_reason(
+fn component_binary_skip_reason(
     component: &Component,
     version: &str,
     runner: &dyn ApplyRunner,
 ) -> Result<Option<String>> {
-    let expected = component.expected_binaries(version);
+    let expected = component.required_binaries(version);
     if expected.is_empty() {
         return Ok(Some(format!(
             "{version} has no expected binaries for {}; not in this release",
@@ -280,6 +395,23 @@ pub fn apply_agent(
     apply_agent_with_runner(component, version, ctx, state, &SystemRunner)
 }
 
+/// Manual `update` uses the same drain/install/restart/health/rollback/undrain
+/// procedure as auto-update when the host is a Lu node with an agent to
+/// update. Returns `false` when this is not such a node (or the release has no
+/// agent binary), so the caller can fall back to a plain install.
+pub fn apply_agent_on_lu_node(
+    component: &Component,
+    version: &str,
+    ctx: &ApplyContext<'_>,
+    state: &mut AutoState,
+) -> Result<bool> {
+    let node = node_name(ctx.cfg);
+    if !node_runs_lu(&SystemRunner, &node, ctx) {
+        return Ok(false);
+    }
+    Ok(apply_agent_with_runner(component, version, ctx, state, &SystemRunner)?.is_none())
+}
+
 pub fn apply_agent_with_runner(
     component: &Component,
     version: &str,
@@ -287,7 +419,7 @@ pub fn apply_agent_with_runner(
     state: &mut AutoState,
     runner: &dyn ApplyRunner,
 ) -> Result<Option<String>> {
-    if let Some(reason) = agent_binary_skip_reason(component, version, runner)? {
+    if let Some(reason) = component_binary_skip_reason(component, version, runner)? {
         journal(
             "agent_skipped",
             &[
@@ -300,8 +432,6 @@ pub fn apply_agent_with_runner(
     }
     let node = node_name(ctx.cfg);
     let unit = &ctx.cfg.agent_unit;
-    let cmd_timeout = command_timeout(ctx)?;
-    let drain_timeout = parse_duration(&ctx.cfg.drain_timeout)?;
     journal(
         "agent_update_start",
         &[
@@ -312,45 +442,7 @@ pub fn apply_agent_with_runner(
         ],
     );
 
-    if let Err(e) = checked(runner, "lu", &["drain", &node], cmd_timeout) {
-        // The command may have partially succeeded; never leave the node
-        // drained because of an ambiguous drain failure.
-        let _ = undrain(runner, &node, ctx);
-        return Err(Error::msg(format!(
-            "failed to drain node {node}: {}",
-            one_line(&e.to_string())
-        )));
-    }
-    journal("agent_drain", &[("node", &node)]);
-
-    let (drained, drain_error) = poll_until(drain_timeout, || {
-        match checked(runner, "lu", &["nodes", "--json"], cmd_timeout) {
-            Ok(out) => {
-                if lu::nodes_report_drained(&out.stdout, &node) {
-                    Ok(true)
-                } else {
-                    journal("agent_drain_pending", &[("node", &node)]);
-                    Ok(false)
-                }
-            }
-            Err(e) => {
-                journal(
-                    "agent_drain_poll_failed",
-                    &[("reason", &one_line(&e.to_string()))],
-                );
-                Err(e.to_string())
-            }
-        }
-    });
-    if !drained {
-        let _ = undrain(runner, &node, ctx);
-        return Err(Error::msg(format!(
-            "timed out after {} waiting for node {node} to drain{}",
-            ctx.cfg.drain_timeout,
-            detail_suffix(drain_error)
-        )));
-    }
-    journal("agent_drained", &[("node", &node)]);
+    drain_and_wait(runner, &node, ctx)?;
 
     let opts = install_options(ctx, version, false);
     let outcome = match runner.install(component, &opts) {
@@ -474,6 +566,175 @@ fn recover_agent(
         ctx.cfg.health_timeout,
         component.name,
         failure_reason
+    )))
+}
+
+/// Apply to Reiki. On a node that runs Lu this follows the same drain/deadline
+/// discipline as the agent path, then checks Reiki's config before restarting
+/// its unit and polling health. Every failure path restores the old binary,
+/// rechecks health and undrains before marking the version bad.
+pub fn apply_reiki(
+    component: &Component,
+    version: &str,
+    ctx: &ApplyContext<'_>,
+    state: &mut AutoState,
+) -> Result<Option<String>> {
+    apply_reiki_with_runner(component, version, ctx, state, &SystemRunner)
+}
+
+pub fn apply_reiki_with_runner(
+    component: &Component,
+    version: &str,
+    ctx: &ApplyContext<'_>,
+    state: &mut AutoState,
+    runner: &dyn ApplyRunner,
+) -> Result<Option<String>> {
+    let opts = install_options(ctx, version, false);
+    apply_reiki_with_options(component, version, ctx, state, runner, opts)
+}
+
+/// Reiki apply with caller-supplied install options. Auto-update uses the
+/// restricted options above; the CLI passes its own flags but still gets the
+/// same drain/config-check/restart/health/rollback path.
+pub fn apply_reiki_with_options(
+    component: &Component,
+    version: &str,
+    ctx: &ApplyContext<'_>,
+    state: &mut AutoState,
+    runner: &dyn ApplyRunner,
+    opts: InstallOptions,
+) -> Result<Option<String>> {
+    if let Some(reason) = component_binary_skip_reason(component, version, runner)? {
+        journal(
+            "reiki_skipped",
+            &[
+                ("component", &component.name),
+                ("version", version),
+                ("reason", &one_line(&reason)),
+            ],
+        );
+        return Ok(Some(reason));
+    }
+
+    let node = node_name(ctx.cfg);
+    let drained = node_runs_lu(runner, &node, ctx);
+    journal(
+        "reiki_update_start",
+        &[
+            ("component", &component.name),
+            ("version", version),
+            ("node", &node),
+            ("drain", &drained.to_string()),
+        ],
+    );
+
+    if let Err(e) = (|| -> Result<()> {
+        if drained {
+            drain_and_wait(runner, &node, ctx)?;
+        }
+        let outcome = runner.install(component, &opts)?;
+        // The config check happens while the old service is still running; a
+        // broken config must never be loaded by a restart.
+        reiki_check(runner, component, ctx)?;
+        restart(
+            runner,
+            component.service_unit.as_deref().unwrap_or("reiki.service"),
+            ctx,
+        )?;
+        let health_timeout = parse_duration(&ctx.cfg.health_timeout)?;
+        let (healthy, health_error) =
+            poll_until(health_timeout, || reiki_healthy(runner, component, ctx));
+        if !healthy {
+            return Err(Error::msg(format!(
+                "reiki health check failed within {} for {version}{}",
+                ctx.cfg.health_timeout,
+                detail_suffix(health_error)
+            )));
+        }
+        install::record_installed(component, version, receipt(&outcome)?, ctx.prefix)?;
+        Ok(())
+    })() {
+        return recover_reiki(
+            component,
+            version,
+            &node,
+            drained,
+            ctx,
+            state,
+            runner,
+            &e.to_string(),
+        );
+    }
+
+    if drained {
+        undrain(runner, &node, ctx)?;
+    }
+    journal(
+        "reiki_update_ok",
+        &[("component", &component.name), ("version", version)],
+    );
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recover_reiki(
+    component: &Component,
+    version: &str,
+    node: &str,
+    drained: bool,
+    ctx: &ApplyContext<'_>,
+    state: &mut AutoState,
+    runner: &dyn ApplyRunner,
+    failure_reason: &str,
+) -> Result<Option<String>> {
+    journal(
+        "reiki_health_failed",
+        &[
+            ("component", &component.name),
+            ("version", version),
+            ("node", node),
+            ("reason", &one_line(failure_reason)),
+        ],
+    );
+    mark_bad(state, &component.name, version, ctx.prefix);
+
+    let mut recovery_errors = Vec::new();
+    if let Err(e) = rollback::restore_binaries(component, ctx.prefix, false) {
+        recovery_errors.push(format!("restore .prev failed: {e}"));
+    }
+    if let Err(e) = restart(
+        runner,
+        component.service_unit.as_deref().unwrap_or("reiki.service"),
+        ctx,
+    ) {
+        recovery_errors.push(format!("restart failed: {e}"));
+    }
+    if recovery_errors.is_empty() {
+        let health_timeout = parse_duration(&ctx.cfg.health_timeout)?;
+        let (healthy, health_error) =
+            poll_until(health_timeout, || reiki_healthy(runner, component, ctx));
+        if !healthy {
+            recovery_errors.push(format!(
+                "restored reiki did not pass health check{}",
+                detail_suffix(health_error)
+            ));
+        }
+    }
+    if drained {
+        if let Err(e) = undrain(runner, node, ctx) {
+            recovery_errors.push(format!("undrain failed: {e}"));
+        }
+    }
+    if !recovery_errors.is_empty() {
+        return Err(Error::msg(format!(
+            "reiki update failed for {version}: {}; recovery failed: {}",
+            one_line(failure_reason),
+            one_line(&recovery_errors.join("; "))
+        )));
+    }
+    Err(Error::msg(format!(
+        "reiki update failed for {version}: {}; restored .prev, verified restored health, marked {version} bad and undrained",
+        one_line(failure_reason)
     )))
 }
 
@@ -865,6 +1126,7 @@ mod tests {
     struct FakeRunner {
         calls: Arc<Mutex<Calls>>,
         fail: BTreeMap<String, String>,
+        fail_once: Arc<Mutex<BTreeMap<String, String>>>,
         nodes: Arc<Mutex<String>>,
         status: Arc<Mutex<String>>,
         receipt: crate::install::InstallReceipt,
@@ -876,6 +1138,7 @@ mod tests {
             Self {
                 calls: Arc::new(Mutex::new(Calls::default())),
                 fail: BTreeMap::new(),
+                fail_once: Arc::new(Mutex::new(BTreeMap::new())),
                 nodes: Arc::new(Mutex::new(NODES_OLD.to_string())),
                 status: Arc::new(Mutex::new(STATUS_IDLE_OLD.to_string())),
                 receipt: crate::install::InstallReceipt {
@@ -902,6 +1165,9 @@ mod tests {
             ));
             if let Some(reason) = self.fail.get(&key) {
                 return Err(Error::msg(reason.clone()));
+            }
+            if let Some(reason) = self.fail_once.lock().unwrap().remove(&key) {
+                return Err(Error::msg(reason));
             }
             let body = match (program, args.first().copied(), args.get(1).copied()) {
                 ("lu", Some("nodes"), Some("--json")) => self.nodes.lock().unwrap().clone(),
@@ -957,10 +1223,19 @@ mod tests {
     }
 
     fn component() -> Component {
-        component::builtin_components()
-            .into_iter()
-            .find(|c| c.name == "ting")
-            .unwrap()
+        // The node agent is exercised directly here. It is no longer a
+        // built-in default, but the apply path must keep supporting it until a
+        // release ships a dedicated binary and it returns to the table.
+        Component {
+            name: "ting".to_string(),
+            repo: "ddproxy/tuishou-lu".to_string(),
+            asset_pattern: "lu-{tag}-{target}.tar.gz".to_string(),
+            binaries: vec!["ting".to_string(), "lu-agent".to_string()],
+            service_unit: Some("lu-agent.service".to_string()),
+            config_path: None,
+            optional_binaries: Vec::new(),
+            binary_ranges: Vec::new(),
+        }
     }
 
     #[test]
@@ -1220,5 +1495,128 @@ mod tests {
         .unwrap();
         assert!(reason.contains("not idle"));
         assert_eq!(runner.calls.lock().unwrap().installs, 0);
+    }
+
+    fn reiki_component() -> Component {
+        component::builtin_components()
+            .into_iter()
+            .find(|c| c.name == "reiki")
+            .unwrap()
+    }
+
+    #[test]
+    fn reiki_drains_checks_config_then_restarts_and_undrains() {
+        let td = tempfile::tempdir().unwrap();
+        let ctx = ApplyContext {
+            cfg: &cfg(&td.path().join("backups")),
+            prefix: Some(td.path()),
+            config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
+        };
+        let runner = FakeRunner::new();
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+        apply_reiki_with_runner(&reiki_component(), "v0.4.1", &ctx, &mut st, &runner).unwrap();
+
+        let cmds = calls.lock().unwrap().commands.clone();
+        let drain = cmds
+            .iter()
+            .position(|(p, a)| p == "lu" && a == &["drain", "n1"])
+            .expect("node must be drained");
+        let check = cmds
+            .iter()
+            .position(|(p, a)| p == "reiki" && a.first().map(String::as_str) == Some("check"))
+            .expect("config must be checked");
+        let restart = cmds
+            .iter()
+            .position(|(p, a)| p == "systemctl" && a == &["restart", "reiki.service"])
+            .expect("unit must be restarted");
+        let active = cmds
+            .iter()
+            .position(|(p, a)| p == "systemctl" && a == &["is-active", "--quiet", "reiki.service"])
+            .expect("unit health must be checked");
+        let undrain = cmds
+            .iter()
+            .position(|(p, a)| p == "lu" && a == &["undrain", "n1"])
+            .expect("node must be undrained");
+        assert!(drain < check && check < restart && restart < active && active < undrain);
+        assert_eq!(
+            cmds.iter()
+                .filter(|(p, a)| p == "reiki" && a.first().map(String::as_str) == Some("check"))
+                .count(),
+            2,
+            "config is checked before restart and again as health"
+        );
+    }
+
+    #[test]
+    fn reiki_config_failure_rolls_back_restarts_and_marks_version_bad() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        fs::write(prefix.join("reiki"), b"old").unwrap();
+        fs::write(prefix.join("reiki.prev"), b"old prev").unwrap();
+        let mut existing = state::State::default();
+        existing.components.insert(
+            "reiki".to_string(),
+            state::InstalledComponent {
+                version: "v0.4.0".to_string(),
+                target: "test".to_string(),
+                checksum: "abc".to_string(),
+                installed_at: "before".to_string(),
+                previous_version: None,
+            },
+        );
+        state::save(&state::default_state_path(Some(prefix)), &existing).unwrap();
+        let ctx = ApplyContext {
+            cfg: &cfg(&td.path().join("backups")),
+            prefix: Some(prefix),
+            config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
+        };
+        let runner = FakeRunner::new();
+        runner.fail_once.lock().unwrap().insert(
+            "reiki check --config /var/lib/reiki/reiki.toml".to_string(),
+            "invalid config".to_string(),
+        );
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+        let err = apply_reiki_with_runner(&reiki_component(), "v0.4.1", &ctx, &mut st, &runner)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("marked v0.4.1 bad"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(prefix.join("reiki")).unwrap(), b"old prev");
+        let bad = st
+            .bad_versions
+            .get("reiki")
+            .expect("bad version must be recorded immediately");
+        assert!(bad.iter().any(|v| v == "v0.4.1"));
+
+        let cmds = calls.lock().unwrap().commands.clone();
+        let check = cmds
+            .iter()
+            .position(|(p, a)| p == "reiki" && a.first().map(String::as_str) == Some("check"))
+            .expect("config check must run");
+        let first_restart = cmds
+            .iter()
+            .position(|(p, a)| p == "systemctl" && a == &["restart", "reiki.service"])
+            .expect("recovery must restart");
+        assert!(
+            check < first_restart,
+            "bad config must prevent the first restart"
+        );
+        assert_eq!(
+            cmds.iter()
+                .filter(|(p, a)| p == "systemctl" && a == &["restart", "reiki.service"])
+                .count(),
+            1,
+            "the failed config check must prevent the first restart; only recovery restarts"
+        );
+        assert!(cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
     }
 }

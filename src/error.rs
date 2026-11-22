@@ -19,6 +19,9 @@ pub enum Error {
     #[error("unknown component '{0}'")]
     UnknownComponent(String),
 
+    #[error("untrusted config {path}: {reason}")]
+    ConfigTrust { path: PathBuf, reason: String },
+
     #[error("unknown config key '{0}'")]
     UnknownConfigKey(String),
 
@@ -79,9 +82,6 @@ pub enum Error {
 
     #[error("no previous version recorded for '{0}'")]
     NoPrevious(String),
-
-    #[error("roll failed on node '{node}': {reason}")]
-    Roll { node: String, reason: String },
 }
 
 impl Error {
@@ -92,7 +92,7 @@ impl Error {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Message(m) if m == "updates available" => ExitCode::from(EXIT_UPDATES_AVAILABLE),
-            Self::Usage(_) => ExitCode::from(EXIT_USAGE),
+            Self::Usage(_) | Self::UnknownComponent(_) => ExitCode::from(EXIT_USAGE),
             _ => ExitCode::from(EXIT_ERROR),
         }
     }

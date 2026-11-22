@@ -31,11 +31,19 @@ verified at runtime. TUF refresh updates the cache under a `0700` directory. Set
 `[verify].trust_root` to a path makes verification use that operator-managed file
 directly with no refresh; protect that file accordingly.
 
+## Config trust
+
+`tuishou.toml` is refused unless it is owned by the running user or root and is not
+writable by group or others. Unknown keys are errors. Component overrides may change
+paths and policy, but never the repository or asset host; downloads come only from
+GitHub release assets.
+
 ## Host execution
 
-`install`, `roll`, and `service` operations run commands on the local host or via `ssh`
-to configured nodes. Only use trusted configs. `tuishou` does not elevate privileges
-for you; run it with the account that should own the files and services.
+`install`, `update`, and local service operations run commands on the host where
+`tuishou` is executed. Updates are performed by each node locally; no commands are sent
+to nodes from a central host. Only use trusted configs. `tuishou` does not elevate
+privileges for you; run it with the account that should own the files and services.
 
 ## Receipts
 

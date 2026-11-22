@@ -9,13 +9,15 @@ pub mod apply;
 pub mod eligibility;
 pub mod state;
 
-use crate::component::resolve_component;
+use crate::component::{resolve_component, Component, NODE_AGENT_BINARIES};
 use crate::config::{AutoUpdateConfig, LoadedConfig};
 use crate::duration::{format_duration, parse_duration};
 use crate::error::{Error, Result};
 use crate::logging::{journal, journal_err, notify, one_line};
+use crate::report::{self, ComponentReport, StatusText};
 use crate::state::InstalledComponent;
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -76,6 +78,7 @@ pub fn handle_run(
     once: bool,
     quiet: bool,
     allow_unattested: bool,
+    json: bool,
 ) -> Result<ExitCode> {
     let cfg = &loaded.auto_update;
     require_enabled(cfg)?;
@@ -92,7 +95,7 @@ pub fn handle_run(
             return Ok(ExitCode::SUCCESS);
         }
     };
-    execute_cycle(loaded, prefix, quiet)
+    execute_cycle(loaded, prefix, quiet, json)
 }
 
 fn installed_versions(
@@ -124,40 +127,167 @@ fn cached_next(
 fn record(
     st: &mut state::AutoState,
     name: &str,
-    result: &str,
-    reason: Option<String>,
+    status: StatusText,
+    installed_version: Option<String>,
     version: Option<String>,
     next: Option<String>,
 ) {
+    let kind = status.kind().to_string();
+    let phrase = status.to_string();
+    let reason = match &status {
+        StatusText::Held { reason }
+        | StatusText::Skipped { reason }
+        | StatusText::Failed { reason } => Some(one_line(reason)),
+        _ => None,
+    };
+    let missing_binaries = match &status {
+        StatusText::NotInRelease { missing } => missing.clone(),
+        _ => Vec::new(),
+    };
     st.results.insert(
         name.to_string(),
         state::ComponentResult {
-            result: result.to_string(),
-            reason: reason.map(|r| one_line(&r)),
+            result: phrase,
+            status_kind: Some(kind),
+            reason,
             version,
+            installed_version,
             next_eligible_version: next,
+            missing_binaries,
             at: crate::state::now_rfc3339().unwrap_or_default(),
         },
     );
 }
 
-fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> Result<ExitCode> {
+fn cycle_names(cfg: &AutoUpdateConfig) -> Vec<String> {
+    let mut names = cfg.components.clone();
+    // Reiki is always applied before the Lu agent when both are due. Other
+    // components keep the configured/table order.
+    names.sort_by_key(|name| match name.as_str() {
+        "reiki" => 0,
+        "lu" => 1,
+        _ => 2,
+    });
+    names
+}
+
+fn status_from_skip(component: &Component, reason: &str, version: &str) -> StatusText {
+    if reason.contains("not in this release") {
+        let missing = reason
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(list, _)| {
+                list.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| component.required_binaries(version));
+        StatusText::NotInRelease { missing }
+    } else {
+        StatusText::Skipped {
+            reason: one_line(reason),
+        }
+    }
+}
+
+/// One report per configured component, in cycle order, using the shared
+/// status vocabulary. Stored results keep their phrase so a failed apply is
+/// not rewritten into a misleading "up to date" after the fact.
+fn cycle_reports(
+    loaded: &LoadedConfig,
+    st: &state::AutoState,
+    installed: &BTreeMap<String, InstalledComponent>,
+) -> Vec<ComponentReport> {
+    cycle_names(&loaded.auto_update)
+        .iter()
+        .filter_map(|name| {
+            let component = resolve_component(name, &loaded.components).ok()?;
+            let entry = st.results.get(name);
+            let (status, entry_installed, latest, missing) = match entry {
+                Some(e) => (
+                    report::status_text_from_kind(
+                        e.status_kind.as_deref().unwrap_or("failed"),
+                        e.installed_version.clone(),
+                        e.reason.clone(),
+                        e.version.clone(),
+                        e.missing_binaries.clone(),
+                    ),
+                    e.installed_version.clone(),
+                    e.version.clone(),
+                    e.missing_binaries.clone(),
+                ),
+                None => (
+                    StatusText::Skipped {
+                        reason: "no result recorded".to_string(),
+                    },
+                    None,
+                    None,
+                    Vec::new(),
+                ),
+            };
+            let current = installed
+                .get(name)
+                .map(|i| i.version.clone())
+                .or(entry_installed);
+            Some(ComponentReport::from_parts(
+                &component, status, current, latest, missing,
+            ))
+        })
+        .collect()
+}
+
+fn execute_cycle(
+    loaded: &LoadedConfig,
+    prefix: Option<&Path>,
+    quiet: bool,
+    json: bool,
+) -> Result<ExitCode> {
     let cfg = &loaded.auto_update;
     let components = &loaded.components;
+    let names = cycle_names(cfg);
     let mut st = state::load(prefix)?;
     let installed = installed_versions(prefix)?;
     st.last_check = Some(crate::state::now_rfc3339()?);
     journal(
         "auto_update_cycle_start",
-        &[("components", &cfg.components.join(","))],
+        &[("components", &names.join(","))],
     );
+
+    let command_timeout = parse_duration(&cfg.command_timeout).unwrap_or(Duration::from_secs(30));
+    if let Some(reason) = crate::fleet::before_cycle(&loaded.update, command_timeout) {
+        journal(
+            "auto_update_fleet_skipped",
+            &[("reason", &one_line(&reason))],
+        );
+        for name in &names {
+            if resolve_component(name, components).is_ok() {
+                record(
+                    &mut st,
+                    name,
+                    StatusText::Skipped {
+                        reason: reason.clone(),
+                    },
+                    installed.get(name).map(|c| c.version.clone()),
+                    None,
+                    None,
+                );
+            }
+        }
+        state::save(prefix, &st)?;
+        let reports = cycle_reports(loaded, &st, &installed);
+        report::print_reports(&reports, json, quiet)?;
+        return Ok(ExitCode::SUCCESS);
+    }
 
     if let Some(hold) = state::active_hold(prefix)? {
         let reason = hold
             .reason
             .unwrap_or_else(|| "hold file present".to_string());
         journal("auto_update_held", &[("reason", &one_line(&reason))]);
-        for name in &cfg.components {
+        for name in &names {
             if let Ok(component) = resolve_component(name, components) {
                 let bad = st.bad_versions.get(name).cloned().unwrap_or_default();
                 let next = cached_next(
@@ -168,31 +298,52 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
                     name == "lu",
                     &st,
                 );
-                record(&mut st, name, "held", Some(reason.clone()), None, next);
+                record(
+                    &mut st,
+                    name,
+                    StatusText::Held {
+                        reason: reason.clone(),
+                    },
+                    installed.get(name).map(|c| c.version.clone()),
+                    None,
+                    next,
+                );
             }
         }
         state::save(prefix, &st)?;
+        let reports = cycle_reports(loaded, &st, &installed);
+        report::print_reports(&reports, json, quiet)?;
         return Ok(ExitCode::SUCCESS);
     }
 
     let agent = crate::http::agent();
     let verifier = crate::verify::default_verifier();
     let mut any_failed = false;
-    for name in &cfg.components {
+    for name in &names {
         let component = match resolve_component(name, components) {
             Ok(c) => c,
             Err(e) => {
+                let reason = one_line(&e.to_string());
                 journal_err(
                     "component_error",
-                    &[("component", name), ("reason", &one_line(&e.to_string()))],
+                    &[("component", name), ("reason", &reason)],
                 );
-                record(&mut st, name, "failed", Some(e.to_string()), None, None);
+                record(
+                    &mut st,
+                    name,
+                    StatusText::Failed {
+                        reason: reason.clone(),
+                    },
+                    installed.get(name).map(|c| c.version.clone()),
+                    None,
+                    None,
+                );
                 any_failed = true;
                 continue;
             }
         };
-        let is_controller = name == "lu";
-        let is_agent = matches!(name.as_str(), "ting" | "lu-agent");
+        let is_reiki = name == "reiki";
+        let is_lu = name == "lu";
         let installed_version = installed.get(name).map(|c| c.version.clone());
         let bad = st.bad_versions.get(name).cloned().unwrap_or_default();
 
@@ -200,16 +351,26 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
         let listing = match eligibility::fetch_listing(&agent, &component.repo, cache.as_ref(), 3) {
             Ok(l) => l,
             Err(e) => {
+                let reason = one_line(&e.to_string());
                 journal_err(
                     "release_list_failed",
-                    &[("component", name), ("reason", &one_line(&e.to_string()))],
+                    &[("component", name), ("reason", &reason)],
                 );
                 let failures = st.failures.entry(name.clone()).or_insert(0);
                 *failures += 1;
                 if *failures >= cfg.notify_after_failures {
-                    send_notification(cfg, "repeated_failure", name, None, Some(&e.to_string()));
+                    send_notification(cfg, "repeated_failure", name, None, Some(&reason));
                 }
-                record(&mut st, name, "failed", Some(e.to_string()), None, None);
+                record(
+                    &mut st,
+                    name,
+                    StatusText::Failed {
+                        reason: reason.clone(),
+                    },
+                    installed_version.clone(),
+                    None,
+                    None,
+                );
                 any_failed = true;
                 continue;
             }
@@ -223,24 +384,64 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
             );
         }
 
-        let choice = match eligibility::choose(
-            &listing,
-            cfg,
-            installed_version.as_deref(),
-            &bad,
-            is_controller,
-        ) {
-            Ok(c) => c,
-            Err(e) => {
-                journal_err(
-                    "eligibility_failed",
-                    &[("component", name), ("reason", &one_line(&e.to_string()))],
-                );
-                record(&mut st, name, "failed", Some(e.to_string()), None, None);
-                any_failed = true;
-                continue;
+        // Lu is a controller until the selected release actually ships a
+        // dedicated agent binary. Re-check with controller gates disabled in
+        // that case so the agent drain path is used.
+        let controller_choice =
+            match eligibility::choose(&listing, cfg, installed_version.as_deref(), &bad, is_lu) {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = one_line(&e.to_string());
+                    journal_err(
+                        "eligibility_failed",
+                        &[("component", name), ("reason", &reason)],
+                    );
+                    record(
+                        &mut st,
+                        name,
+                        StatusText::Failed {
+                            reason: reason.clone(),
+                        },
+                        installed_version.clone(),
+                        None,
+                        None,
+                    );
+                    any_failed = true;
+                    continue;
+                }
+            };
+        let agent_in_release = is_lu
+            && controller_choice.candidate.as_ref().is_some_and(|r| {
+                crate::install::archive_binary_names(&agent, &component, &r.tag)
+                    .map(|names| {
+                        names
+                            .iter()
+                            .any(|n| NODE_AGENT_BINARIES.contains(&n.as_str()))
+                    })
+                    .unwrap_or(false)
+            });
+        let choice = if agent_in_release {
+            match eligibility::choose(&listing, cfg, installed_version.as_deref(), &bad, false) {
+                Ok(c) => c,
+                Err(e) => {
+                    let reason = one_line(&e.to_string());
+                    record(
+                        &mut st,
+                        name,
+                        StatusText::Failed { reason },
+                        installed_version.clone(),
+                        None,
+                        controller_choice.next_eligible_version.clone(),
+                    );
+                    any_failed = true;
+                    continue;
+                }
             }
+        } else {
+            controller_choice
         };
+        let is_agent = is_lu && agent_in_release;
+        let is_controller = is_lu && !agent_in_release;
         let next = choice.next_eligible_version.clone();
         let release = match choice.candidate {
             Some(r) => r,
@@ -256,7 +457,20 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
                         ("next", next.as_deref().unwrap_or("-")),
                     ],
                 );
-                record(&mut st, name, "up-to-date", Some(reason), None, next);
+                let status = if reason.contains("not installed") {
+                    StatusText::NotInstalled {
+                        latest: next.clone().unwrap_or_default(),
+                    }
+                } else if next.as_deref().is_some_and(|v| bad.iter().any(|b| b == v)) {
+                    StatusText::BadVersionSkipped {
+                        version: next.clone().unwrap_or_default(),
+                    }
+                } else {
+                    StatusText::Skipped {
+                        reason: one_line(&reason),
+                    }
+                };
+                record(&mut st, name, status, installed_version.clone(), None, next);
                 continue;
             }
         };
@@ -267,12 +481,12 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
             verifier: Some(verifier.clone()),
             verify_config: Some(&loaded.verify),
         };
-        let outcome = if is_controller {
-            apply::apply_controller(&component, &release.tag, &release.body, &ctx, &mut st)
-                .map(|skip| skip.map(|reason| ("skipped", reason)))
+        let outcome = if is_reiki {
+            apply::apply_reiki(&component, &release.tag, &ctx, &mut st)
         } else if is_agent {
             apply::apply_agent(&component, &release.tag, &ctx, &mut st)
-                .map(|skip| skip.map(|reason| ("skipped", reason)))
+        } else if is_controller {
+            apply::apply_controller(&component, &release.tag, &release.body, &ctx, &mut st)
         } else {
             apply::plain_install(&component, &release.tag, &ctx).map(|_| None)
         };
@@ -286,19 +500,29 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
                 record(
                     &mut st,
                     name,
-                    "updated",
-                    None,
+                    StatusText::Updated {
+                        from: installed_version.clone().unwrap_or_else(|| "-".to_string()),
+                        to: release.tag.clone(),
+                    },
+                    installed_version.clone(),
                     Some(release.tag.clone()),
                     next,
                 );
                 send_notification(cfg, "update", name, Some(&release.tag), None);
             }
-            Ok(Some((kind, reason))) => {
+            Ok(Some(reason)) => {
                 journal(
                     "auto_update_skipped",
                     &[("component", name), ("reason", &one_line(&reason))],
                 );
-                record(&mut st, name, kind, Some(reason), None, next);
+                record(
+                    &mut st,
+                    name,
+                    status_from_skip(&component, &reason, &release.tag),
+                    installed_version.clone(),
+                    Some(release.tag.clone()),
+                    next,
+                );
             }
             Err(e) => {
                 let reason = one_line(&e.to_string());
@@ -328,9 +552,11 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
                 record(
                     &mut st,
                     name,
-                    "failed",
-                    Some(reason.clone()),
-                    Some(release.tag),
+                    StatusText::Failed {
+                        reason: reason.clone(),
+                    },
+                    installed_version.clone(),
+                    Some(release.tag.clone()),
                     next,
                 );
                 any_failed = true;
@@ -338,6 +564,9 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
         }
     }
     state::save(prefix, &st)?;
+    let installed_after = installed_versions(prefix)?;
+    let reports = cycle_reports(loaded, &st, &installed_after);
+    report::print_reports(&reports, json, quiet)?;
     if !quiet {
         journal(
             "auto_update_cycle_done",
@@ -354,6 +583,7 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
 #[derive(Debug, Serialize)]
 struct StatusRow {
     component: String,
+    status: String,
     last_result: String,
     reason: Option<String>,
     installed_version: Option<String>,
@@ -398,43 +628,55 @@ fn handle_status_locked(
     let st = state::load(prefix)?;
     let installed = installed_versions(prefix)?;
     let hold = state::active_hold(prefix)?;
+    let names = cycle_names(cfg);
+    let ordered: Vec<_> = names
+        .iter()
+        .filter_map(|name| resolve_component(name, &loaded.components).ok())
+        .collect();
+    let hold_reason = hold.as_ref().map(|h| {
+        h.reason
+            .clone()
+            .unwrap_or_else(|| "hold file present".to_string())
+    });
+    // The same evaluator backs `status`, `update --check` and auto-update so
+    // their per-component lines cannot disagree.
+    let reports = report::evaluate_all(
+        &crate::http::agent(),
+        &ordered,
+        prefix,
+        &installed,
+        hold_reason.as_deref(),
+        &st.bad_versions,
+    );
     let mut rows = Vec::new();
-    for name in &cfg.components {
-        let component = resolve_component(name, &loaded.components)?;
+    for (name, current) in names.iter().zip(reports) {
+        let component = match ordered.iter().find(|c| c.name == *name) {
+            Some(c) => c,
+            None => continue,
+        };
         let bad = st.bad_versions.get(name).cloned().unwrap_or_default();
-        let is_controller = name == "lu";
         let installed_version = installed.get(name).map(|c| c.version.clone());
         let next = cached_next(
-            &component,
+            component,
             cfg,
             installed_version.as_deref(),
             &bad,
-            is_controller,
+            name == "lu",
             &st,
         )
-        .or_else(|| {
-            // No cached listing yet: do a live check so ansible sees the
-            // actual next version on first run.
-            let agent = crate::http::agent();
-            let listing = eligibility::fetch_listing(&agent, &component.repo, None, 1).ok()?;
-            eligibility::choose(
-                &listing,
-                cfg,
-                installed_version.as_deref(),
-                &bad,
-                is_controller,
-            )
-            .ok()?
-            .next_eligible_version
-        });
+        .or_else(|| current.latest_version.clone());
         let entry = st.results.get(name);
         rows.push(StatusRow {
             component: name.clone(),
+            status: current.status.clone(),
             last_result: entry
                 .map(|e| e.result.clone())
                 .unwrap_or_else(|| "never".to_string()),
-            reason: entry.and_then(|e| e.reason.clone()),
-            installed_version: installed_version.clone(),
+            reason: current
+                .reason
+                .clone()
+                .or_else(|| entry.and_then(|e| e.reason.clone())),
+            installed_version: current.installed_version.clone(),
             last_version: entry.and_then(|e| e.version.clone()),
             next_eligible_version: next,
         });
@@ -476,14 +718,7 @@ fn handle_status_locked(
             );
         }
         for row in &rows {
-            println!(
-                "  {:<10} last={:<10} version={:<10} next={:<10} reason={}",
-                row.component,
-                row.last_result,
-                row.last_version.as_deref().unwrap_or("-"),
-                row.next_eligible_version.as_deref().unwrap_or("-"),
-                row.reason.as_deref().unwrap_or("-")
-            );
+            println!("{}: {}", row.component, row.status);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -694,6 +929,18 @@ mod tests {
         assert!(service.contains("--config /"));
         assert!(!service.contains("--config relative.toml"));
         assert!(!service.contains("--prefix"));
+    }
+
+    #[test]
+    fn cycle_names_puts_reiki_before_lu_even_when_config_is_reversed() {
+        let cfg = AutoUpdateConfig {
+            components: vec!["tuishou".to_string(), "lu".to_string(), "reiki".to_string()],
+            ..AutoUpdateConfig::default()
+        };
+        assert_eq!(
+            cycle_names(&cfg),
+            vec!["reiki".to_string(), "lu".to_string(), "tuishou".to_string()]
+        );
     }
 
     #[test]
