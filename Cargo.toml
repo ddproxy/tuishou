@@ -7,12 +7,17 @@ publish = false
 description = "Install and update the Tuishou stack from GitHub releases"
 repository = "https://github.com/ddproxy/tuishou"
 
+[features]
+# Test-only hooks. Never enabled by build or release targets.
+test-hooks = []
+
 [dependencies]
 base64 = "=0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 const-oid = "=0.10.2"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
+tempfile = "3"
 serde_json = "1"
 serde_json_canonicalizer = "=0.4.1"
 sigstore = { version = "=0.15.0", default-features = false, features = ["verify", "sigstore-trust-root", "rustls-tls"] }
@@ -26,9 +31,6 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde", "std"] }
 toml = "1.2"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
 x509-cert = { version = "=0.3.0", features = ["pem"] }
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = true

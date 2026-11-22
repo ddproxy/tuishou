@@ -5,15 +5,34 @@ use std::io::Read;
 use std::path::{Component as PathComponent, Path, PathBuf};
 use tar::Archive;
 
+/// A compressed asset may be small while its entries expand without bound.
+/// These caps bound work done while listing and extracting an archive.
+pub const MAX_ARCHIVE_ENTRIES: u64 = 4_096;
+pub const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ExtractedBinary {
     pub name: String,
     pub path: PathBuf,
 }
 
+fn check_entry_count(index: u64, max_entries: u64) -> Result<()> {
+    if index >= max_entries {
+        return Err(Error::Archive(format!(
+            "archive exceeds maximum of {max_entries} entries"
+        )));
+    }
+    Ok(())
+}
+
 /// List the regular-file basenames in an archive without extracting anything.
 /// Used to decide whether a release actually ships a component's binaries.
 pub fn list_binary_names(archive_path: &Path) -> Result<Vec<String>> {
+    list_binary_names_limited(archive_path, MAX_ARCHIVE_ENTRIES)
+}
+
+fn list_binary_names_limited(archive_path: &Path, max_entries: u64) -> Result<Vec<String>> {
     let file = fs::File::open(archive_path).map_err(|source| Error::Read {
         path: archive_path.to_path_buf(),
         source,
@@ -23,7 +42,8 @@ pub fn list_binary_names(archive_path: &Path) -> Result<Vec<String>> {
         .entries()
         .map_err(|e| Error::Archive(format!("failed to read archive entries: {e}")))?;
     let mut names = Vec::new();
-    for entry in entries {
+    for (index, entry) in entries.enumerate() {
+        check_entry_count(index as u64, max_entries)?;
         let entry = entry.map_err(|e| Error::Archive(format!("invalid archive entry: {e}")))?;
         let entry_type = entry.header().entry_type();
         let path = entry
@@ -53,6 +73,24 @@ pub fn extract_binaries(
     expected_binaries: &[String],
     dest_dir: &Path,
 ) -> Result<Vec<ExtractedBinary>> {
+    extract_binaries_with_limits(
+        archive_path,
+        expected_binaries,
+        dest_dir,
+        MAX_ENTRY_BYTES,
+        MAX_TOTAL_BYTES,
+        MAX_ARCHIVE_ENTRIES,
+    )
+}
+
+fn extract_binaries_with_limits(
+    archive_path: &Path,
+    expected_binaries: &[String],
+    dest_dir: &Path,
+    max_entry_bytes: u64,
+    max_total_bytes: u64,
+    max_entries: u64,
+) -> Result<Vec<ExtractedBinary>> {
     let file = fs::File::open(archive_path).map_err(|source| Error::Read {
         path: archive_path.to_path_buf(),
         source,
@@ -64,11 +102,14 @@ pub fn extract_binaries(
         .map_err(|e| Error::Archive(format!("failed to read archive entries: {e}")))?;
 
     let mut manifest_paths: Option<Vec<String>> = None;
-    // Scan entries in one pass, storing regular files. Manifest, if present, informs layout.
+    // Scan entries in one pass, storing only candidate binaries and the
+    // manifest. The tar iterator skips data for entries we do not read.
     let mut pending: Vec<PendingEntry> = Vec::new();
+    let mut total: u64 = 0;
 
-    for entry in entries {
-        let mut entry = entry.map_err(|e| Error::Archive(format!("invalid archive entry: {e}")))?;
+    for (index, entry) in entries.enumerate() {
+        check_entry_count(index as u64, max_entries)?;
+        let entry = entry.map_err(|e| Error::Archive(format!("invalid archive entry: {e}")))?;
         let header = entry.header().clone();
         let entry_type = header.entry_type();
         let path = entry
@@ -94,10 +135,33 @@ pub fn extract_binaries(
         validate_entry_path(&path)?;
 
         if entry_type.is_file() {
+            let base = path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let wanted =
+                is_manifest_path(&path) || expected_binaries.iter().any(|name| name == &base);
+            if !wanted {
+                continue;
+            }
             let mut data = Vec::new();
-            entry.read_to_end(&mut data).map_err(|e| {
-                Error::Archive(format!("failed to read archive entry {path_str}: {e}"))
-            })?;
+            entry
+                .take(max_entry_bytes.saturating_add(1))
+                .read_to_end(&mut data)
+                .map_err(|e| {
+                    Error::Archive(format!("failed to read archive entry {path_str}: {e}"))
+                })?;
+            if data.len() as u64 > max_entry_bytes {
+                return Err(Error::Archive(format!(
+                    "archive entry {path_str} exceeds decompressed size limit of {max_entry_bytes} bytes"
+                )));
+            }
+            total = total.saturating_add(data.len() as u64);
+            if total > max_total_bytes {
+                return Err(Error::Archive(format!(
+                    "archive exceeds total decompressed size limit of {max_total_bytes} bytes"
+                )));
+            }
             pending.push(PendingEntry {
                 path: path.clone(),
                 data,
@@ -263,4 +327,97 @@ fn parse_manifest(text: &str) -> std::result::Result<Vec<String>, ()> {
         }
     }
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use tar::{Builder, Header};
+
+    fn write_archive(path: &Path, files: &[(&str, &[u8])]) {
+        let file = fs::File::create(path).unwrap();
+        let gz = GzEncoder::new(file, Compression::fast());
+        let mut builder = Builder::new(gz);
+        for (name, data) in files {
+            let mut header = Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *data).unwrap();
+        }
+        builder.into_inner().unwrap().finish().unwrap();
+    }
+
+    #[test]
+    fn extracts_expected_binary_within_limits() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        write_archive(&archive, &[("bin/ting", b"hello")]);
+        let dest = dir.path().join("out");
+        let expected = vec!["ting".to_string()];
+        let got = extract_binaries_with_limits(&archive, &expected, &dest, 32, 64, 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "ting");
+        assert_eq!(fs::read(&got[0].path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn rejects_oversized_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        write_archive(&archive, &[("ting", b"abcdefgh")]);
+        let expected = vec!["ting".to_string()];
+        let err =
+            extract_binaries_with_limits(&archive, &expected, &dir.path().join("out"), 4, 64, 10)
+                .unwrap_err();
+        assert!(err.to_string().contains("decompressed size limit"), "{err}");
+    }
+
+    #[test]
+    fn rejects_oversized_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        write_archive(&archive, &[("ting", b"abcdef"), ("lu", b"ghijkl")]);
+        let expected = vec!["ting".to_string(), "lu".to_string()];
+        let err =
+            extract_binaries_with_limits(&archive, &expected, &dir.path().join("out"), 8, 10, 10)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("total decompressed size limit"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn ignores_unwanted_oversized_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        write_archive(&archive, &[("docs/notes.txt", b"a".repeat(64).as_slice())]);
+        let expected = vec!["ting".to_string()];
+        let got =
+            extract_binaries_with_limits(&archive, &expected, &dir.path().join("out"), 4, 8, 10)
+                .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn rejects_too_many_entries_when_extracting() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        write_archive(&archive, &[("a", b""), ("b", b""), ("c", b"")]);
+        let err = extract_binaries_with_limits(&archive, &[], &dir.path().join("out"), 16, 16, 2)
+            .unwrap_err();
+        assert!(err.to_string().contains("maximum of 2 entries"), "{err}");
+    }
+
+    #[test]
+    fn rejects_too_many_entries_when_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar.gz");
+        write_archive(&archive, &[("a", b""), ("b", b""), ("c", b"")]);
+        let err = list_binary_names_limited(&archive, 2).unwrap_err();
+        assert!(err.to_string().contains("maximum of 2 entries"), "{err}");
+    }
 }

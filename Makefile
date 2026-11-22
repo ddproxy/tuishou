@@ -8,7 +8,7 @@ validate-workflows:
 	bash scripts/test-validate-workflows.sh
 
 test: validate-workflows
-	cargo test --workspace --locked
+	cargo test --workspace --locked --features test-hooks
 
 lint:
 	cargo fmt --all -- --check

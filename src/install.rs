@@ -69,17 +69,15 @@ pub fn archive_binary_names(
         &checksum_asset.url,
         &asset_name,
         &checksum_name,
-        &tmp,
+        tmp.path(),
         crate::http::max_download_bytes(),
     );
-    let result = downloaded.and_then(|d| {
+    downloaded.and_then(|d| {
         let content = download::read_checksum_file(&d.checksum_path)?;
         let expected = verify::parse_checksum_file(&content, &asset_name)?;
         verify::verify_checksum(&d.archive_path, &expected)?;
         archive::list_binary_names(&d.archive_path)
-    });
-    let _ = fs::remove_dir_all(&tmp);
-    result
+    })
 }
 
 pub fn install_component(
@@ -149,7 +147,7 @@ pub fn install_component(
         &checksum_asset.url,
         &asset_name,
         &checksum_name,
-        &tmp,
+        tmp.path(),
         opts.max_download_bytes,
     )?;
     let checksum_content = download::read_checksum_file(&downloaded.checksum_path)?;
@@ -177,7 +175,7 @@ pub fn install_component(
         }
     }
 
-    let extract_dir = tmp.join("extract");
+    let extract_dir = tmp.path().join("extract");
     let extracted =
         archive::extract_binaries(&downloaded.archive_path, &expected_binaries, &extract_dir)?;
     if extracted.is_empty() {
@@ -210,8 +208,6 @@ pub fn install_component(
     if opts.commit_state {
         record_installed(component, &tag, &receipt, opts.prefix.as_deref())?;
     }
-
-    let _ = fs::remove_dir_all(&tmp);
 
     if !opts.quiet {
         println!("installed {} {} ({})", component.name, tag, target.as_str());
@@ -447,18 +443,17 @@ pub fn smoke_check(bin_dir: &Path, binaries: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn tempfile_dir() -> Result<PathBuf> {
-    let base = std::env::temp_dir().join("tuishou");
-    fs::create_dir_all(&base).map_err(|source| Error::Write {
-        path: base.clone(),
-        source,
-    })?;
-    let dir = base.join(format!("dl-{}-{}", std::process::id(), now_nanos()));
-    fs::create_dir_all(&dir).map_err(|source| Error::Write {
-        path: dir.clone(),
-        source,
-    })?;
-    Ok(dir)
+fn tempfile_dir() -> Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("tuishou-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(fs::Permissions::from_mode(0o700));
+    }
+    builder
+        .tempdir()
+        .map_err(|source| Error::msg(format!("failed to create temporary directory: {source}")))
 }
 
 fn now_nanos() -> u128 {
@@ -472,4 +467,32 @@ pub fn major_version(tag: &str) -> Option<u64> {
     let v = tag.strip_prefix('v').unwrap_or(tag);
     let major = v.split('.').next()?;
     major.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tempdir_is_private_and_unpredictable() {
+        let a = tempfile_dir().unwrap();
+        let b = tempfile_dir().unwrap();
+        assert!(a.path().is_dir());
+        assert_ne!(a.path(), b.path());
+        assert!(a
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("tuishou-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists());
+    }
 }

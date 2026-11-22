@@ -617,7 +617,7 @@ pub fn run() -> Result<ExitCode> {
                 max_download_bytes: http::max_download_bytes(),
                 quiet: cli.quiet,
                 verbose: cli.verbose,
-                smoke_check: false,
+                smoke_check: true,
                 verifier: verify::default_verifier(),
                 verify_config: loaded.verify.clone(),
                 commit_state: true,
