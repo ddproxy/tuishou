@@ -37,14 +37,8 @@ server_bin="$root/target/debug/examples/file_release_server"
 asset="tuishou-${tag}-${target}.tar.gz"
 checksum="${asset}.sha256"
 
-mkdir -p dist
-cp "$release_bin" dist/tuishou
-rm -f "dist/$asset" "dist/$checksum"
-tar -C dist -czf "dist/$asset" tuishou tuishou.bash tuishou.zsh tuishou.fish tuishou.1
-(cd dist && sha256sum "$asset" > "$checksum")
-(cd dist && sha256sum -c "$checksum")
-
 tmp="$(mktemp -d)"
+dist="$tmp/dist"
 server_pid=""
 cleanup() {
   if [ -n "$server_pid" ]; then
@@ -55,7 +49,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$server_bin" dist "$tag" > "$tmp/port" 2> "$tmp/server.log" &
+# build.rs materialises these files under OUT_DIR, never in the source tree.
+docs="$(find "$root/target/release/build" -type f -name tuishou.bash -path '*/out/*' -print -quit)"
+if [ -z "$docs" ]; then
+  echo "release-check: generated docs not found under OUT_DIR" >&2
+  exit 1
+fi
+generated="$(dirname "$docs")"
+mkdir -p "$dist"
+cp "$release_bin" "$dist/tuishou"
+cp "$generated/tuishou.bash" "$generated/tuishou.zsh" "$generated/tuishou.fish" "$generated/tuishou.1" "$dist/"
+tar -C "$dist" -czf "$dist/$asset" tuishou tuishou.bash tuishou.zsh tuishou.fish tuishou.1
+(cd "$dist" && sha256sum "$asset" > "$checksum")
+(cd "$dist" && sha256sum -c "$checksum")
+
+"$server_bin" "$dist" "$tag" > "$tmp/port" 2> "$tmp/server.log" &
 server_pid=$!
 port=""
 for _ in $(seq 1 100); do

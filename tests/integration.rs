@@ -1263,3 +1263,97 @@ fn removed_roll_config_sections_are_unknown_keys() {
         );
     }
 }
+
+#[test]
+fn status_line_shows_versions_and_last_check() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let prefix = td.path().join("prefix");
+    fs::create_dir_all(&prefix).unwrap();
+    let target = current_target();
+    let tag = "v0.5.0";
+    let specs = [
+        (
+            "ddproxy/reiki",
+            format!("reiki-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("reiki", b"reiki", Some(0o755))]),
+        ),
+        (
+            "ddproxy/tuishou-lu",
+            format!("lu-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
+        ),
+        (
+            "ddproxy/tuishou",
+            format!("tuishou-{tag}-{target}.tar.gz"),
+            make_tar_gz(&[("tuishou", b"tuishou", Some(0o755))]),
+        ),
+    ];
+    let server = FakeServer::start_with(|base| {
+        let mut routes = Vec::new();
+        for (repo, asset, archive) in &specs {
+            routes.extend(route_for_default(base, repo, tag, asset, archive));
+        }
+        routes
+    });
+
+    fs::write(
+        prefix.join(".tuishou.json"),
+        serde_json::json!({
+            "components": {
+                "lu": {
+                    "version": "v0.4.0",
+                    "target": target,
+                    "checksum": "a".repeat(64),
+                    "installed_at": "2025-12-01T00:00:00Z"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let auto_dir = prefix.join(".tuishou");
+    fs::create_dir_all(&auto_dir).unwrap();
+    fs::write(
+        auto_dir.join("auto.json"),
+        serde_json::json!({
+            "last_check": "2026-01-01T00:00:00Z",
+            "results": {
+                "lu": {"result": "update available v0.4.0 -> v0.5.0", "at": "2026-01-02T03:04:05Z"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home);
+    let out = cmd
+        .args(["status", "--prefix"])
+        .arg(&prefix)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "stdout={stdout}");
+    let lines: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    assert_eq!(lines.len(), 3, "stdout={stdout}");
+    for (line, name) in lines.iter().zip(["reiki", "lu", "tuishou"]) {
+        assert!(line.starts_with(&format!("{name}: ")), "line={line}");
+        assert!(line.contains("installed="), "line={line}");
+        assert!(line.contains("latest="), "line={line}");
+        assert!(line.contains("last_check="), "line={line}");
+    }
+    let lu = lines.iter().find(|line| line.starts_with("lu: ")).unwrap();
+    assert!(lu.contains("installed=v0.4.0"), "line={lu}");
+    assert!(lu.contains("latest=v0.5.0"), "line={lu}");
+    assert!(lu.contains("last_check=2026-01-02T03:04:05Z"), "line={lu}");
+    assert!(
+        stdout.contains("last_check=2026-01-01T00:00:00Z"),
+        "global last check should be the fallback: {stdout}"
+    );
+}

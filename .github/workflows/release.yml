@@ -19,6 +19,14 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+    # Ubuntu runners ship host musl tools only. A static aarch64 musl binary
+    # needs an aarch64 musl cross-linker; a glibc cross-compiler is not a
+    # drop-in replacement. Cross-linking is opt-in: set AARCH64_MUSL_LINKER to
+    # a working linker already installed on the runner (for example on a
+    # self-hosted runner). Otherwise the aarch64 steps are skipped rather than
+    # guessing at a toolchain and publishing a broken archive.
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -27,31 +35,43 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
+      - name: Skip aarch64 without a musl cross-linker
+        if: matrix.arch == 'aarch64' && vars.AARCH64_MUSL_LINKER == ''
+        run: echo "::notice::skipping aarch64 release target: no musl cross-linker configured"
       - name: Cache Rust
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install musl tools
+        if: matrix.arch != 'aarch64' || vars.AARCH64_MUSL_LINKER != ''
         run: |
+          set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          if [ "${{ matrix.arch }}" = "aarch64" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu
-          fi
       - name: Build
+        if: matrix.arch != 'aarch64' || vars.AARCH64_MUSL_LINKER != ''
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: ${{ vars.AARCH64_MUSL_LINKER }}
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package
+        if: matrix.arch != 'aarch64' || vars.AARCH64_MUSL_LINKER != ''
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
           TARGET="${{ matrix.target }}"
           OUT="tuishou-${TAG}-${TARGET}"
+          # build.rs writes generated docs under OUT_DIR, not into the source tree.
+          docs="$(find "target/${TARGET}/release/build" -type f -name tuishou.bash -path '*/out/*' -print -quit)"
+          if [ -z "$docs" ]; then
+            echo "generated docs not found under OUT_DIR" >&2
+            exit 1
+          fi
+          generated="$(dirname "$docs")"
           mkdir -p dist
           cp "target/${TARGET}/release/tuishou" "dist/tuishou"
-          # build.rs generated the completions and man page into dist/
+          cp "$generated/tuishou.bash" "$generated/tuishou.zsh" "$generated/tuishou.fish" "$generated/tuishou.1" dist/
           tar -C dist -czf "${OUT}.tar.gz" tuishou tuishou.bash tuishou.zsh tuishou.fish tuishou.1
           sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256"
       - name: Upload artifact
+        if: matrix.arch != 'aarch64' || vars.AARCH64_MUSL_LINKER != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tuishou-${{ github.ref_name }}-${{ matrix.target }}

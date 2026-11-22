@@ -156,20 +156,25 @@ pub fn get_json(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value> {
     serde_json::from_str(&body).map_err(|e| Error::Http(format!("invalid JSON from {url}: {e}")))
 }
 
+/// A response body read under an explicit byte cap, with its HTTP status kept
+/// so callers can map specific statuses without inspecting error text.
+pub struct LimitedResponse {
+    pub status: u16,
+    pub body: Vec<u8>,
+}
+
 /// GET a response body with an explicit byte cap. Used for attestation API
 /// responses, which must not be allowed to exhaust memory or disk.
-pub fn get_limited(
+pub fn get_limited_response(
     agent: &ureq::Agent,
     url: &str,
     headers: &[(&str, String)],
     max_bytes: u64,
-) -> Result<Vec<u8>> {
+) -> Result<LimitedResponse> {
     let mut all: Vec<(&str, String)> = headers.to_vec();
     all.extend(auth_headers_for(url));
     let resp = get_response(agent, url, &all)?;
-    if !(200..300).contains(&resp.status()) {
-        return Err(status_error("GET", url, resp));
-    }
+    let status = resp.status();
     let mut reader = resp.into_reader().take(max_bytes.saturating_add(1));
     let mut body = Vec::new();
     reader
@@ -178,7 +183,7 @@ pub fn get_limited(
     if body.len() as u64 > max_bytes {
         return Err(Error::DownloadTooLarge { limit: max_bytes });
     }
-    Ok(body)
+    Ok(LimitedResponse { status, body })
 }
 
 pub fn download_to_writer(
@@ -414,11 +419,18 @@ fn read_body(resp: ureq::Response, max_bytes: u64) -> Result<String> {
 fn status_error(method: &str, url: &str, resp: ureq::Response) -> Error {
     let code = resp.status();
     let body = resp.into_string().unwrap_or_default();
-    let body = redact_secrets(&crate::logging::one_line(body.trim()));
+    status_error_body(method, url, code, body.trim().as_bytes())
+}
+
+/// Build the same redacted, one-line HTTP error from an already-read body.
+pub(crate) fn status_error_body(method: &str, url: &str, status: u16, body: &[u8]) -> Error {
+    let body = redact_secrets(&crate::logging::one_line(
+        String::from_utf8_lossy(body).trim(),
+    ));
     let message = if body.is_empty() {
-        format!("{method} {url} failed with status {code}")
+        format!("{method} {url} failed with status {status}")
     } else {
-        format!("{method} {url} failed with status {code}: {body}")
+        format!("{method} {url} failed with status {status}: {body}")
     };
     Error::Http(redact_secrets(&message))
 }
