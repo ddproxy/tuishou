@@ -36,7 +36,7 @@ pub fn github_token() -> Option<String> {
 }
 
 /// GitHub tokens are only sent to GitHub API endpoints. Asset hosts and hosts
-/// added through `TUISHOU_ALLOWED_HOSTS` never receive credentials.
+/// added through the test-only `TUISHOU_ALLOWED_HOSTS` never receive credentials.
 pub fn auth_headers_for(url: &str) -> Vec<(&'static str, String)> {
     if !is_github_api(url) {
         return Vec::new();
@@ -340,17 +340,13 @@ fn origin(url: &str) -> Result<(String, String, u16)> {
     Ok((scheme, host, port))
 }
 
-/// Host allowlist for redirects. Loopback is permitted only for local tests
-/// via `TUISHOU_ALLOW_INSECURE_HTTP=1`.
+/// Host allowlist for redirects. Loopback and extra hosts are only available
+/// in builds with the `test-hooks` feature; release binaries ignore the
+/// corresponding environment variables.
 fn ensure_allowed_url(url: &str) -> Result<()> {
     ensure_https(url)?;
     let (_, host, _, _) = url_parts(url)?;
-    let extra = std::env::var("TUISHOU_ALLOWED_HOSTS")
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .any(|s| s == host);
+    let extra = extra_allowed_hosts().iter().any(|s| s == &host);
     let github = matches!(
         host.as_str(),
         "github.com"
@@ -358,7 +354,7 @@ fn ensure_allowed_url(url: &str) -> Result<()> {
             | "objects.githubusercontent.com"
             | "release-assets.githubusercontent.com"
             | "github-releases.githubusercontent.com"
-    ) || host.ends_with(".githubusercontent.com");
+    );
     let loopback =
         allow_insecure_http() && matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
     if github || extra || loopback {
@@ -370,8 +366,30 @@ fn ensure_allowed_url(url: &str) -> Result<()> {
     }
 }
 
+#[cfg(feature = "test-hooks")]
+fn extra_allowed_hosts() -> Vec<String> {
+    std::env::var("TUISHOU_ALLOWED_HOSTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn extra_allowed_hosts() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(feature = "test-hooks")]
 fn allow_insecure_http() -> bool {
     std::env::var("TUISHOU_ALLOW_INSECURE_HTTP").ok().as_deref() == Some("1")
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn allow_insecure_http() -> bool {
+    false
 }
 
 pub fn retry_after(value: Option<&str>) -> Option<u64> {
@@ -415,6 +433,7 @@ fn map_ureq_err(method: &str, url: &str, err: ureq::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "test-hooks")]
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -460,6 +479,7 @@ mod tests {
         assert_eq!(origin("http://localhost/a").unwrap().2, 80);
     }
 
+    #[cfg(feature = "test-hooks")]
     fn spawn_capture_server(
         body: &'static [u8],
         redirect: Option<String>,
@@ -506,6 +526,7 @@ mod tests {
         (base, seen, stop)
     }
 
+    #[cfg(feature = "test-hooks")]
     #[test]
     fn redirect_to_another_origin_drops_credentials() {
         let _guard = crate::test_env_lock();
@@ -538,6 +559,37 @@ mod tests {
         drop(second_requests);
         let _ = stop_first.send(());
         let _ = stop_second.send(());
+        std::env::remove_var("TUISHOU_ALLOW_INSECURE_HTTP");
+    }
+
+    #[test]
+    fn only_known_github_asset_hosts_are_allowed() {
+        let _guard = crate::test_env_lock();
+        assert!(ensure_allowed_url("https://objects.githubusercontent.com/a").is_ok());
+        assert!(ensure_allowed_url("https://release-assets.githubusercontent.com/a").is_ok());
+        assert!(ensure_allowed_url("https://attacker.githubusercontent.com/a").is_err());
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_hooks_enable_extra_hosts_and_loopback() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("TUISHOU_ALLOWED_HOSTS", "extra.test");
+        std::env::set_var("TUISHOU_ALLOW_INSECURE_HTTP", "1");
+        assert!(ensure_allowed_url("https://extra.test/x").is_ok());
+        assert!(ensure_allowed_url("http://127.0.0.1:8080/x").is_ok());
+        std::env::remove_var("TUISHOU_ALLOWED_HOSTS");
+        std::env::remove_var("TUISHOU_ALLOW_INSECURE_HTTP");
+    }
+
+    #[cfg(not(feature = "test-hooks"))]
+    #[test]
+    fn release_build_ignores_network_test_hooks() {
+        std::env::set_var("TUISHOU_ALLOWED_HOSTS", "extra.test");
+        std::env::set_var("TUISHOU_ALLOW_INSECURE_HTTP", "1");
+        assert!(ensure_allowed_url("https://extra.test/x").is_err());
+        assert!(ensure_allowed_url("http://127.0.0.1:8080/x").is_err());
+        std::env::remove_var("TUISHOU_ALLOWED_HOSTS");
         std::env::remove_var("TUISHOU_ALLOW_INSECURE_HTTP");
     }
 }

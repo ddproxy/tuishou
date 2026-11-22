@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "test-hooks")]
 pub const FAKE_VERIFIER_ENV: &str = "TUISHOU_FAKE_ATTESTATION";
 
 #[derive(Debug, Clone)]
@@ -58,11 +59,11 @@ impl AttestationVerifier for SigstoreAttestationVerifier {
     }
 }
 
-/// The injected verifier used by production call sites. A debug-only hook lets
-/// integration tests exercise install paths without network access; release
-/// builds always use the real verifier.
+/// The injected verifier used by production call sites. A compile-time
+/// `test-hooks` feature lets integration tests exercise install paths without
+/// network access; normal builds always use the real verifier.
 pub fn default_verifier() -> Arc<dyn AttestationVerifier> {
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "test-hooks")]
     {
         if std::env::var_os(FAKE_VERIFIER_ENV).is_some() {
             return Arc::new(FakeAttestationVerifier);
@@ -110,10 +111,12 @@ impl AttestationRequest {
     }
 }
 
-/// Fail-closed fake used by debug-build integration tests only.
+/// Fail-closed fake used by integration tests built with `test-hooks` only.
+#[cfg(feature = "test-hooks")]
 #[derive(Debug, Default)]
 pub struct FakeAttestationVerifier;
 
+#[cfg(feature = "test-hooks")]
 impl AttestationVerifier for FakeAttestationVerifier {
     fn verify(&self, request: &AttestationRequest) -> Result<AttestationReport> {
         let digest = hex_encode(&sha256_bytes(&request.path)?);
@@ -349,5 +352,25 @@ mod tests {
         std::fs::write(&p, b"hello").unwrap();
         let err = verify_checksum(&p, &"b".repeat(64)).unwrap_err();
         assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn test_hooks_can_select_fake_verifier() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var(FAKE_VERIFIER_ENV, "1");
+        let verifier = default_verifier();
+        assert!(format!("{verifier:?}").contains("FakeAttestationVerifier"));
+        std::env::remove_var(FAKE_VERIFIER_ENV);
+    }
+
+    #[cfg(not(feature = "test-hooks"))]
+    #[test]
+    fn env_cannot_select_fake_verifier_in_normal_builds() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("TUISHOU_FAKE_ATTESTATION", "1");
+        let verifier = default_verifier();
+        assert!(!format!("{verifier:?}").contains("FakeAttestationVerifier"));
+        std::env::remove_var("TUISHOU_FAKE_ATTESTATION");
     }
 }

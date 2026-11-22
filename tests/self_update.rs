@@ -227,6 +227,37 @@ fn self_update_bad_checksum_leaves_binary_in_place() {
 }
 
 #[test]
+fn self_update_smoke_failure_leaves_binary_in_place() {
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let install_dir = td.path().join("prefix");
+    let binary = copy_binary_to(&install_dir);
+    let original = fs::read(&binary).unwrap();
+
+    let archive = tar_gz(&[("tuishou", b"#!/bin/sh\nexit 1\n")]);
+    let checksum = format!(
+        "{}  tuishou-v0.2.0-{}.tar.gz\n",
+        sha256_hex(&archive),
+        target()
+    );
+    let server = FakeServer::start_with(|base| release_routes(base, &archive, &checksum, "v0.2.0"));
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tuishou"));
+    env_for(&mut cmd, &server, &home);
+    cmd.args(["self-update", "--version", "v0.2.0", "--prefix"])
+        .arg(&install_dir)
+        .arg("--allow-unattested");
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("smoke check failed"), "stderr={stderr}");
+    assert_eq!(fs::read(&binary).unwrap(), original);
+    assert!(!install_dir.join("tuishou.prev").exists());
+    assert!(!install_dir.join(".tuishou.json").exists());
+}
+
+#[test]
 fn self_update_dry_run_does_not_write() {
     let td = tempfile::tempdir().unwrap();
     let home = td.path().join("home");

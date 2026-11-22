@@ -26,9 +26,9 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --features test-hooks
       # The runner user is already non-root. This step proves the suite does not depend on a
       # working gh CLI, an external network or a populated HOME; a unit test also checks that the
       # source never spawns gh.
@@ -46,4 +46,4 @@ jobs:
           env PATH="$bindir:$PATH" HOME="$bindir/home" \
             CARGO_HOME="$cargo_home" RUSTUP_HOME="$rustup_home" \
             XDG_STATE_HOME="$bindir/home/.local/state" \
-            cargo test --workspace --locked
+            cargo test --workspace --locked --features test-hooks
