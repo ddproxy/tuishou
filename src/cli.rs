@@ -1,3 +1,4 @@
+use crate::auto_update;
 use crate::completions;
 use crate::component::{resolve_component, resolve_components};
 use crate::config;
@@ -9,6 +10,7 @@ use crate::release;
 use crate::roll;
 use crate::rollback;
 use crate::self_update;
+use crate::state;
 use crate::status;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -58,6 +60,9 @@ pub enum Commands {
         /// Allow crossing a major version boundary
         #[arg(long)]
         allow_major: bool,
+        /// Run <binary> --version after install (the only release code executed)
+        #[arg(long)]
+        smoke_check: bool,
     },
     /// Update installed components
     Update {
@@ -126,6 +131,29 @@ pub enum Commands {
         /// Words typed so far, with the current word last
         words: Vec<String>,
     },
+    /// Opt-in scheduled auto-update (off by default, not recommended for production)
+    #[command(subcommand)]
+    AutoUpdate(AutoUpdateAction),
+
+    /// Record an existing binary in state without replacing it
+    Adopt {
+        /// Component name
+        component: String,
+        /// Release version tag the existing binary represents
+        #[arg(long)]
+        version: String,
+        /// Install prefix directory
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+    },
+
+    #[command(hide = true, name = "__auto-update-locked")]
+    AutoUpdateLocked {
+        /// Install prefix directory
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+    },
+
     /// Roll a component across a fleet over SSH
     Roll {
         /// Inventory file path or comma-separated node list
@@ -152,6 +180,46 @@ pub enum Commands {
         /// Allow install when gh attestation verification is unavailable
         #[arg(long)]
         allow_unattested: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AutoUpdateAction {
+    /// Run one update cycle (no daemon; the timer or cron schedules cycles)
+    Run {
+        /// Explicit one-shot marker; accepted for systemd unit clarity
+        #[arg(long)]
+        once: bool,
+        /// Always refused: attestations are mandatory in auto mode
+        #[arg(long)]
+        allow_unattested: bool,
+    },
+    /// Print, but do not install, a systemd service and timer unit pair
+    InstallTimer {
+        /// OnUnitActiveSec value (default 10m, minimum 5m)
+        #[arg(long)]
+        interval: Option<String>,
+    },
+    /// Show last check, per-component results, hold state and next version
+    Status,
+    /// Pause all automatic updates by creating the HOLD file
+    Hold {
+        /// Why updates are paused
+        #[arg(long)]
+        reason: Option<String>,
+        /// RFC3339 time at which the hold expires
+        #[arg(long)]
+        expires_at: Option<String>,
+        /// Duration after which the hold expires (e.g. 2h)
+        #[arg(long)]
+        expires_in: Option<String>,
+    },
+    /// Remove the HOLD file and resume automatic updates
+    Release,
+    /// Forget bad versions so they can be retried
+    ClearBad {
+        /// Component to clear (default: all)
+        component: Option<String>,
     },
 }
 
@@ -183,7 +251,9 @@ pub fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let components = config::load_components(None)?;
+    let loaded = config::load_config(None)?;
+    let components = loaded.components;
+    let auto_cfg = loaded.auto_update;
     let agent = http::agent();
 
     match cli.command {
@@ -194,6 +264,7 @@ pub fn run() -> Result<ExitCode> {
             dry_run,
             allow_unattested,
             allow_major,
+            smoke_check,
         } => {
             let targets = resolve_components(&[component], &components)?;
             let opts = InstallOptions {
@@ -205,6 +276,8 @@ pub fn run() -> Result<ExitCode> {
                 max_download_bytes: http::max_download_bytes(),
                 quiet: cli.quiet,
                 verbose: cli.verbose,
+                smoke_check,
+                signer_workflow: None,
             };
             let mut outcomes = Vec::new();
             for c in &targets {
@@ -294,6 +367,8 @@ pub fn run() -> Result<ExitCode> {
                     max_download_bytes: http::max_download_bytes(),
                     quiet: cli.quiet,
                     verbose: cli.verbose,
+                    smoke_check: false,
+                    signer_workflow: None,
                 };
                 install::install_component(&agent, c, &opts)?;
             }
@@ -343,6 +418,8 @@ pub fn run() -> Result<ExitCode> {
                 max_download_bytes: http::max_download_bytes(),
                 quiet: cli.quiet,
                 verbose: cli.verbose,
+                smoke_check: false,
+                signer_workflow: None,
             };
             let outcome = install::install_component(&agent, &component, &opts)?;
             if cli.json {
@@ -376,6 +453,90 @@ pub fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Complete { .. } => unreachable!("handled before config load"),
+        Commands::Adopt {
+            component,
+            version,
+            prefix,
+        } => {
+            let c = resolve_component(&component, &components)?;
+            let tag = release::normalize_tag(&version);
+            let bin_dir = install::install_dir(prefix.as_deref());
+            let present: Vec<String> = c
+                .binaries
+                .iter()
+                .filter(|name| bin_dir.join(name).is_file())
+                .cloned()
+                .collect();
+            if present.is_empty() {
+                return Err(Error::msg(format!(
+                    "adopt {}: none of the component binaries ({}) exist in {}; nothing to record",
+                    c.name,
+                    c.binaries.join(", "),
+                    bin_dir.display()
+                )));
+            }
+            let checksum = crate::verify::sha256_file(&bin_dir.join(&present[0]))?;
+            let state_path = state::default_state_path(prefix.as_deref());
+            let mut st = state::load(&state_path)?;
+            let previous_version = st.components.get(&c.name).map(|e| e.version.clone());
+            st.components.insert(
+                c.name.clone(),
+                state::InstalledComponent {
+                    version: tag.clone(),
+                    target: crate::target::Target::detect()?.as_str().to_string(),
+                    checksum,
+                    installed_at: state::now_rfc3339()?,
+                    previous_version,
+                },
+            );
+            state::save(&state_path, &st)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "component": c.name,
+                        "version": tag,
+                        "binaries": present,
+                        "adopted": true,
+                    })
+                );
+            } else if !cli.quiet {
+                println!("adopted {} {} ({})", c.name, tag, present.join(", "));
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::AutoUpdateLocked { prefix } => {
+            auto_update::handle_locked(prefix.as_deref(), cli.quiet)
+        }
+        Commands::AutoUpdate(action) => match action {
+            AutoUpdateAction::Run {
+                once,
+                allow_unattested,
+            } => auto_update::handle_run(&auto_cfg, None, once, cli.quiet, allow_unattested),
+            AutoUpdateAction::InstallTimer { interval } => {
+                auto_update::print_timer(interval.as_deref())?;
+                Ok(ExitCode::SUCCESS)
+            }
+            AutoUpdateAction::Status => {
+                auto_update::handle_status(&config::load_config(None)?, None, cli.json, cli.quiet)
+            }
+            AutoUpdateAction::Hold {
+                reason,
+                expires_at,
+                expires_in,
+            } => {
+                auto_update::handle_hold(None, reason, expires_at, expires_in)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            AutoUpdateAction::Release => {
+                auto_update::handle_release_hold(None)?;
+                Ok(ExitCode::SUCCESS)
+            }
+            AutoUpdateAction::ClearBad { component } => {
+                auto_update::handle_clear_bad(None, component.as_deref())?;
+                Ok(ExitCode::SUCCESS)
+            }
+        },
         Commands::Roll {
             nodes,
             component,

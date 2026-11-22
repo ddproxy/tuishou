@@ -354,7 +354,7 @@ fn ssh_run(node: &Node, cmd: &[String]) -> Result<()> {
     }
 }
 
-fn is_drained(lu_node_json: &str) -> bool {
+pub fn is_drained(lu_node_json: &str) -> bool {
     // Heuristic: look for running/draining state in JSON. Accept "running_jobs":0 or "jobs":[] or "drained":true.
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(lu_node_json) {
         if let Some(d) = v.get("drained").and_then(|x| x.as_bool()) {

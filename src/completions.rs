@@ -9,12 +9,22 @@ pub const COMMANDS: &[&str] = &[
     "rollback",
     "roll",
     "self-update",
+    "auto-update",
+    "adopt",
     "completions",
     "man",
 ];
 
 const GLOBAL_OPTIONS: &[&str] = &["--json", "--quiet", "--verbose", "--help", "--version"];
-const COMPONENTS: &[&str] = &["lu", "tuishou", "all"];
+const COMPONENTS: &[&str] = &["lu", "ting", "tuishou", "all"];
+const AUTO_ACTIONS: &[&str] = &[
+    "run",
+    "install-timer",
+    "status",
+    "hold",
+    "release",
+    "clear-bad",
+];
 
 pub fn command_options(command: &str) -> &'static [&'static str] {
     match command {
@@ -24,6 +34,7 @@ pub fn command_options(command: &str) -> &'static [&'static str] {
             "--dry-run",
             "--allow-unattested",
             "--allow-major",
+            "--smoke-check",
         ],
         "update" => &["--check", "--allow-major", "--allow-unattested", "--prefix"],
         "status" => &["--prefix"],
@@ -44,6 +55,8 @@ pub fn command_options(command: &str) -> &'static [&'static str] {
             "--allow-unattested",
             "--allow-major",
         ],
+        "auto-update" => &["--json", "--quiet"],
+        "adopt" => &["--version", "--prefix"],
         "completions" => &[],
         "man" => &[],
         _ => &[],
@@ -67,8 +80,9 @@ pub fn candidates(words: &[String]) -> String {
         pool.extend_from_slice(COMMANDS);
     } else if let Some(first) = words.first() {
         match first.as_str() {
-            "install" | "update" | "rollback" => pool.extend_from_slice(COMPONENTS),
+            "install" | "update" | "rollback" | "adopt" => pool.extend_from_slice(COMPONENTS),
             "completions" => pool.extend_from_slice(&["bash", "zsh", "fish"]),
+            "auto-update" if words.len() == 2 => pool.extend_from_slice(AUTO_ACTIONS),
             _ => {}
         }
         pool.extend_from_slice(GLOBAL_OPTIONS);

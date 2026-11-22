@@ -20,6 +20,11 @@ pub struct InstallOptions {
     pub quiet: bool,
     #[allow(dead_code)]
     pub verbose: bool,
+    /// Run `<binary> --version` after install. This is the only code from a
+    /// release archive that tuishou ever executes.
+    pub smoke_check: bool,
+    /// Expected workflow identity for `gh attestation verify --signer-workflow`.
+    pub signer_workflow: Option<String>,
 }
 
 pub struct InstallOutcome {
@@ -100,10 +105,11 @@ pub fn install_component(
     let checksum_content = download::read_checksum_file(&downloaded.checksum_path)?;
     let expected = verify::parse_checksum_file(&checksum_content, &asset_name)?;
     verify::verify_checksum(&downloaded.archive_path, &expected)?;
-    verify::verify_attestation(
+    verify::verify_attestation_with_signer(
         &downloaded.archive_path,
         &component.repo,
         opts.allow_unattested,
+        opts.signer_workflow.as_deref(),
     )?;
 
     let extract_dir = tmp.join("extract");
@@ -127,6 +133,10 @@ pub fn install_component(
     for bin in &extracted {
         install_binary(&bin.path, &bin_dir, &bin.name)?;
         installed_names.push(bin.name.clone());
+    }
+
+    if opts.smoke_check {
+        smoke_check(&bin_dir, &installed_names)?;
     }
 
     let prev_version = st
@@ -172,6 +182,37 @@ fn default_bin_dir() -> PathBuf {
         }
     }
     PathBuf::from("/usr/local/bin")
+}
+
+/// The only release-provided code tuishou executes: `--version` on each
+/// installed binary. A non-zero exit or empty output fails the install.
+pub fn smoke_check(bin_dir: &Path, binaries: &[String]) -> Result<()> {
+    for name in binaries {
+        let path = bin_dir.join(name);
+        let output = std::process::Command::new(&path)
+            .arg("--version")
+            .output()
+            .map_err(|e| {
+                Error::msg(format!(
+                    "smoke check failed for {}: could not run {}: {e}",
+                    name,
+                    path.display()
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(Error::msg(format!(
+                "smoke check failed for {name}: --version exited with {}",
+                output.status
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.trim().is_empty() {
+            return Err(Error::msg(format!(
+                "smoke check failed for {name}: --version produced no output"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn install_binary(src: &Path, bin_dir: &Path, name: &str) -> Result<()> {
