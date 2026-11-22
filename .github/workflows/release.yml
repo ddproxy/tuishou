@@ -50,7 +50,8 @@ jobs:
           OUT="tuishou-${TAG}-${TARGET}"
           mkdir -p dist
           cp "target/${TARGET}/release/tuishou" "dist/tuishou"
-          tar -C dist -czf "${OUT}.tar.gz" tuishou
+          # build.rs generated the completions and man page into dist/
+          tar -C dist -czf "${OUT}.tar.gz" tuishou tuishou.bash tuishou.zsh tuishou.fish tuishou.1
           sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256"
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

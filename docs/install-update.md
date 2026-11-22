@@ -41,3 +41,22 @@ tuishou rollback <component> [--prefix DIR]
 ```
 
 Restores `<name>.prev` for the component binaries.
+
+## Self-update
+
+```sh
+tuishou self-update [--version vX.Y.Z] [--prefix DIR] [--allow-unattested] [--allow-major] [--dry-run]
+```
+
+Updates the `tuishou` binary itself from its own release archive. It uses the
+same checksum and attestation verification as component installs, writes the
+new binary atomically next to the running executable (or into `--prefix`), and
+keeps the old binary as `tuishou.prev`. See
+[Verify a tuishou release](verify-release.md) for manual verification steps.
+
+## Generated docs
+
+`cargo build` writes shell completions (`dist/tuishou.bash`, `dist/tuishou.zsh`,
+`dist/tuishou.fish`) and the man page (`dist/tuishou.1`) into `dist/`. Those
+files are generated at build time and are not committed. The same content is
+available on demand via `tuishou completions <bash|zsh|fish>` and `tuishou man`.

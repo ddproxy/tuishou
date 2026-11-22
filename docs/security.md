@@ -1,5 +1,7 @@
 # Security
 
+See [Verify a tuishou release](verify-release.md) for checksum and attestation commands you can run yourself.
+
 ## Verified
 
 - **SHA-256 checksums**: every downloaded archive is verified against its `.sha256` file before extraction.

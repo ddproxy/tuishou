@@ -2,8 +2,10 @@
 
 mod archive;
 mod cli;
+mod completions;
 mod component;
 mod config;
+mod docs_static;
 mod download;
 mod error;
 mod http;
@@ -11,6 +13,7 @@ mod install;
 mod release;
 mod roll;
 mod rollback;
+mod self_update;
 mod state;
 mod status;
 mod target;

@@ -25,13 +25,22 @@ impl Component {
 }
 
 pub fn builtin_components() -> Vec<Component> {
-    vec![Component {
-        name: "lu".to_string(),
-        repo: "ddproxy/lu".to_string(),
-        asset_pattern: "lu-{tag}-{target}.tar.gz".to_string(),
-        binaries: vec!["lu".to_string(), "lu-agent".to_string(), "ting".to_string()],
-        service_unit: None,
-    }]
+    vec![
+        Component {
+            name: "lu".to_string(),
+            repo: "ddproxy/lu".to_string(),
+            asset_pattern: "lu-{tag}-{target}.tar.gz".to_string(),
+            binaries: vec!["lu".to_string(), "lu-agent".to_string(), "ting".to_string()],
+            service_unit: None,
+        },
+        Component {
+            name: "tuishou".to_string(),
+            repo: "ddproxy/tuishou".to_string(),
+            asset_pattern: "tuishou-{tag}-{target}.tar.gz".to_string(),
+            binaries: vec!["tuishou".to_string()],
+            service_unit: None,
+        },
+    ]
 }
 
 pub fn resolve_component(name: &str, components: &[Component]) -> Result<Component> {

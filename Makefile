@@ -1,9 +1,13 @@
-.PHONY: build test lint docs
+.PHONY: build test lint docs release-check validate-workflows
 
 build:
 	cargo build --locked
 
-test:
+validate-workflows:
+	bash scripts/validate-workflows.sh
+	bash scripts/test-validate-workflows.sh
+
+test: validate-workflows
 	cargo test --workspace --locked
 
 lint:
@@ -12,3 +16,6 @@ lint:
 
 docs:
 	@if command -v vale >/dev/null 2>&1; then vale README.md docs/*.md CHANGELOG.md SECURITY.md; else echo "vale not installed; skipping"; fi
+
+release-check: build
+	bash scripts/release-check.sh

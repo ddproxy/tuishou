@@ -1,13 +1,16 @@
+use crate::completions;
 use crate::component::{resolve_component, resolve_components};
 use crate::config;
+use crate::docs_static;
 use crate::error::{Error, Result, EXIT_UPDATES_AVAILABLE};
 use crate::http;
 use crate::install::{self, InstallOptions};
 use crate::release;
 use crate::roll;
 use crate::rollback;
+use crate::self_update;
 use crate::status;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -87,6 +90,42 @@ pub enum Commands {
         #[arg(long)]
         prefix: Option<PathBuf>,
     },
+    /// Update the tuishou binary itself from its own release archive
+    SelfUpdate {
+        /// Release version tag (e.g. v0.2.0)
+        #[arg(long)]
+        version: Option<String>,
+        /// Directory to install into (default: directory of the running binary)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+        /// Allow install when gh attestation verification is unavailable
+        #[arg(long)]
+        allow_unattested: bool,
+        /// Allow crossing a major version boundary
+        #[arg(long)]
+        allow_major: bool,
+        /// Show what would be done without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Print a shell completion script
+    Completions {
+        /// Shell to generate for
+        #[arg(value_enum)]
+        shell: CompletionShell,
+    },
+    /// Print the tuishou man page
+    Man,
+    #[command(
+        hide = true,
+        name = "__complete",
+        trailing_var_arg = true,
+        allow_hyphen_values = true
+    )]
+    Complete {
+        /// Words typed so far, with the current word last
+        words: Vec<String>,
+    },
     /// Roll a component across a fleet over SSH
     Roll {
         /// Inventory file path or comma-separated node list
@@ -116,10 +155,33 @@ pub enum Commands {
     },
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+impl CompletionShell {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+            Self::Fish => "fish",
+        }
+    }
+}
+
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     // NO_COLOR respected - we emit no ANSI color; keep placeholder for future.
     let _ = std::env::var_os("NO_COLOR");
+
+    // Completion must work even if the working directory has a broken config.
+    if let Commands::Complete { words } = &cli.command {
+        println!("{}", completions::candidates(words));
+        return Ok(ExitCode::SUCCESS);
+    }
 
     let components = config::load_components(None)?;
     let agent = http::agent();
@@ -263,6 +325,57 @@ pub fn run() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Commands::SelfUpdate {
+            version,
+            prefix,
+            allow_unattested,
+            allow_major,
+            dry_run,
+        } => {
+            let component = self_update::self_component(&components);
+            let bin_dir = self_update::binary_dir(prefix.as_deref())?;
+            let opts = InstallOptions {
+                version,
+                prefix: Some(bin_dir),
+                dry_run,
+                allow_unattested,
+                allow_major,
+                max_download_bytes: http::max_download_bytes(),
+                quiet: cli.quiet,
+                verbose: cli.verbose,
+            };
+            let outcome = install::install_component(&agent, &component, &opts)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "component": outcome.component,
+                        "version": outcome.version,
+                        "binaries": outcome.binaries,
+                        "dry_run": outcome.dry_run,
+                        "self": true,
+                    })
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Completions { shell } => {
+            let file = format!("tuishou.{}", shell.as_str());
+            let body = docs_static::DIST_FILES
+                .iter()
+                .find(|(name, _)| *name == file)
+                .map(|(_, body)| *body)
+                .ok_or_else(|| {
+                    Error::msg(format!("no completion script for {}", shell.as_str()))
+                })?;
+            print!("{body}");
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Man => {
+            print!("{}", docs_static::MAN_PAGE);
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Complete { .. } => unreachable!("handled before config load"),
         Commands::Roll {
             nodes,
             component,

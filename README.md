@@ -48,6 +48,13 @@ tuishou status --json
 # Roll back a component to the previous binary
 tuishou rollback lu
 
+# Update the tuishou binary itself from its own release
+tuishou self-update --version v0.2.0
+
+# Print shell completions or the man page
+tuishou completions bash
+tuishou man
+
 # Roll a component across a fleet
 tuishou roll --nodes inventory.toml --component lu --version v0.4.0 --dry-run
 ```
@@ -58,6 +65,7 @@ Global flags: `--json`, `--quiet`, `--verbose`. `NO_COLOR` is respected.
 
 - [Quick start](docs/quick-start.md)
 - [Install and update](docs/install-update.md)
+- [Verify a tuishou release](docs/verify-release.md)
 - [Fleet roll](docs/fleet-roll.md)
 - [Security](docs/security.md)
 - [FAQ](docs/faq.md)
@@ -69,6 +77,7 @@ make build
 make test
 make lint
 make docs
+make release-check
 ```
 
 ## License

@@ -372,3 +372,39 @@ fn is_drained(lu_node_json: &str) -> bool {
     }
     false
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Extract the first fenced ```toml block from a markdown document.
+    fn first_toml_block(doc: &str) -> String {
+        let mut lines = doc.lines();
+        while let Some(line) = lines.next() {
+            if line.trim() == "```toml" {
+                let mut block = String::new();
+                for line in lines.by_ref() {
+                    if line.trim() == "```" {
+                        return block;
+                    }
+                    block.push_str(line);
+                    block.push('\n');
+                }
+            }
+        }
+        panic!("no ```toml fenced block found in docs");
+    }
+
+    #[test]
+    fn documented_inventory_example_parses() {
+        let doc = include_str!("../docs/fleet-roll.md");
+        let example = first_toml_block(doc);
+        let inventory: Inventory = toml::from_str(&example)
+            .unwrap_or_else(|e| panic!("documented inventory example is invalid: {e}\n{example}"));
+        assert_eq!(inventory.node.len(), 2);
+        assert_eq!(inventory.node[0].name, "node-1");
+        assert_eq!(inventory.node[0].ssh, "deploy@10.0.0.11");
+        assert_eq!(inventory.node[0].port, Some(22));
+        assert_eq!(inventory.node[1].unit.as_deref(), Some("lu-agent.service"));
+    }
+}
