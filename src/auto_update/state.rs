@@ -2,10 +2,14 @@
 
 use crate::error::{Error, Result};
 use crate::release::Release;
+use rustix::fs::{flock, FlockOperation};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -110,6 +114,70 @@ pub fn lock_path(prefix: Option<&Path>) -> PathBuf {
     state_dir(prefix).join("lock")
 }
 
+/// An OS advisory lock. The kernel releases it when the process exits (or is
+/// killed), so a stale lock can never block later cycles after a reboot.
+pub struct CycleLock {
+    file: File,
+}
+
+impl CycleLock {
+    pub fn acquire(prefix: Option<&Path>) -> Result<Self> {
+        let path = lock_path(prefix);
+        let _ = ensure_state_dir(prefix)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| Error::Write {
+                path: path.clone(),
+                source,
+            })?;
+        flock(&file, FlockOperation::LockExclusive).map_err(|source| Error::Write {
+            path: path.clone(),
+            source: source.into(),
+        })?;
+        Ok(Self { file })
+    }
+
+    /// Non-blocking variant: a concurrent cycle exits quietly instead of
+    /// waiting, and the OS releases the lock if the holder dies.
+    pub fn try_acquire(prefix: Option<&Path>) -> Result<Option<Self>> {
+        let path = lock_path(prefix);
+        let _ = ensure_state_dir(prefix)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|source| Error::Write {
+                path: path.clone(),
+                source,
+            })?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(Some(Self { file })),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(source) => Err(Error::Write {
+                path,
+                source: source.into(),
+            }),
+        }
+    }
+}
+
+impl Drop for CycleLock {
+    fn drop(&mut self) {
+        let _ = flock(&self.file, FlockOperation::Unlock);
+    }
+}
+
+/// Run a closure while holding the same cycle lock used by `auto-update run`.
+/// All state readers/writers that modify state must go through this helper.
+pub fn with_cycle_lock<T>(prefix: Option<&Path>, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let _guard = CycleLock::acquire(prefix)?;
+    f()
+}
+
 pub fn load(prefix: Option<&Path>) -> Result<AutoState> {
     let path = state_path(prefix);
     if !path.exists() {
@@ -124,20 +192,68 @@ pub fn load(prefix: Option<&Path>) -> Result<AutoState> {
 }
 
 pub fn save(prefix: Option<&Path>, state: &AutoState) -> Result<()> {
-    let dir = ensure_state_dir(prefix)?;
-    let path = state_path(prefix);
+    let _ = ensure_state_dir(prefix)?;
     let text = serde_json::to_string_pretty(state)
         .map_err(|e| Error::msg(format!("failed to serialize auto-update state: {e}")))?;
-    let tmp = dir.join("auto.json.tmp");
-    fs::write(&tmp, format!("{text}\n")).map_err(|source| Error::Write {
-        path: tmp.clone(),
+    atomic_write(&state_path(prefix), format!("{text}\n").as_bytes())
+}
+
+/// Write through a unique temp file, fsync the data, rename into place and
+/// fsync the directory. Unique names avoid the previous collision between two
+/// writers that both used `<state dir>/auto.json.tmp`.
+fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| Error::Write {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let tmp = unique_temp_path(path);
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|source| Error::Write {
+                path: tmp.clone(),
+                source,
+            })?;
+        file.write_all(content)
+            .and_then(|()| file.sync_all())
+            .map_err(|source| Error::Write {
+                path: tmp.clone(),
+                source,
+            })?;
+    }
+    fs::rename(&tmp, path).map_err(|source| Error::Write {
+        path: path.to_path_buf(),
         source,
     })?;
-    fs::rename(&tmp, &path).map_err(|source| Error::Write {
-        path: path.clone(),
-        source,
-    })?;
+    if let Some(parent) = path.parent() {
+        // Directory fsync is best-effort: some filesystems reject it.
+        if let Ok(dir) = File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
+}
+
+fn unique_temp_path(path: &Path) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "state".to_string());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_name = format!(".{name}.tmp-{}-{nanos}-{seq}", std::process::id());
+    match path.parent() {
+        Some(parent) => parent.join(tmp_name),
+        None => PathBuf::from(tmp_name),
+    }
 }
 
 /// Parse a hold file. Plain text is accepted as a reason for hand-written
@@ -189,20 +305,9 @@ pub fn active_hold(prefix: Option<&Path>) -> Result<Option<Hold>> {
 }
 
 pub fn write_hold(prefix: Option<&Path>, hold: &Hold) -> Result<()> {
-    let dir = ensure_state_dir(prefix)?;
-    let path = hold_path(prefix);
     let text = serde_json::to_string_pretty(hold)
         .map_err(|e| Error::msg(format!("failed to serialize hold: {e}")))?;
-    let tmp = dir.join("HOLD.tmp");
-    fs::write(&tmp, format!("{text}\n")).map_err(|source| Error::Write {
-        path: tmp.clone(),
-        source,
-    })?;
-    fs::rename(&tmp, &path).map_err(|source| Error::Write {
-        path: path.clone(),
-        source,
-    })?;
-    Ok(())
+    atomic_write(&hold_path(prefix), format!("{text}\n").as_bytes())
 }
 
 pub fn remove_hold(prefix: Option<&Path>) -> Result<bool> {
@@ -234,5 +339,47 @@ mod tests {
             state_dir(Some(Path::new("/opt/bin"))),
             PathBuf::from("/opt/bin/.tuishou")
         );
+    }
+
+    #[test]
+    fn cycle_lock_is_os_released_and_rejects_a_second_holder() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        let first = CycleLock::acquire(Some(prefix)).unwrap();
+        assert!(CycleLock::try_acquire(Some(prefix)).unwrap().is_none());
+        drop(first);
+        assert!(CycleLock::try_acquire(Some(prefix)).unwrap().is_some());
+    }
+
+    #[test]
+    fn stale_directory_lock_does_not_block_the_cycle_lock() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        let stale = state_dir(Some(prefix)).join("lock.d");
+        fs::create_dir_all(&stale).unwrap();
+        assert!(CycleLock::acquire(Some(prefix)).is_ok());
+    }
+
+    #[test]
+    fn state_writes_use_unique_temp_names() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        let first = AutoState {
+            last_check: Some("first".to_string()),
+            ..AutoState::default()
+        };
+        let second = AutoState {
+            last_check: Some("second".to_string()),
+            ..AutoState::default()
+        };
+        save(Some(prefix), &first).unwrap();
+        save(Some(prefix), &second).unwrap();
+        assert_eq!(
+            load(Some(prefix)).unwrap().last_check.as_deref(),
+            Some("second")
+        );
+        assert!(!state_path(Some(prefix))
+            .with_file_name("auto.json.tmp")
+            .exists());
     }
 }

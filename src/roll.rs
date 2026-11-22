@@ -1,10 +1,13 @@
 use crate::component::Component;
 use crate::error::{Error, Result};
+use crate::lu;
+use crate::process;
 use serde::Deserialize;
 use std::path::Path;
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -101,16 +104,19 @@ pub struct SystemRollRunner;
 
 impl RollRunner for SystemRollRunner {
     fn drain(&self, node: &Node) -> Result<()> {
-        run_lu(&["node", "drain", &node.name])
+        run_lu(&["drain", &node.name])
     }
 
     fn wait_drained(&self, node: &Node, force_after_secs: Option<u64>) -> Result<()> {
         let timeout = Duration::from_secs(force_after_secs.unwrap_or(300));
         let start = Instant::now();
         loop {
-            let out = run_lu_capture(&["node", &node.name, "--json"])?;
-            if is_drained(&out) {
-                return Ok(());
+            // `lu nodes --json` is the only supported source of drain state.
+            let out = run_lu_capture(&["nodes", "--json"]);
+            if let Ok(text) = &out {
+                if is_drained(text, &node.name) {
+                    return Ok(());
+                }
             }
             if start.elapsed() >= timeout {
                 if force_after_secs.is_some() {
@@ -120,9 +126,13 @@ impl RollRunner for SystemRollRunner {
                     );
                     return Ok(());
                 }
+                let detail = out
+                    .err()
+                    .map(|e| format!(" (last error: {e})"))
+                    .unwrap_or_default();
                 return Err(Error::Roll {
                     node: node.name.clone(),
-                    reason: "timed out waiting for node to drain".to_string(),
+                    reason: format!("timed out waiting for node to drain{detail}"),
                 });
             }
             thread::sleep(Duration::from_secs(2));
@@ -163,16 +173,21 @@ impl RollRunner for SystemRollRunner {
         let timeout = Duration::from_secs(timeout_secs);
         let start = Instant::now();
         loop {
-            let out = run_lu_capture(&["node", &node.name, "--json"]);
-            if let Ok(text) = out {
-                if text.contains(version) {
+            let out = run_lu_capture(&["nodes", "--json"]);
+            if let Ok(text) = &out {
+                // Exact normalized match: 0.4.10 must not satisfy 0.4.1.
+                if lu::node_reports_version(text, &node.name, version) {
                     return Ok(());
                 }
             }
             if start.elapsed() >= timeout {
+                let detail = out
+                    .err()
+                    .map(|e| format!(" (last error: {e})"))
+                    .unwrap_or_default();
                 return Err(Error::Roll {
                     node: node.name.clone(),
-                    reason: format!("timed out waiting for version {version}"),
+                    reason: format!("timed out waiting for version {version}{detail}"),
                 });
             }
             thread::sleep(Duration::from_secs(2));
@@ -180,7 +195,7 @@ impl RollRunner for SystemRollRunner {
     }
 
     fn undrain(&self, node: &Node) -> Result<()> {
-        run_lu(&["node", "undrain", &node.name])
+        run_lu(&["undrain", &node.name])
     }
 
     fn latest_version(&self, component: &Component) -> Result<String> {
@@ -285,47 +300,12 @@ fn print_plan(plan: &RollPlan, nodes: &[Node], version: &str) -> Result<()> {
 }
 
 fn run_lu(args: &[&str]) -> Result<()> {
-    let lu = find_lu()?;
-    let status = Command::new(&lu)
-        .args(args)
-        .status()
-        .map_err(|e| Error::msg(format!("failed to run lu: {e}")))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::msg(format!(
-            "lu {} failed with {}",
-            args.join(" "),
-            status
-        )))
-    }
+    process::checked("lu", args, COMMAND_TIMEOUT)?;
+    Ok(())
 }
 
 fn run_lu_capture(args: &[&str]) -> Result<String> {
-    let lu = find_lu()?;
-    let out = Command::new(&lu)
-        .args(args)
-        .output()
-        .map_err(|e| Error::msg(format!("failed to run lu: {e}")))?;
-    if !out.status.success() {
-        return Err(Error::msg(format!(
-            "lu {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-fn find_lu() -> Result<String> {
-    let path_var = std::env::var_os("PATH").ok_or_else(|| Error::msg("PATH not set"))?;
-    for dir in std::env::split_paths(&path_var) {
-        let cand = dir.join("lu");
-        if cand.is_file() {
-            return Ok(cand.to_string_lossy().to_string());
-        }
-    }
-    Err(Error::msg("lu CLI not found on PATH"))
+    Ok(process::checked("lu", args, COMMAND_TIMEOUT)?.stdout)
 }
 
 fn ssh_run(node: &Node, cmd: &[String]) -> Result<()> {
@@ -337,40 +317,17 @@ fn ssh_run(node: &Node, cmd: &[String]) -> Result<()> {
     args.push(node.ssh.clone());
     args.push("--".to_string());
     args.extend(cmd.iter().cloned());
-    let status = Command::new("ssh")
-        .args(&args)
-        .status()
-        .map_err(|e| Error::Roll {
-            node: node.name.clone(),
-            reason: format!("failed to run ssh: {e}"),
-        })?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(Error::Roll {
-            node: node.name.clone(),
-            reason: format!("ssh command failed with {status}"),
-        })
-    }
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    process::checked("ssh", &refs, COMMAND_TIMEOUT).map_err(|e| Error::Roll {
+        node: node.name.clone(),
+        reason: e.to_string(),
+    })?;
+    Ok(())
 }
 
-pub fn is_drained(lu_node_json: &str) -> bool {
-    // Heuristic: look for running/draining state in JSON. Accept "running_jobs":0 or "jobs":[] or "drained":true.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(lu_node_json) {
-        if let Some(d) = v.get("drained").and_then(|x| x.as_bool()) {
-            return d;
-        }
-        if let Some(n) = v.get("running_jobs").and_then(|x| x.as_u64()) {
-            return n == 0;
-        }
-        if let Some(arr) = v.get("jobs").and_then(|x| x.as_array()) {
-            return arr.is_empty();
-        }
-        if let Some(n) = v.get("runningJobs").and_then(|x| x.as_u64()) {
-            return n == 0;
-        }
-    }
-    false
+/// Drain detection for the real `lu nodes --json` array shape.
+pub fn is_drained(lu_nodes_json: &str, node: &str) -> bool {
+    lu::nodes_report_drained(lu_nodes_json, node)
 }
 
 #[cfg(test)]

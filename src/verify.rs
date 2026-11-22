@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
 
 pub fn sha256_file(path: &Path) -> Result<String> {
     let mut file = std::fs::File::open(path).map_err(|source| Error::Read {
@@ -109,47 +109,40 @@ pub fn verify_attestation_with_signer(
     allow_unattested: bool,
     signer_workflow: Option<&str>,
 ) -> Result<()> {
-    let gh = match which_gh() {
-        Some(p) => p,
-        None => {
-            if allow_unattested {
-                eprintln!(
-                    "tuishou: gh not found; skipping attestation verification (--allow-unattested)"
-                );
-                return Ok(());
-            }
-            return Err(Error::AttestationUnavailable);
+    if !gh_available() {
+        if allow_unattested {
+            eprintln!(
+                "tuishou: gh not found; skipping attestation verification (--allow-unattested)"
+            );
+            return Ok(());
         }
-    };
-    let mut cmd = Command::new(gh);
-    cmd.arg("attestation")
-        .arg("verify")
-        .arg(archive)
-        .arg("--repo")
-        .arg(repo);
+        return Err(Error::AttestationUnavailable);
+    }
+    let archive = archive.to_string_lossy();
+    let mut args: Vec<&str> = vec!["attestation", "verify", archive.as_ref(), "--repo", repo];
     if let Some(signer) = signer_workflow {
         if !signer.is_empty() {
-            cmd.arg("--signer-workflow").arg(signer);
+            args.push("--signer-workflow");
+            args.push(signer);
         }
     }
-    let output = cmd
-        .output()
-        .map_err(|e| Error::Attestation(format!("failed to run gh: {e}")))?;
-    if output.status.success() {
+    let output = crate::process::run("gh", &args, Duration::from_secs(60))
+        .map_err(|e| Error::Attestation(e.to_string()))?;
+    if output.status == 0 {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let msg = format!(
         "{}{}",
-        stdout.trim(),
-        if stderr.trim().is_empty() {
+        output.stdout.trim(),
+        if output.stderr.trim().is_empty() {
             String::new()
         } else {
-            format!("\n{}", stderr.trim())
+            format!("\n{}", output.stderr.trim())
         }
     );
-    Err(Error::Attestation(msg.trim().to_string()))
+    Err(Error::Attestation(
+        crate::http::redact_secrets(msg.trim()).to_string(),
+    ))
 }
 
 pub fn gh_available() -> bool {

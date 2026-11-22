@@ -4,7 +4,7 @@ use crate::release;
 use crate::state;
 use serde::Serialize;
 use std::path::Path;
-use std::process::Command;
+use std::time::Duration;
 
 #[derive(Debug, Serialize)]
 pub struct StatusEntry {
@@ -48,25 +48,13 @@ pub fn collect_status(
 }
 
 fn check_service_active(unit: &str) -> Option<bool> {
-    let systemctl = which("systemctl")?;
-    let status = Command::new(systemctl)
-        .arg("is-active")
-        .arg("--quiet")
-        .arg(unit)
-        .status()
-        .ok()?;
-    Some(status.success())
-}
-
-fn which(name: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let cand = dir.join(name);
-        if cand.is_file() {
-            return Some(cand.to_string_lossy().to_string());
-        }
-    }
-    None
+    let out = crate::process::run(
+        "systemctl",
+        &["is-active", "--quiet", unit],
+        Duration::from_secs(10),
+    )
+    .ok()?;
+    Some(out.status == 0)
 }
 
 pub fn print_status(entries: &[StatusEntry], json: bool, quiet: bool) -> Result<()> {

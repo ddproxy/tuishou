@@ -11,6 +11,43 @@ pub struct ExtractedBinary {
     pub path: PathBuf,
 }
 
+/// List the regular-file basenames in an archive without extracting anything.
+/// Used to decide whether a release actually ships a component's binaries.
+pub fn list_binary_names(archive_path: &Path) -> Result<Vec<String>> {
+    let file = fs::File::open(archive_path).map_err(|source| Error::Read {
+        path: archive_path.to_path_buf(),
+        source,
+    })?;
+    let mut archive = Archive::new(GzDecoder::new(file));
+    let entries = archive
+        .entries()
+        .map_err(|e| Error::Archive(format!("failed to read archive entries: {e}")))?;
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| Error::Archive(format!("invalid archive entry: {e}")))?;
+        let entry_type = entry.header().entry_type();
+        let path = entry
+            .path()
+            .map_err(|e| Error::Archive(format!("invalid entry path: {e}")))?
+            .to_path_buf();
+        if entry_type.is_symlink() || entry_type.is_hard_link() {
+            return Err(Error::Archive(format!(
+                "archive contains forbidden link: {}",
+                path.display()
+            )));
+        }
+        validate_entry_path(&path)?;
+        if entry_type.is_file() {
+            if let Some(name) = path.file_name().map(|s| s.to_string_lossy().into_owned()) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    Ok(names)
+}
+
 pub fn extract_binaries(
     archive_path: &Path,
     expected_binaries: &[String],

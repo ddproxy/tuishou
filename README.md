@@ -63,7 +63,7 @@ tuishou man
 tuishou roll --nodes inventory.toml --component lu --version v0.4.0 --dry-run
 ```
 
-Global flags: `--json`, `--quiet`, `--verbose`. `NO_COLOR` is respected.
+Global flags: `--json`, `--quiet`, `--verbose`, `--config <path>` (or `TUISHOU_CONFIG`). `NO_COLOR` is respected.
 
 ## Documentation
 

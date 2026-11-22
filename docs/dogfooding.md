@@ -12,7 +12,7 @@ tuishou adopt ting --version v0.4.0 --prefix /usr/local/bin
 tuishou status --json --prefix /usr/local/bin
 ```
 
-`adopt` checks that at least one expected component binary exists in the install directory, records the version/target/checksum in state, and does not download or replace binaries. It is safe to run before the first managed update.
+`adopt` checks that at least one expected component binary exists in the install directory, records the version/target/checksum in state, and does not download or replace binaries. It is safe to run before the first managed update. With no `--prefix` flag, `adopt` uses `auto_update.prefix` from the loaded config when present.
 
 ## Fresh node
 

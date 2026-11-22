@@ -1,4 +1,4 @@
-use crate::component::{builtin_components, Component};
+use crate::component::{builtin_components, BinaryRange, Component};
 use crate::duration::parse_duration;
 use crate::error::{Error, Result};
 use crate::version;
@@ -24,6 +24,7 @@ pub struct ComponentConfig {
     pub asset_pattern: Option<String>,
     pub binaries: Option<Vec<String>>,
     pub service_unit: Option<String>,
+    pub binary_ranges: Option<Vec<BinaryRange>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -80,6 +81,9 @@ impl ControllerPolicy {
 #[serde(default)]
 pub struct AutoUpdateConfig {
     pub enabled: bool,
+    /// Install prefix whose `.tuishou.json`, `.tuishou/` state and binaries are
+    /// managed by automatic runs. CLI `--prefix` overrides this value.
+    pub prefix: Option<PathBuf>,
     pub interval: String,
     pub components: Vec<String>,
     pub policy: AutoPolicy,
@@ -99,6 +103,10 @@ pub struct AutoUpdateConfig {
     pub health_timeout: String,
     pub node_name: Option<String>,
     pub agent_unit: String,
+    /// Controller systemd unit restarted after a verified controller update.
+    pub controller_unit: String,
+    /// Deadline for each individual `lu`/`systemctl` child process.
+    pub command_timeout: String,
     /// Argument vector (never a shell string). The JSON summary is appended.
     pub notify_command: Vec<String>,
     pub notify_after_failures: u32,
@@ -108,6 +116,7 @@ impl Default for AutoUpdateConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            prefix: None,
             interval: "10m".to_string(),
             components: vec!["lu".to_string(), "ting".to_string()],
             policy: AutoPolicy::Patch,
@@ -125,6 +134,8 @@ impl Default for AutoUpdateConfig {
             health_timeout: "5m".to_string(),
             node_name: None,
             agent_unit: "lu-agent.service".to_string(),
+            controller_unit: "lu.service".to_string(),
+            command_timeout: "30s".to_string(),
             notify_command: Vec::new(),
             notify_after_failures: 3,
         }
@@ -143,6 +154,16 @@ impl AutoUpdateConfig {
         parse_duration(&self.min_release_age)?;
         parse_duration(&self.drain_timeout)?;
         parse_duration(&self.health_timeout)?;
+        if parse_duration(&self.command_timeout)?.is_zero() {
+            return Err(Error::msg(
+                "auto_update.command_timeout must be greater than zero",
+            ));
+        }
+        if self.agent_unit.is_empty() || self.controller_unit.is_empty() {
+            return Err(Error::msg(
+                "auto_update.agent_unit and controller_unit must not be empty",
+            ));
+        }
         if !self.require_attestation {
             return Err(Error::msg(
                 "auto_update.require_attestation cannot be false: auto mode always verifies attestations",
@@ -196,6 +217,9 @@ pub fn default_config_path() -> PathBuf {
 pub struct LoadedConfig {
     pub components: Vec<Component>,
     pub auto_update: AutoUpdateConfig,
+    /// Path of the config file as loaded; passed to child processes that read
+    /// the same controller configuration (for example `lu backup --config`).
+    pub config_path: PathBuf,
 }
 
 pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
@@ -236,6 +260,9 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
             if let Some(binaries) = o.binaries {
                 existing.binaries = binaries;
             }
+            if let Some(binary_ranges) = o.binary_ranges {
+                existing.binary_ranges = binary_ranges;
+            }
             if o.service_unit.is_some() {
                 existing.service_unit = o.service_unit;
             }
@@ -264,12 +291,14 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
                 asset_pattern,
                 binaries,
                 service_unit: o.service_unit,
+                binary_ranges: o.binary_ranges.unwrap_or_default(),
             });
         }
     }
     Ok(LoadedConfig {
         components,
         auto_update: cfg.auto_update,
+        config_path: path,
     })
 }
 
