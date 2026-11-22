@@ -140,7 +140,9 @@ fn env_for(cmd: &mut Command, server: &FakeServer, home: &Path) {
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join(".local/state"))
         .env_remove("GITHUB_TOKEN")
-        .env_remove("GH_TOKEN");
+        .env_remove("GH_TOKEN")
+        // Hide any real `gh` (CI runners ship one).
+        .env("PATH", "/nonexistent-tuishou-test-bin");
 }
 
 fn copy_binary_to(dir: &Path) -> PathBuf {
