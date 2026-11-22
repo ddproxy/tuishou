@@ -1,20 +1,22 @@
-use crate::auto_update;
+use crate::auto_update::{self, apply};
 use crate::completions;
-use crate::component::{resolve_component, resolve_components};
-use crate::config;
+use crate::component::{resolve_component, Component};
+use crate::config::{self, LoadedConfig};
 use crate::docs_static;
 use crate::error::{Error, Result, EXIT_UPDATES_AVAILABLE};
+use crate::fleet;
 use crate::http;
 use crate::install::{self, InstallOptions};
 use crate::release;
-use crate::roll;
+use crate::report::{self, ComponentReport, StatusText};
 use crate::rollback;
 use crate::self_update;
 use crate::state;
 use crate::status;
 use crate::verify::{self, AttestationRequest, AttestationVerifier};
 use clap::{Parser, Subcommand, ValueEnum};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -22,7 +24,7 @@ use std::sync::Arc;
 #[command(
     name = "tuishou",
     version,
-    about = "Install, update and roll the Tuishou stack from GitHub releases"
+    about = "Install and update the Tuishou stack from GitHub releases"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -166,34 +168,6 @@ pub enum Commands {
         #[arg(long)]
         prefix: Option<PathBuf>,
     },
-
-    /// Roll a component across a fleet over SSH
-    Roll {
-        /// Inventory file path or comma-separated node list
-        #[arg(long)]
-        nodes: String,
-        /// Component to roll
-        #[arg(long, default_value = "ting")]
-        component: String,
-        /// Release version tag
-        #[arg(long)]
-        version: Option<String>,
-        /// Number of nodes to roll concurrently (currently serial batches; reserved)
-        #[arg(long, default_value_t = 1)]
-        batch: usize,
-        /// Show the roll plan without making changes
-        #[arg(long)]
-        dry_run: bool,
-        /// Continue after drain wait timeout by forcing the step
-        #[arg(long)]
-        force_after: Option<u64>,
-        /// Allow crossing a major version boundary
-        #[arg(long)]
-        allow_major: bool,
-        /// Warn and continue when attestation verification fails
-        #[arg(long)]
-        allow_unattested: bool,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -282,6 +256,157 @@ fn auto_update_prefix(
     flag.or_else(|| loaded.auto_update.prefix.clone())
 }
 
+fn known_component_names(components: &[Component]) -> String {
+    components
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// `None` means "all"; "all" is explicit and equivalent. Unknown names are
+/// usage errors (exit 2) that list the built-in names.
+fn resolve_targets(name: Option<&str>, components: &[Component]) -> Result<Vec<Component>> {
+    match name {
+        None | Some("all") => Ok(components.to_vec()),
+        Some(wanted) => components
+            .iter()
+            .find(|c| c.name == wanted)
+            .cloned()
+            .map(|c| vec![c])
+            .ok_or_else(|| {
+                Error::Usage(format!(
+                    "unknown component '{wanted}'; known components: {} (or 'all')",
+                    known_component_names(components)
+                ))
+            }),
+    }
+}
+
+type EvaluationContext = (Option<String>, BTreeMap<String, Vec<String>>);
+
+fn evaluation_context(loaded: &LoadedConfig, prefix: Option<&Path>) -> Result<EvaluationContext> {
+    let auto_prefix = auto_update_prefix(loaded, prefix.map(Path::to_path_buf));
+    let bad = auto_update::state::load(auto_prefix.as_deref())?.bad_versions;
+    let hold = auto_update::state::active_hold(auto_prefix.as_deref())?
+        .map(|h| h.reason.unwrap_or_else(|| "hold file present".to_string()));
+    Ok((hold, bad))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn base_install_options(
+    loaded: &LoadedConfig,
+    verbose: bool,
+    version: Option<String>,
+    prefix: Option<PathBuf>,
+    allow_unattested: bool,
+    allow_major: bool,
+    smoke_check: bool,
+    commit_state: bool,
+) -> InstallOptions {
+    InstallOptions {
+        version,
+        prefix,
+        // All per-component reporting uses the shared vocabulary, so the
+        // installer itself must not print an extra line.
+        dry_run: false,
+        allow_unattested,
+        allow_major,
+        max_download_bytes: http::max_download_bytes(),
+        quiet: true,
+        verbose,
+        smoke_check,
+        verifier: verify::default_verifier(),
+        verify_config: loaded.verify.clone(),
+        commit_state,
+    }
+}
+
+fn perform_install(
+    agent: &ureq::Agent,
+    component: &Component,
+    tag: &str,
+    opts: &InstallOptions,
+    loaded: &LoadedConfig,
+    prefix: Option<&Path>,
+) -> Result<()> {
+    if !opts.dry_run && (component.name == "reiki" || component.name == "lu") {
+        let mut auto = auto_update::state::load(prefix)?;
+        let mut local_opts = opts.clone();
+        // The local apply paths record state only after config/health pass.
+        local_opts.commit_state = false;
+        local_opts.quiet = true;
+        let ctx = apply::ApplyContext {
+            cfg: &loaded.auto_update,
+            prefix,
+            config_path: Some(loaded.config_path.as_path()),
+            verifier: Some(opts.verifier.clone()),
+            verify_config: Some(&opts.verify_config),
+        };
+        let applied = if component.name == "reiki" {
+            apply::apply_reiki_with_options(
+                component,
+                tag,
+                &ctx,
+                &mut auto,
+                &apply::SystemRunner,
+                local_opts,
+            )?;
+            true
+        } else {
+            // On a Lu node the agent follows the same drain/restart/health
+            // procedure as auto-update, with Reiki applied first in a normal
+            // `update all` run. Elsewhere a plain install is sufficient.
+            apply::apply_agent_on_lu_node(component, tag, &ctx, &mut auto)?
+        };
+        if applied {
+            return Ok(());
+        }
+    }
+    install::install_component(agent, component, opts)?;
+    Ok(())
+}
+
+fn updated_report(component: &Component, previous: Option<&str>, tag: &str) -> ComponentReport {
+    let status = match previous {
+        Some(old) if old == tag => StatusText::UpToDate {
+            version: tag.to_string(),
+        },
+        Some(old) => StatusText::Updated {
+            from: old.to_string(),
+            to: tag.to_string(),
+        },
+        None => StatusText::Updated {
+            from: "-".to_string(),
+            to: tag.to_string(),
+        },
+    };
+    ComponentReport::from_parts(
+        component,
+        status,
+        Some(tag.to_string()),
+        Some(tag.to_string()),
+        Vec::new(),
+    )
+}
+
+fn failed_report(
+    component: &Component,
+    err: &Error,
+    previous: Option<String>,
+    latest: Option<String>,
+) -> ComponentReport {
+    ComponentReport::from_parts(
+        component,
+        StatusText::Failed {
+            reason: crate::logging::one_line(&err.to_string()),
+        },
+        previous,
+        latest,
+        Vec::new(),
+    )
+}
+
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     // NO_COLOR respected - we emit no ANSI color; keep placeholder for future.
@@ -308,43 +433,56 @@ pub fn run() -> Result<ExitCode> {
             allow_major,
             smoke_check,
         } => {
-            let targets = resolve_components(&[component], &components)?;
-            let opts = InstallOptions {
-                version,
-                prefix,
-                dry_run,
-                allow_unattested,
-                allow_major,
-                max_download_bytes: http::max_download_bytes(),
-                quiet: cli.quiet,
-                verbose: cli.verbose,
-                smoke_check,
-                verifier: verify::default_verifier(),
-                verify_config: loaded.verify.clone(),
-                commit_state: true,
-            };
-            let mut outcomes = Vec::new();
+            let targets = resolve_targets(Some(&component), &components)?;
+            let before = report::installed_versions(prefix.as_deref())?;
+            let mut reports = Vec::new();
             for c in &targets {
-                outcomes.push(install::install_component(&agent, c, &opts)?);
-            }
-            if cli.json {
-                let v: Vec<_> = outcomes
-                    .iter()
-                    .map(|o| {
-                        serde_json::json!({
-                            "component": o.component,
-                            "version": o.version,
-                            "binaries": o.binaries,
-                            "dry_run": o.dry_run,
-                        })
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&v).map_err(|e| Error::msg(e.to_string()))?
+                let tag = match &version {
+                    Some(v) => release::fetch_tagged(&agent, &c.repo, v)?.tag,
+                    None => release::fetch_latest(&agent, &c.repo)?.tag,
+                };
+                let missing = match report::archive_missing_binaries(&agent, c, &tag) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        reports.push(failed_report(c, &e, None, Some(tag)));
+                        continue;
+                    }
+                };
+                if !missing.is_empty() {
+                    reports.push(ComponentReport::from_parts(
+                        c,
+                        StatusText::NotInRelease {
+                            missing: missing.clone(),
+                        },
+                        None,
+                        Some(tag),
+                        missing,
+                    ));
+                    continue;
+                }
+                let previous = before.get(&c.name).map(|i| i.version.clone());
+                let mut opts = base_install_options(
+                    &loaded,
+                    cli.verbose,
+                    Some(tag.clone()),
+                    prefix.clone(),
+                    allow_unattested,
+                    allow_major,
+                    smoke_check,
+                    true,
                 );
+                opts.dry_run = dry_run;
+                match perform_install(&agent, c, &tag, &opts, &loaded, prefix.as_deref()) {
+                    Ok(()) => reports.push(updated_report(c, previous.as_deref(), &tag)),
+                    Err(e) => reports.push(failed_report(c, &e, previous, Some(tag))),
+                }
             }
-            Ok(ExitCode::SUCCESS)
+            report::print_reports(&reports, cli.json, cli.quiet)?;
+            Ok(if report::has_failed(&reports) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
         }
         Commands::Update {
             component,
@@ -353,85 +491,100 @@ pub fn run() -> Result<ExitCode> {
             allow_unattested,
             prefix,
         } => {
-            let st = crate::state::load(&crate::state::default_state_path(prefix.as_deref()))?;
-            let targets: Vec<_> = if let Some(c) = component {
-                resolve_components(&[c], &components)?
-            } else {
-                components
-                    .iter()
-                    .filter(|c| st.components.contains_key(&c.name))
-                    .cloned()
-                    .collect()
-            };
-            let mut updates = Vec::new();
-            for c in &targets {
-                let installed = st.components.get(&c.name);
-                let latest = release::fetch_latest(&agent, &c.repo)?;
-                let has_update = installed.map(|i| i.version != latest.tag).unwrap_or(true);
-                if has_update {
-                    if !cli.quiet {
-                        let from = installed.map(|i| i.version.as_str()).unwrap_or("-");
-                        println!("{}: {} -> {}", c.name, from, latest.tag);
-                        if let Some(h) = release::changelog_heading(&latest.body, &latest.tag) {
-                            println!("  {h}");
-                        }
-                    }
-                    updates.push((c.clone(), latest));
-                } else if !cli.quiet {
-                    println!("{}: up to date ({})", c.name, latest.tag);
-                }
-            }
+            let targets = resolve_targets(component.as_deref(), &components)?;
+            let explicit = component.is_some();
+            let installed = report::installed_versions(prefix.as_deref())?;
+            let (hold, bad) = evaluation_context(&loaded, prefix.as_deref())?;
+            let evaluated = report::evaluate_all(
+                &agent,
+                &targets,
+                prefix.as_deref(),
+                &installed,
+                hold.as_deref(),
+                &bad,
+            );
             if check {
-                if !updates.is_empty() {
-                    if cli.json {
-                        let v: Vec<_> = updates
-                            .iter()
-                            .map(|(c, r)| serde_json::json!({"component": c.name, "latest": r.tag}))
-                            .collect();
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&v)
-                                .map_err(|e| Error::msg(e.to_string()))?
-                        );
-                    }
-                    return Ok(ExitCode::from(EXIT_UPDATES_AVAILABLE));
-                }
-                if cli.json {
-                    println!("[]");
-                }
+                report::print_reports(&evaluated, cli.json, cli.quiet)?;
+                return Ok(if report::has_failed(&evaluated) {
+                    ExitCode::FAILURE
+                } else if report::has_installable_update(&evaluated) {
+                    ExitCode::from(EXIT_UPDATES_AVAILABLE)
+                } else {
+                    ExitCode::SUCCESS
+                });
+            }
+
+            let command_timeout =
+                crate::duration::parse_duration(&loaded.auto_update.command_timeout)
+                    .unwrap_or(std::time::Duration::from_secs(30));
+            if let Some(reason) = fleet::before_cycle(&loaded.update, command_timeout) {
+                let skipped: Vec<ComponentReport> = targets
+                    .iter()
+                    .map(|c| {
+                        ComponentReport::new(
+                            c,
+                            StatusText::Skipped {
+                                reason: reason.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                report::print_reports(&skipped, cli.json, cli.quiet)?;
                 return Ok(ExitCode::SUCCESS);
             }
-            for (c, latest) in &updates {
-                let opts = InstallOptions {
-                    version: Some(latest.tag.clone()),
-                    prefix: prefix.clone(),
-                    dry_run: false,
-                    allow_unattested,
-                    allow_major,
-                    max_download_bytes: http::max_download_bytes(),
-                    quiet: cli.quiet,
-                    verbose: cli.verbose,
-                    smoke_check: false,
-                    verifier: verify::default_verifier(),
-                    verify_config: loaded.verify.clone(),
-                    commit_state: true,
-                };
-                install::install_component(&agent, c, &opts)?;
+
+            let mut reports = Vec::new();
+            for (c, current) in targets.iter().zip(evaluated) {
+                let previous = current.installed_version.clone();
+                let latest = current.latest_version.clone();
+                match current.status_text() {
+                    StatusText::UpdateAvailable { .. } | StatusText::NotInstalled { .. } => {
+                        // An explicit `update <name>` installs a component that
+                        // is not installed yet; a bare `update` does not.
+                        if matches!(current.status_text(), StatusText::NotInstalled { .. })
+                            && !explicit
+                        {
+                            reports.push(current);
+                            continue;
+                        }
+                        let Some(tag) = latest.clone() else {
+                            reports.push(current);
+                            continue;
+                        };
+                        let opts = base_install_options(
+                            &loaded,
+                            cli.verbose,
+                            Some(tag.clone()),
+                            prefix.clone(),
+                            allow_unattested,
+                            allow_major,
+                            false,
+                            true,
+                        );
+                        match perform_install(&agent, c, &tag, &opts, &loaded, prefix.as_deref()) {
+                            Ok(()) => reports.push(updated_report(c, previous.as_deref(), &tag)),
+                            Err(e) => reports.push(failed_report(c, &e, previous, latest)),
+                        }
+                    }
+                    _ => reports.push(current),
+                }
             }
-            if cli.json {
-                let v: Vec<_> = updates
-                    .iter()
-                    .map(|(c, r)| serde_json::json!({"component": c.name, "version": r.tag, "updated": true}))
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&v).map_err(|e| Error::msg(e.to_string()))?
-                );
-            }
-            Ok(ExitCode::SUCCESS)
+            report::print_reports(&reports, cli.json, cli.quiet)?;
+            Ok(if report::has_failed(&reports) {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            })
         }
         Commands::Status { prefix } => {
-            let entries = status::collect_status(&agent, &components, prefix.as_deref())?;
+            let (hold, bad) = evaluation_context(&loaded, prefix.as_deref())?;
+            let entries = status::collect_status(
+                &agent,
+                &components,
+                prefix.as_deref(),
+                hold.as_deref(),
+                &bad,
+            )?;
             status::print_status(&entries, cli.json, cli.quiet)?;
             Ok(ExitCode::SUCCESS)
         }
@@ -617,6 +770,7 @@ pub fn run() -> Result<ExitCode> {
                 once,
                 cli.quiet,
                 allow_unattested,
+                cli.json,
             ),
             AutoUpdateAction::InstallTimer { interval, prefix } => {
                 let prefix = auto_update_prefix(&loaded, prefix);
@@ -655,33 +809,5 @@ pub fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
-        Commands::Roll {
-            nodes,
-            component,
-            version,
-            batch,
-            dry_run,
-            force_after,
-            allow_major,
-            allow_unattested,
-        } => {
-            let c = resolve_component(&component, &components)?;
-            let plan = roll::RollPlan {
-                nodes,
-                component: c,
-                version,
-                batch,
-                dry_run,
-                force_after_secs: force_after,
-                allow_major,
-                allow_unattested,
-                quiet: cli.quiet,
-                verbose: cli.verbose,
-                json: cli.json,
-            };
-            let runner = roll::SystemRollRunner;
-            roll::execute_roll(&plan, &runner)?;
-            Ok(ExitCode::SUCCESS)
-        }
     }
 }

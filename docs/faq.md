@@ -14,6 +14,19 @@ reason: digest mismatch, wrong issuer or workflow, missing Rekor proof, untruste
 chain, malformed bundle, and so on. `--allow-unattested` turns failures into warnings
 for explicit local use. Auto-update always refuses `--allow-unattested`.
 
+## Which components are built in?
+
+`reiki`, `lu` and `tuishou`. See [components.md](components.md). A bare `tuishou update`
+checks all three. An unknown component name is a usage error (exit 2) that lists the
+known names.
+
+## What makes a config file acceptable?
+
+`tuishou.toml` must be owned by you or root and must not be writable by group or
+others. Unknown keys are errors. A component override can change paths and policy, but
+it cannot change the repository or asset host: downloads come only from GitHub release
+assets.
+
 ## Which verifier does tuishou use?
 
 The official `sigstore` Rust crate, pinned to `=0.15.0`, with its `rustls-tls` feature.

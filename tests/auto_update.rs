@@ -788,7 +788,7 @@ fn min_release_age_and_policy_are_enforced() {
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
     enable_fake_attestation(&bindir);
-    setup_prefix_with_state(&home, "app", "v0.4.0");
+    setup_prefix_with_state(&home, "lu", "v0.4.0");
     let target = current_target();
     let asset = format!("lu-v0.4.1-{target}.tar.gz");
     let archive = make_tar_gz(&[("lu", b"new\n")]);
@@ -813,7 +813,10 @@ fn min_release_age_and_policy_are_enforced() {
         future,
         Some("\"e1\""),
     ));
-    write_config(td.path(), "[auto_update]\nenabled = true\ncomponents = [\"app\"]\nmin_release_age = \"10m\"\n\n[[component]]\nname = \"app\"\nrepo = \"ddproxy/tuishou-lu\"\nasset_pattern = \"lu-{tag}-{target}.tar.gz\"\nbinaries = [\"lu\"]\n");
+    write_config(
+        td.path(),
+        "[auto_update]\nenabled = true\ncomponents = [\"lu\"]\nmin_release_age = \"10m\"\n",
+    );
     let path = format!(
         "{}:{}",
         bindir.display(),
@@ -893,26 +896,32 @@ exit 0
     );
     write_fake_tool(&bindir, "systemctl", &systemctl);
 
-    setup_prefix_with_state(&home, "ting", "v0.4.0");
+    setup_prefix_with_state(&home, "lu", "v0.4.0");
     let home_bin = home.join(".local/bin");
     fs::create_dir_all(&home_bin).unwrap();
-    fs::write(home_bin.join("ting"), b"#!/bin/sh\necho old\n").unwrap();
+    fs::write(home_bin.join("lu"), b"#!/bin/sh\necho old\n").unwrap();
+    fs::write(home_bin.join("lu-agent"), b"#!/bin/sh\necho old agent\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(home_bin.join("ting"), fs::Permissions::from_mode(0o755)).unwrap();
+        for name in ["lu", "lu-agent"] {
+            fs::set_permissions(home_bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
     }
 
     let target = current_target();
     let asset = format!("lu-v0.4.1-{target}.tar.gz");
-    let archive = make_tar_gz(&[("ting", b"#!/bin/sh\necho ting v0.4.1\n")]);
+    let archive = make_tar_gz(&[
+        ("lu", b"#!/bin/sh\necho lu v0.4.1\n"),
+        ("lu-agent", b"#!/bin/sh\necho agent v0.4.1\n"),
+    ]);
     let server = FakeServer::start(release_routes_with_base(
         "http://127.0.0.1:1",
         "ddproxy/tuishou-lu",
         "v0.4.1",
         &asset,
         &archive,
-        "",
+        "## ok\n",
         "2020-01-01T00:00:00Z",
         Some("\"e1\""),
     ));
@@ -922,11 +931,11 @@ exit 0
         "v0.4.1",
         &asset,
         &archive,
-        "",
+        "## ok\n",
         "2020-01-01T00:00:00Z",
         Some("\"e1\""),
     ));
-    fs::write(td.path().join("tuishou.toml"), "[auto_update]\nenabled = true\ncomponents = [\"ting\"]\nmin_release_age = \"0s\"\ndrain_timeout = \"2s\"\nhealth_timeout = \"2s\"\nnode_name = \"n1\"\n").unwrap();
+    fs::write(td.path().join("tuishou.toml"), "[auto_update]\nenabled = true\ncomponents = [\"lu\"]\nmin_release_age = \"0s\"\ndrain_timeout = \"2s\"\nhealth_timeout = \"2s\"\nnode_name = \"n1\"\n").unwrap();
     let path = format!(
         "{}:{}",
         bindir.display(),
@@ -1009,23 +1018,23 @@ exit 0
         log = log.display()
     );
     write_fake_tool(&bindir, "systemctl", &systemctl);
-    setup_prefix_with_state(&home, "ting", "v0.4.0");
+    setup_prefix_with_state(&home, "lu", "v0.4.0");
     let home_bin = home.join(".local/bin");
     fs::create_dir_all(&home_bin).unwrap();
-    fs::write(home_bin.join("ting"), b"#!/bin/sh\necho old\n").unwrap();
-    // `ting` owns both binaries; both need a .prev for recovery to verify.
+    fs::write(home_bin.join("lu"), b"#!/bin/sh\necho old\n").unwrap();
+    // Both binaries need a .prev for recovery to verify.
     fs::write(home_bin.join("lu-agent"), b"#!/bin/sh\necho old agent\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        for name in ["ting", "lu-agent"] {
+        for name in ["lu", "lu-agent"] {
             fs::set_permissions(home_bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
         }
     }
     let target = current_target();
     let asset = format!("lu-v0.4.1-{target}.tar.gz");
     let archive = make_tar_gz(&[
-        ("ting", b"#!/bin/sh\necho new v0.4.1\n"),
+        ("lu", b"#!/bin/sh\necho new v0.4.1\n"),
         ("lu-agent", b"#!/bin/sh\necho new agent v0.4.1\n"),
     ]);
     let server = FakeServer::start(release_routes_with_base(
@@ -1034,7 +1043,7 @@ exit 0
         "v0.4.1",
         &asset,
         &archive,
-        "",
+        "## ok\n",
         "2020-01-01T00:00:00Z",
         Some("\"e1\""),
     ));
@@ -1044,11 +1053,11 @@ exit 0
         "v0.4.1",
         &asset,
         &archive,
-        "",
+        "## ok\n",
         "2020-01-01T00:00:00Z",
         Some("\"e1\""),
     ));
-    fs::write(td.path().join("tuishou.toml"), "[auto_update]\nenabled = true\ncomponents = [\"ting\"]\nmin_release_age = \"0s\"\ndrain_timeout = \"2s\"\nhealth_timeout = \"1s\"\nnode_name = \"n1\"\n").unwrap();
+    fs::write(td.path().join("tuishou.toml"), "[auto_update]\nenabled = true\ncomponents = [\"lu\"]\nmin_release_age = \"0s\"\ndrain_timeout = \"2s\"\nhealth_timeout = \"1s\"\nnode_name = \"n1\"\n").unwrap();
     let path = format!(
         "{}:{}",
         bindir.display(),
@@ -1073,14 +1082,14 @@ exit 0
         "should fail on unhealthy node\nstdout={stdout}\nstderr={stderr}\nauto={auto_state_s}"
     );
     // .prev restored
-    let content = fs::read(home_bin.join("ting")).unwrap();
+    let content = fs::read(home_bin.join("lu")).unwrap();
     assert_eq!(content, b"#!/bin/sh\necho old\n");
     // bad marked
     let auto_state: serde_json::Value = serde_json::from_str(
         &fs::read_to_string(home.join(".local/state/tuishou/auto.json")).unwrap(),
     )
     .unwrap();
-    let bad = auto_state["bad_versions"]["ting"].as_array().unwrap();
+    let bad = auto_state["bad_versions"]["lu"].as_array().unwrap();
     assert!(bad.iter().any(|v| v == "v0.4.1"), "{auto_state}");
     // Successful recovery restores .prev, restarts, verifies the old version
     // and undrains; failure to verify would have left the node drained.
@@ -1154,11 +1163,7 @@ exit 0
     setup_prefix_with_state(&home, "lu", "v0.4.0");
     let target = current_target();
     let asset = format!("lu-v0.4.1-{target}.tar.gz");
-    let archive = make_tar_gz(&[
-        ("lu", b"#!/bin/sh\necho lu v0.4.1\n"),
-        ("ting", b"#!/bin/sh\necho ting\n"),
-        ("lu-agent", b"#!/bin/sh\necho agent\n"),
-    ]);
+    let archive = make_tar_gz(&[("lu", b"#!/bin/sh\necho lu v0.4.1\n")]);
     let server = FakeServer::start(release_routes_with_base(
         "http://127.0.0.1:1",
         "ddproxy/tuishou-lu",
@@ -1313,11 +1318,9 @@ exit 0
     fs::create_dir_all(&home_bin).unwrap();
     let target = current_target();
     let asset = format!("lu-v0.4.1-{target}.tar.gz");
-    let archive = make_tar_gz(&[
-        ("lu", b"#!/bin/sh\necho lu v0.4.1\n"),
-        ("ting", b"#!/bin/sh\necho t\n"),
-        ("lu-agent", b"#!/bin/sh\necho a\n"),
-    ]);
+    // Keep the release controller-only so the controller path (backup/restart)
+    // is exercised; adding an agent binary would switch to the agent path.
+    let archive = make_tar_gz(&[("lu", b"#!/bin/sh\necho lu v0.4.1\n")]);
     let server = FakeServer::start(release_routes_with_base(
         "http://127.0.0.1:1",
         "ddproxy/tuishou-lu",
@@ -1812,11 +1815,13 @@ exit 0
         &fs::read_to_string(home.join(".local/state/tuishou/auto.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(auto["results"]["lu"]["result"], "failed");
-    assert!(auto["results"]["lu"]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("backup"));
+    let result = &auto["results"]["lu"];
+    assert_eq!(result["status_kind"], "failed", "{auto}");
+    assert!(
+        result["result"].as_str().unwrap().starts_with("failed ("),
+        "{auto}"
+    );
+    assert!(result["reason"].as_str().unwrap().contains("backup"));
 }
 
 #[test]
@@ -2111,7 +2116,7 @@ exit 0
     fs::create_dir_all(&prefix).unwrap();
     let state = serde_json::json!({
         "components": {
-            "ting": {
+            "lu": {
                 "version": "v0.4.0",
                 "target": current_target(),
                 "checksum": "0".repeat(64),
@@ -2120,7 +2125,7 @@ exit 0
         }
     });
     fs::write(prefix.join(".tuishou.json"), state.to_string()).unwrap();
-    for name in ["ting", "lu-agent"] {
+    for name in ["lu", "lu-agent", "ting"] {
         fs::write(prefix.join(name), format!("#!/bin/sh\necho {name} old\n")).unwrap();
         #[cfg(unix)]
         {
@@ -2137,7 +2142,7 @@ exit 0
         "v0.4.1",
         &asset,
         &archive,
-        "",
+        "## ok\n",
         "2020-01-01T00:00:00Z",
         None,
     ));
@@ -2147,14 +2152,14 @@ exit 0
         "v0.4.1",
         &asset,
         &archive,
-        "",
+        "## ok\n",
         "2020-01-01T00:00:00Z",
         None,
     ));
     write_config(
         td.path(),
         &format!(
-            "[auto_update]\nenabled = true\ncomponents = [\"ting\"]\nmin_release_age = \"0s\"\ndrain_timeout = \"2s\"\nhealth_timeout = \"2s\"\nnode_name = \"n1\"\nprefix = \"{}\"\n",
+            "[auto_update]\nenabled = true\ncomponents = [\"lu\"]\nmin_release_age = \"0s\"\ndrain_timeout = \"2s\"\nhealth_timeout = \"2s\"\nnode_name = \"n1\"\nprefix = \"{}\"\n",
             prefix.display()
         ),
     );
@@ -2185,7 +2190,9 @@ exit 0
 #[test]
 fn agent_component_absent_from_release_is_skipped_without_touching_files() {
     let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let r = run_agent_cycle_with_archive(&[("lu", b"#!/bin/sh\necho lu v0.4.1\n")]);
+    // The archive has an agent binary but not the required `lu` binary, so the
+    // component must be reported as absent from this release before any drain.
+    let r = run_agent_cycle_with_archive(&[("lu-agent", b"#!/bin/sh\necho lu-agent v0.4.1\n")]);
     assert!(
         r.out.status.success(),
         "stdout={} stderr={}",
@@ -2194,25 +2201,30 @@ fn agent_component_absent_from_release_is_skipped_without_touching_files() {
     );
     let log = fs::read_to_string(&r.log_path).unwrap_or_default();
     assert!(!log.contains("lu drain"), "{log}");
-    assert!(!log.contains("systemctl"), "{log}");
+    assert!(!log.contains("systemctl restart"), "{log}");
     assert_eq!(
-        fs::read_to_string(r.bin_dir.join("ting")).unwrap(),
-        "#!/bin/sh\necho ting old\n"
+        fs::read_to_string(r.bin_dir.join("lu")).unwrap(),
+        "#!/bin/sh\necho lu old\n"
     );
     assert_eq!(
         fs::read_to_string(r.bin_dir.join("lu-agent")).unwrap(),
         "#!/bin/sh\necho lu-agent old\n"
     );
-    assert!(!r.bin_dir.join("ting.prev").exists());
+    assert!(!r.bin_dir.join("lu.prev").exists());
     assert!(!r.bin_dir.join("lu-agent.prev").exists());
     let auto: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(r.prefix.join(".tuishou/auto.json")).unwrap())
             .unwrap();
-    assert_eq!(auto["results"]["ting"]["result"], "skipped", "{auto}");
-    assert!(auto["results"]["ting"]["reason"]
-        .as_str()
-        .unwrap()
-        .contains("not in this release"));
+    let result = &auto["results"]["lu"];
+    assert_eq!(result["status_kind"], "not_in_release", "{auto}");
+    assert!(
+        result["result"]
+            .as_str()
+            .unwrap()
+            .starts_with("not in this release"),
+        "{auto}"
+    );
+    assert!(result["missing_binaries"][0] == "lu", "{auto}");
 }
 
 #[test]
@@ -2243,7 +2255,12 @@ fn agent_update_uses_whichever_agent_binary_is_in_the_archive() {
         let auto: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(r.prefix.join(".tuishou/auto.json")).unwrap())
                 .unwrap();
-        assert_eq!(auto["results"]["ting"]["result"], "updated", "{auto}");
+        let result = &auto["results"]["lu"];
+        assert_eq!(result["status_kind"], "updated", "{auto}");
+        assert!(
+            result["result"].as_str().unwrap().starts_with("updated "),
+            "{auto}"
+        );
     }
 }
 
@@ -2278,4 +2295,166 @@ fn timer_uses_boot_active_and_absolute_config_path() {
         cfg.display()
     );
     assert!(stdout.contains(&expected), "{stdout}");
+}
+
+#[test]
+fn fleet_limit_skips_auto_update_cycle_when_controller_reports_unavailable_nodes() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    let bin = td.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let nodes = serde_json::json!([{"name":"n1","draining":true,"online":true}]).to_string();
+    write_fake_tool(&bin, "lu", &format!("#!/bin/sh\necho '{nodes}'\n"));
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cfg = write_config(
+        td.path(),
+        "[auto_update]\nenabled = true\ncomponents = [\"lu\"]\n\n[update]\nmax_unavailable = 1\n",
+    );
+    let server = FakeServer::start(vec![]);
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home, &path);
+    let out = cmd
+        .current_dir(td.path())
+        .arg("--config")
+        .arg(&cfg)
+        .args(["auto-update", "run", "--once", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("skipped (fleet limit"), "stdout={text}");
+    assert_eq!(server.hit_count("/repos/"), 0, "no release check expected");
+}
+
+#[test]
+fn fleet_limit_allows_auto_update_cycle_when_under_limit() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    let bin = td.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let nodes = serde_json::json!([{"name":"n1","draining":false,"online":true}]).to_string();
+    write_fake_tool(&bin, "lu", &format!("#!/bin/sh\necho '{nodes}'\n"));
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cfg = write_config(
+        td.path(),
+        "[auto_update]\nenabled = true\ncomponents = [\"lu\"]\n\n[update]\nmax_unavailable = 2\n",
+    );
+    let server = FakeServer::start(vec![]);
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home, &path);
+    let out = cmd
+        .current_dir(td.path())
+        .arg("--config")
+        .arg(&cfg)
+        .args(["auto-update", "run", "--once", "--json"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!text.contains("fleet limit"), "output={text}");
+    assert!(server.hit_count("/repos/") > 0, "output={text}");
+    let log = fs::read_to_string(home.join(".local/state/tuishou/tuishou.log")).unwrap_or_default();
+    assert!(!log.contains("auto_update_fleet_skipped"), "log={log}");
+}
+
+#[test]
+fn fleet_limit_fails_closed_when_controller_is_unreachable() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    let bin = td.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    write_fake_tool(
+        &bin,
+        "lu",
+        "#!/bin/sh\necho 'controller down' >&2\nexit 7\n",
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cfg = write_config(
+        td.path(),
+        "[auto_update]\nenabled = true\ncomponents = [\"lu\"]\n\n[update]\nmax_unavailable = 1\n",
+    );
+    let server = FakeServer::start(vec![]);
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home, &path);
+    let out = cmd
+        .current_dir(td.path())
+        .arg("--config")
+        .arg(&cfg)
+        .args(["auto-update", "run", "--once", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("skipped (fleet limit") && text.contains("controller state unavailable"),
+        "stdout={text}"
+    );
+    assert_eq!(server.hit_count("/repos/"), 0, "no release check expected");
+}
+
+#[test]
+fn fleet_limit_skips_explicit_update_when_controller_reports_unavailable_nodes() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    let bin = td.path().join("bin");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    let nodes = serde_json::json!([{"name":"n1","draining":true,"online":true}]).to_string();
+    write_fake_tool(&bin, "lu", &format!("#!/bin/sh\necho '{nodes}'\n"));
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let cfg = write_config(td.path(), "[update]\nmax_unavailable = 1\n");
+    let server = FakeServer::start(vec![]);
+    let mut cmd = tuishou_cmd();
+    base_env(&mut cmd, &server, &home, &path);
+    let out = cmd
+        .current_dir(td.path())
+        .arg("--config")
+        .arg(&cfg)
+        .args(["update", "lu", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("skipped (fleet limit"), "stdout={text}");
 }

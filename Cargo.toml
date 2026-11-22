@@ -4,7 +4,7 @@ version = "0.2.1"
 edition = "2021"
 license = "MIT"
 publish = false
-description = "Install, update and roll the Tuishou stack from GitHub releases"
+description = "Install and update the Tuishou stack from GitHub releases"
 repository = "https://github.com/ddproxy/tuishou"
 
 [dependencies]

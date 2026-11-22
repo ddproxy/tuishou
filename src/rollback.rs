@@ -23,6 +23,12 @@ pub fn restore_binaries(
 
     let mut restored_any = false;
     for name in &component.binaries {
+        // Optional binaries (the Lu node agent today) may never have been
+        // installed. Restoring only what has a backup keeps rollback useful
+        // for the binaries that actually shipped.
+        if !bin_dir.join(format!("{name}.prev")).exists() {
+            continue;
+        }
         install::restore_previous_binary(&bin_dir, name)?;
         restored_any = true;
     }
@@ -56,6 +62,8 @@ pub fn rollback_binaries(
         binaries: binaries.to_vec(),
         service_unit: None,
         binary_ranges: Vec::new(),
+        config_path: None,
+        optional_binaries: Vec::new(),
     };
     let _ = quiet;
     restore_binaries(&c, prefix, true)

@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### Removed
+
+- Removed `tuishou roll`, the remote SSH runner and the inventory file format, together with their docs, examples, man page entries, completions and tests. Config sections belonging to them are now unknown keys. `tuishou update` and `auto-update` are the only update paths; each node updates itself.
+
+### Added
+
+- Added `[update].start_delay_max` (default `0`, recommended `10m` for fleets) for a random delay before an update cycle, and `[update].max_unavailable` (default unset) to skip a cycle when the controller already reports enough draining or offline nodes. Both are honoured by `update` and `auto-update`; unreadable controller state fails closed when a limit is set.
+- Added `docs/node-update.md` with the single-node drain/install/restart/health/rollback/undrain procedure, manual invocation, scheduling guidance and an "Updating many nodes" section with an Ansible example. Added tests for the removed command and config keys, jitter bounds, fleet-limit allow/refuse/fail-closed behaviour and the shared local update path.
+- `docs/components.md` documents the built-in Reiki, Lu and Tuishou defaults, their release assets, binaries, service units, signer workflows and health checks. Man page, completions and examples now use Reiki and Lu first.
+- New integration coverage for bare `update`, unknown component usage errors, shared `--check` exit codes, per-component reporting, `install all` with a missing binary, config trust, and rejected repository overrides. Auto-update tests cover Reiki-before-Lu ordering, Reiki drain/config-check/restart/health and rollback with a bad-version mark.
+
+### Changed
+
+- Reiki and Lu are equal first-class defaults alongside Tuishou. `ting` is no longer a default; the recognition path remains for a future one-line return.
+- Every command now prints exactly one fixed-vocabulary status line per component in table order, and `--json` carries the same data. `status`, `update --check` and `auto-update` share one evaluation.
+- A bare `tuishou update` means `update all`. Components absent from a release are reported as `not in this release` and never counted as updates. Not-installed components are installed only by an explicit `install <name>` or `update <name>`.
+- Config files are refused unless owned by the running user or root and not group/other writable. Component overrides may change paths and policy but never the repository or asset host.
+- Reiki updates drain a Lu node when present, check the Reiki config before restart, health-check after restart and roll back with a bad-version mark on failure.
+
+### Fixed
+
+- Rollback skips optional binaries that have no previous copy, so Lu controller-only archives restore cleanly.
+
 ## v0.2.1 - 2026-11-22
 
 ### Changed
