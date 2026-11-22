@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.2.1 - 2026-11-22
+
+### Changed
+
+- Release archives are built for x86_64 Linux only. The aarch64 build failed to link with the new verification dependencies; it returns once the cross toolchain is fixed.
+
 ## v0.2.0 - 2026-11-22
 
 ### Changed
