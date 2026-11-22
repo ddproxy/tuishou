@@ -266,6 +266,7 @@ mod tests {
             body: body.to_string(),
             assets: Vec::new(),
             published_at: published.map(str::to_string),
+            target_commitish: None,
             prerelease: pre,
             draft: false,
         }

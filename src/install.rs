@@ -1,13 +1,15 @@
 use crate::archive;
 use crate::component::Component;
+use crate::config::VerifyConfig;
 use crate::download;
 use crate::error::{Error, Result};
 use crate::release;
 use crate::state::{self, InstalledComponent};
 use crate::target::Target;
-use crate::verify;
+use crate::verify::{self, AttestationRequest, AttestationVerifier};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
@@ -26,8 +28,10 @@ pub struct InstallOptions {
     /// Write the new version to state. Deferred callers (agent/controller
     /// auto-update) only record it after their health check succeeds.
     pub commit_state: bool,
-    /// Expected workflow identity for `gh attestation verify --signer-workflow`.
-    pub signer_workflow: Option<String>,
+    /// Attestation verifier injected by the caller (real or test fake).
+    pub verifier: Arc<dyn AttestationVerifier>,
+    /// Verification configuration, including per-component workflow overrides.
+    pub verify_config: VerifyConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -151,12 +155,27 @@ pub fn install_component(
     let checksum_content = download::read_checksum_file(&downloaded.checksum_path)?;
     let expected = verify::parse_checksum_file(&checksum_content, &asset_name)?;
     verify::verify_checksum(&downloaded.archive_path, &expected)?;
-    verify::verify_attestation_with_signer(
-        &downloaded.archive_path,
-        &component.repo,
-        opts.allow_unattested,
-        opts.signer_workflow.as_deref(),
-    )?;
+    let source_digest = release::fetch_source_digest(agent, &component.repo, &rel)?;
+    let request = AttestationRequest {
+        path: downloaded.archive_path.clone(),
+        repo: component.repo.clone(),
+        signer_workflow: opts.verify_config.workflow_for(&component.name).to_string(),
+        tag: Some(tag.clone()),
+        source_digest,
+        trust_root: opts.verify_config.trust_root.clone(),
+        cache_dir: opts.verify_config.cache_dir(opts.prefix.as_deref()),
+        cache_ttl: opts.verify_config.cache_ttl()?,
+    };
+    if let Err(e) = opts.verifier.verify(&request) {
+        if opts.allow_unattested {
+            eprintln!(
+                "tuishou: attestation verification failed; continuing because --allow-unattested was set: {}",
+                crate::http::redact_secrets(&e.to_string())
+            );
+        } else {
+            return Err(e);
+        }
+    }
 
     let extract_dir = tmp.join("extract");
     let extracted =

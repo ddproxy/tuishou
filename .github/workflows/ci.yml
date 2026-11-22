@@ -29,9 +29,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
-      # The runner user is already non-root. This step also proves the suite
-      # does not depend on gh, an external network or a populated HOME.
-      - name: Test without gh, external network or HOME state
+      # The runner user is already non-root. This step proves the suite does not depend on a
+      # working gh CLI, an external network or a populated HOME; a unit test also checks that the
+      # source never spawns gh.
+      - name: Test with a failing gh first on PATH
         env:
           TUISHOU_GITHUB_API_BASE: http://127.0.0.1:1
         run: |

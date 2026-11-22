@@ -8,10 +8,16 @@ description = "Install, update and roll the Tuishou stack from GitHub releases"
 repository = "https://github.com/ddproxy/tuishou"
 
 [dependencies]
+base64 = "=0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
+const-oid = "=0.10.2"
 flate2 = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_json_canonicalizer = "=0.4.1"
+sigstore = { version = "=0.15.0", default-features = false, features = ["verify", "sigstore-trust-root", "rustls-tls"] }
+sigstore_protobuf_specs = "=0.5.2"
+tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt", "time"] }
 rustix = { version = "1", features = ["fs"] }
 sha2 = "0.11"
 tar = "0.4"
@@ -19,6 +25,7 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "std"] }
 toml = "1.2"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
+x509-cert = { version = "=0.3.0", features = ["pem"] }
 
 [dev-dependencies]
 tempfile = "3"

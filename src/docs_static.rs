@@ -40,9 +40,9 @@ tuishou \- install, update and roll the Tuishou stack from GitHub releases
 [\fIoptions\fR]
 .SH DESCRIPTION
 .B tuishou
-downloads release archives, verifies SHA-256 checksums and (when \fBgh\fR is
-available) build attestations, then installs or updates binaries atomically
-while keeping the previous binary as \fI<name>.prev\fR.
+downloads release archives, verifies SHA-256 checksums and in-process Sigstore
+attestations, then installs or updates binaries atomically while keeping the
+previous binary as \fI<name>.prev\fR.
 .SH COMMANDS
 .TP
 .B install <component|all>
@@ -84,6 +84,12 @@ Print a shell completion script to stdout.
 .TP
 .B man
 Print this man page to stdout.
+.TP
+.B verify \fIfile\fR --repo \fIowner/name\fR [\fB--signer-workflow\fR \fIpath\fR] [\fB--tag\fR \fItag\fR]
+Verify a local artifact against its GitHub attestation bundle. Prints the
+subject digest, OIDC issuer, workflow identity, expected workflow path, ref and
+Rekor log index. Exit status is 0 when verified, 1 when refused and 2 for usage
+errors.
 .SH GLOBAL OPTIONS
 .TP
 .B --json
@@ -110,8 +116,10 @@ With \fB--prefix\fR this is \fI<prefix>/.tuishou\fR instead.
 .TP
 .I dist/
 Generated completions and man page; not committed to source control.
+.TP
+.I $XDG_STATE_HOME/tuishou/verify-cache/
+Trusted-root cache (mode 0700); override with \fB[verify].cache_dir\fR.
 .SH SEE ALSO
-.BR gh-attestation-verify (1),
 .BR sha256sum (1)
 "#;
 

@@ -1,32 +1,52 @@
 # FAQ
 
-## Where is install state stored?
+## Do I need the GitHub CLI installed?
 
-By default: `$XDG_STATE_HOME/tuishou/installed.json`, or `~/.local/state/tuishou/installed.json` when `XDG_STATE_HOME` is unset. With `--prefix DIR`, state is stored at `<DIR>/.tuishou.json`.
+No. `tuishou` verifies attestations in process. It does not spawn an external CLI,
+require an external CLI login, or require any GitHub CLI on PATH. The only manual
+external cross-check documented in this repository is an optional command in
+[verify-release.md](verify-release.md); it is never invoked by `tuishou`.
 
-## What exit codes does tuishou use?
+## What happens if verification fails?
 
-- `0`: success.
-- `1`: error.
-- `10`: `tuishou update --check` found updates.
+The install, update, self-update, or auto-update is refused with exit 1 and a specific
+reason: digest mismatch, wrong issuer or workflow, missing Rekor proof, untrusted
+chain, malformed bundle, and so on. `--allow-unattested` turns failures into warnings
+for explicit local use. Auto-update always refuses `--allow-unattested`.
 
-## Does update cross major versions?
+## Which verifier does tuishou use?
 
-No. Pass `--allow-major` to allow a major version change.
+The official `sigstore` Rust crate, pinned to `=0.15.0`, with its `rustls-tls` feature.
+It is used in strict offline bundle-verification mode with a pinned/persisted trust
+root; `tuishou` adds explicit Rekor SET and Merkle inclusion checks, GitHub OIDC
+identity checks, SLSA provenance predicate checks, and its own HTTP/token rules.
 
-## What happens if gh is not installed?
+## Which hosts are contacted?
 
-`tuishou` reports that attestation verification requires `gh`. Pass `--allow-unattested` to continue with checksum verification only.
+- `api.github.com` for releases and attestations, with a token only when configured.
+- `github.com` and release-asset hosts from the allowlist for asset downloads, with no
+  token.
+- `tuf-repo-cdn.sigstore.dev` for optional trust-root refresh, unless a local
+  `[verify].trust_root` is configured.
 
-## How do I add a component?
+## Can I pin the trust root?
 
-Add a `[[component]]` entry to `tuishou.toml` in the working directory. Unknown config keys are errors.
+Yes. Set `[verify].trust_root` to a path containing a Sigstore `trusted_root.json`.
+That file is trusted input and is never refreshed. The embedded roots are pinned and
+checksum-checked at runtime.
 
-```toml
-[[component]]
-name = "example"
-repo = "owner/example"
-asset_pattern = "example-{tag}-{target}.tar.gz"
-binaries = ["example"]
-service_unit = "example.service"
+## What identities are accepted?
+
+Only `https://token.actions.githubusercontent.com` with a workflow SAN for the
+expected owner/repo, the configured signer workflow (default
+`.github/workflows/release.yml`), and the expected `refs/tags/...` ref, plus matching
+source repository/ref/digest extensions. Everything else is refused.
+
+## How do I inspect a bundle?
+
+```sh
+tuishou verify artifact.tar.gz --repo owner/name --tag v1.2.3
 ```
+
+It prints the digest, issuer, identity, workflow, ref, and Rekor log index. Exit 0
+means verified, 1 refused, 2 usage.

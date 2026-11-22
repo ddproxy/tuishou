@@ -141,7 +141,8 @@ fn env_for(cmd: &mut Command, server: &FakeServer, home: &Path) {
         .env("XDG_STATE_HOME", home.join(".local/state"))
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
-        // Hide any real `gh` (CI runners ship one).
+        // Use the debug-only fake verifier with no external CLI on PATH.
+        .env("TUISHOU_FAKE_ATTESTATION", "1")
         .env("PATH", "/nonexistent-tuishou-test-bin");
 }
 

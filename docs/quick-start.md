@@ -1,28 +1,50 @@
 # Quick start
 
-`tuishou` installs, updates and rolls Tuishou components from GitHub releases.
+## Install
 
-## 1. Install tuishou
+Install `tuishou` with cargo or from a release binary. Release binaries are verified
+in process against their GitHub attestations; no GitHub CLI is required.
 
-Download the `tuishou` release archive for your target, verify its SHA-256 checksum, and install the binary on your `PATH`.
+## Minimal config
 
-## 2. Install a component
+Create `tuishou.toml`:
 
-```sh
-tuishou install lu
+```toml
+[install]
+method = "copy"
+source = "github"
+repo = "owner/name"
+asset = "tool-{version}-{target}.tar.gz"
+
+[verify]
+signer_workflow = ".github/workflows/release.yml"
+
+[service]
+name = "tool.service"
+mode = "user"
 ```
 
-`tuishou` resolves the latest release, downloads the archive and checksum, verifies integrity, verifies build attestation when `gh` is available, extracts the expected binaries, and installs them atomically.
-
-## 3. Check status
+## Verify and install
 
 ```sh
+tuishou verify tool-1.2.3-x86_64-unknown-linux-gnu.tar.gz \
+  --repo owner/name --tag v1.2.3
+tuishou install
 tuishou status
 ```
 
-## 4. Update
+`tuishou verify` prints the digest, issuer, identity, workflow, ref, and Rekor log
+index; exit 0 means verified, 1 refused, 2 usage. `install` refuses unverified
+artifacts unless you explicitly pass `--allow-unattested`.
 
-```sh
-tuishou update --check
-tuishou update
+## Enable auto-update
+
+```toml
+[auto_update]
+enabled = true
+check_interval = "6h"
 ```
+
+Auto-update never accepts `--allow-unattested`. It checks releases, verifies in
+process, and applies only verified artifacts. See [auto-update.md](auto-update.md) and
+[verify-release.md](verify-release.md).

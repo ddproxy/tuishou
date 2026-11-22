@@ -12,9 +12,11 @@ use crate::rollback;
 use crate::self_update;
 use crate::state;
 use crate::status;
+use crate::verify::{self, AttestationRequest, AttestationVerifier};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -58,7 +60,7 @@ pub enum Commands {
         /// Show what would be done without making changes
         #[arg(long)]
         dry_run: bool,
-        /// Allow install when gh attestation verification is unavailable
+        /// Warn and continue when attestation verification fails
         #[arg(long)]
         allow_unattested: bool,
         /// Allow crossing a major version boundary
@@ -78,7 +80,7 @@ pub enum Commands {
         /// Allow crossing a major version boundary
         #[arg(long)]
         allow_major: bool,
-        /// Allow install when gh attestation verification is unavailable
+        /// Warn and continue when attestation verification fails
         #[arg(long)]
         allow_unattested: bool,
         /// Install prefix directory
@@ -107,7 +109,7 @@ pub enum Commands {
         /// Directory to install into (default: directory of the running binary)
         #[arg(long)]
         prefix: Option<PathBuf>,
-        /// Allow install when gh attestation verification is unavailable
+        /// Warn and continue when attestation verification fails
         #[arg(long)]
         allow_unattested: bool,
         /// Allow crossing a major version boundary
@@ -125,6 +127,20 @@ pub enum Commands {
     },
     /// Print the tuishou man page
     Man,
+    /// Verify a local artifact against its GitHub attestation bundle
+    Verify {
+        /// Artifact to verify
+        file: PathBuf,
+        /// GitHub repository in owner/name form
+        #[arg(long)]
+        repo: String,
+        /// Override the expected signer workflow path
+        #[arg(long)]
+        signer_workflow: Option<String>,
+        /// Expected release tag (otherwise read from the certificate SAN)
+        #[arg(long)]
+        tag: Option<String>,
+    },
     #[command(
         hide = true,
         name = "__complete",
@@ -174,7 +190,7 @@ pub enum Commands {
         /// Allow crossing a major version boundary
         #[arg(long)]
         allow_major: bool,
-        /// Allow install when gh attestation verification is unavailable
+        /// Warn and continue when attestation verification fails
         #[arg(long)]
         allow_unattested: bool,
     },
@@ -303,7 +319,8 @@ pub fn run() -> Result<ExitCode> {
                 quiet: cli.quiet,
                 verbose: cli.verbose,
                 smoke_check,
-                signer_workflow: None,
+                verifier: verify::default_verifier(),
+                verify_config: loaded.verify.clone(),
                 commit_state: true,
             };
             let mut outcomes = Vec::new();
@@ -395,7 +412,8 @@ pub fn run() -> Result<ExitCode> {
                     quiet: cli.quiet,
                     verbose: cli.verbose,
                     smoke_check: false,
-                    signer_workflow: None,
+                    verifier: verify::default_verifier(),
+                    verify_config: loaded.verify.clone(),
                     commit_state: true,
                 };
                 install::install_component(&agent, c, &opts)?;
@@ -447,7 +465,8 @@ pub fn run() -> Result<ExitCode> {
                 quiet: cli.quiet,
                 verbose: cli.verbose,
                 smoke_check: false,
-                signer_workflow: None,
+                verifier: verify::default_verifier(),
+                verify_config: loaded.verify.clone(),
                 commit_state: true,
             };
             let outcome = install::install_component(&agent, &component, &opts)?;
@@ -479,6 +498,58 @@ pub fn run() -> Result<ExitCode> {
         }
         Commands::Man => {
             print!("{}", docs_static::MAN_PAGE);
+            Ok(ExitCode::SUCCESS)
+        }
+        Commands::Verify {
+            file,
+            repo,
+            signer_workflow,
+            tag,
+        } => {
+            verify::github::validate_repo(&repo)
+                .map_err(|e| Error::Usage(format!("invalid --repo: {e}")))?;
+            let workflow = signer_workflow.unwrap_or_else(|| loaded.verify.signer_workflow.clone());
+            verify::validate_signer_workflow(&workflow, "--signer-workflow")
+                .map_err(|e| Error::Usage(e.to_string()))?;
+            if let Some(value) = &tag {
+                verify::validate_tag(value, "--tag").map_err(|e| Error::Usage(e.to_string()))?;
+            }
+            let mut verify_config = loaded.verify.clone();
+            verify_config.signer_workflow = workflow.clone();
+            let request = AttestationRequest {
+                path: file,
+                repo,
+                signer_workflow: workflow,
+                tag,
+                source_digest: None,
+                trust_root: verify_config.trust_root.clone(),
+                cache_dir: verify_config.cache_dir(None),
+                cache_ttl: verify_config.cache_ttl()?,
+            };
+            let verifier: Arc<dyn AttestationVerifier> = verify::default_verifier();
+            let report = verifier.verify(&request)?;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "digest": report.digest,
+                        "issuer": report.issuer,
+                        "identity": report.identity,
+                        "workflow": report.workflow,
+                        "ref": report.ref_value,
+                        "log_index": report.log_index,
+                        "predicate_type": report.predicate_type,
+                    }))
+                    .map_err(|e| Error::msg(e.to_string()))?
+                );
+            } else {
+                println!("digest: {}", report.digest);
+                println!("issuer: {}", report.issuer);
+                println!("identity: {}", report.identity);
+                println!("workflow: {}", report.workflow);
+                println!("ref: {}", report.ref_value);
+                println!("log index: {}", report.log_index);
+            }
             Ok(ExitCode::SUCCESS)
         }
         Commands::Complete { .. } => unreachable!("handled before config load"),

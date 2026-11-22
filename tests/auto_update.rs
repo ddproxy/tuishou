@@ -156,7 +156,9 @@ fn current_target() -> String {
 }
 
 fn tuishou_cmd() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_tuishou"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tuishou"));
+    cmd.env("TUISHOU_FAKE_ATTESTATION", "1");
+    cmd
 }
 
 fn write_fake_tool(dir: &Path, name: &str, body: &str) -> PathBuf {
@@ -279,6 +281,7 @@ fn base_env(cmd: &mut Command, server: &FakeServer, home: &Path, path_env: &str)
         .env("HOME", home)
         .env("XDG_STATE_HOME", home.join(".local/state"))
         .env("PATH", path_env)
+        .env("TUISHOU_FAKE_ATTESTATION", "1")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN");
 }
@@ -352,9 +355,9 @@ fn assert_no_legacy_lu_commands(log: &str) {
     );
 }
 
-fn fake_gh_ok(dir: &Path) -> PathBuf {
-    write_fake_tool(dir, "gh", "#!/bin/sh\nexit 0\n")
-}
+/// Verification is faked through the debug hook set by `base_env`; this helper
+/// keeps the call sites readable without creating any external executable.
+fn enable_fake_attestation(_dir: &Path) {}
 
 fn setup_prefix_with_state(home: &Path, component: &str, version: &str) {
     let state_dir = home.join(".local/state/tuishou");
@@ -414,7 +417,7 @@ fn interval_below_5m_rejected() {
 }
 
 #[test]
-fn auto_mode_refuses_allow_unattested_and_requires_gh() {
+fn auto_mode_refuses_allow_unattested() {
     let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let td = tempfile::tempdir().unwrap();
     let home = td.path().join("home");
@@ -422,22 +425,8 @@ fn auto_mode_refuses_allow_unattested_and_requires_gh() {
     write_config(td.path(), "[auto_update]\nenabled = true\n");
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    // no gh on PATH
+    enable_fake_attestation(&bindir);
     let path = bindir.display().to_string();
-    let out = tuishou_cmd()
-        .current_dir(td.path())
-        .env("HOME", &home)
-        .env("XDG_STATE_HOME", home.join(".local/state"))
-        .env("PATH", &path)
-        .args(["auto-update", "run", "--once"])
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("gh"), "{stderr}");
-
-    // allow-unattested refused even if gh present
-    fake_gh_ok(&bindir);
     let out = tuishou_cmd()
         .current_dir(td.path())
         .env("HOME", &home)
@@ -458,7 +447,7 @@ fn hold_and_expiry_pause_updates() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     setup_prefix_with_state(&home, "app", "v0.4.0");
 
     let target = current_target();
@@ -602,7 +591,7 @@ fn lock_contention_second_run_exits_quietly() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     write_config(
         td.path(),
         "[auto_update]\nenabled = true\ncomponents = []\n",
@@ -649,7 +638,7 @@ fn etag_304_uses_cache_and_rate_limit_retries() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     setup_prefix_with_state(&home, "app", "v0.4.0");
     let target = current_target();
     let asset = format!("lu-v0.4.1-{target}.tar.gz");
@@ -798,7 +787,7 @@ fn min_release_age_and_policy_are_enforced() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     setup_prefix_with_state(&home, "app", "v0.4.0");
     let target = current_target();
     let asset = format!("lu-v0.4.1-{target}.tar.gz");
@@ -860,7 +849,7 @@ fn agent_drain_install_restart_undrain_order() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let log = td.path().join("cmd.log");
     let drained = td.path().join("drained");
     let restarted = td.path().join("restarted");
@@ -987,7 +976,7 @@ fn health_failure_rolls_back_and_marks_bad() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let log = td.path().join("cmd.log");
     let drained = td.path().join("drained");
     // The node never reports the new version, so health fails. It keeps
@@ -1115,7 +1104,7 @@ fn controller_schema_marker_and_notify_and_backups() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let notify_log = td.path().join("notify.json");
     let notify_cmd = td.path().join("notify.sh");
     fs::write(
@@ -1257,7 +1246,7 @@ fn controller_backup_retention_and_notify_on_update() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let notify_out = td.path().join("notify.out");
     let notify_cmd = td.path().join("notify.sh");
     fs::write(
@@ -1412,7 +1401,7 @@ fn controller_busy_status_skips_update_and_backup() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let log = td.path().join("cmd.log");
     let backup_dir = td.path().join("backups");
     fs::create_dir_all(&backup_dir).unwrap();
@@ -1558,7 +1547,7 @@ fn controller_backup_uses_out_file_with_config_and_secure_permissions() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let log = td.path().join("cmd.log");
     let restarted = td.path().join("restarted");
     let backups = td.path().join("backups");
@@ -1727,7 +1716,7 @@ fn failed_controller_backup_refuses_the_update() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let log = td.path().join("cmd.log");
     let backups = td.path().join("backups");
     let lu = format!(
@@ -1838,7 +1827,7 @@ fn auto_update_prefix_controls_state_hold_timer_and_adopt() {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let prefix = td.path().join("prefix");
     fs::create_dir_all(&prefix).unwrap();
     let state = serde_json::json!({
@@ -2079,7 +2068,7 @@ fn run_agent_cycle_with_archive(files: &[(&str, &[u8])]) -> AgentCycleResult {
     fs::create_dir_all(&home).unwrap();
     let bindir = td.path().join("bin");
     fs::create_dir_all(&bindir).unwrap();
-    fake_gh_ok(&bindir);
+    enable_fake_attestation(&bindir);
     let log = td.path().join("cmd.log");
     let drained = td.path().join("drained");
     let restarted = td.path().join("restarted");
