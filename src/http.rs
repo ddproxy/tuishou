@@ -37,7 +37,7 @@ pub fn github_token() -> Option<String> {
 
 /// GitHub tokens are only sent to GitHub API endpoints. Asset hosts and hosts
 /// added through `TUISHOU_ALLOWED_HOSTS` never receive credentials.
-fn auth_headers_for(url: &str) -> Vec<(&'static str, String)> {
+pub fn auth_headers_for(url: &str) -> Vec<(&'static str, String)> {
     if !is_github_api(url) {
         return Vec::new();
     }
@@ -154,6 +154,31 @@ pub fn get_json(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value> {
     }
     let body = read_body(resp, DEFAULT_MAX_DOWNLOAD_BYTES)?;
     serde_json::from_str(&body).map_err(|e| Error::Http(format!("invalid JSON from {url}: {e}")))
+}
+
+/// GET a response body with an explicit byte cap. Used for attestation API
+/// responses, which must not be allowed to exhaust memory or disk.
+pub fn get_limited(
+    agent: &ureq::Agent,
+    url: &str,
+    headers: &[(&str, String)],
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    let mut all: Vec<(&str, String)> = headers.to_vec();
+    all.extend(auth_headers_for(url));
+    let resp = get_response(agent, url, &all)?;
+    if !(200..300).contains(&resp.status()) {
+        return Err(status_error("GET", url, resp));
+    }
+    let mut reader = resp.into_reader().take(max_bytes.saturating_add(1));
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|e| Error::Http(format!("failed to read response body: {e}")))?;
+    if body.len() as u64 > max_bytes {
+        return Err(Error::DownloadTooLarge { limit: max_bytes });
+    }
+    Ok(body)
 }
 
 pub fn download_to_writer(
@@ -417,6 +442,8 @@ mod tests {
 
     #[test]
     fn non_github_hosts_are_refused() {
+        // Other tests set TUISHOU_ALLOW_INSECURE_HTTP; hold the lock so the answer does not depend on timing.
+        let _guard = crate::test_env_lock();
         assert!(ensure_allowed_url("https://github.com/ddproxy/tuishou").is_ok());
         assert!(ensure_allowed_url("https://evil.test/x").is_err());
         assert!(ensure_allowed_url("http://127.0.0.1:8080/x").is_err());

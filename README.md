@@ -12,22 +12,22 @@ This repository holds the installer, updater and fleet roll tooling only. Contro
 
 ## Install
 
-Download the release archive for your target, verify its checksum, and place `tuishou` on your `PATH`:
+Download the release archive for your target and place `tuishou` on your `PATH`:
 
 ```sh
 TAG=v0.1.0
 TARGET=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/ddproxy/tuishou/releases/download/${TAG}/tuishou-${TAG}-${TARGET}.tar.gz"
-curl -fsSLO "https://github.com/ddproxy/tuishou/releases/download/${TAG}/tuishou-${TAG}-${TARGET}.tar.gz.sha256"
-sha256sum -c "tuishou-${TAG}-${TARGET}.tar.gz.sha256"
 tar -xzf "tuishou-${TAG}-${TARGET}.tar.gz"
 install -m 0755 tuishou ~/.local/bin/tuishou
 ```
 
+Release archives have GitHub attestations. `tuishou` verifies them in process; no GitHub CLI is required. See [verify a release](docs/verify-release.md).
+
 ## Commands
 
 ```sh
-# Install a component (latest release)
+# Install a component (latest release, verified in process)
 tuishou install lu
 
 # Install a specific version into a prefix
@@ -40,7 +40,11 @@ tuishou adopt lu --version v0.4.0 --prefix /usr/local/bin
 tuishou update --check
 
 # Update installed components
-tuishou update --allow-unattested
+tuishou update
+
+# Inspect an artifact's attestation
+tuishou verify lu-0.4.0-x86_64-unknown-linux-musl.tar.gz \
+  --repo ddproxy/lu --tag v0.4.0
 
 # Show installed and latest versions (stable JSON for automation)
 tuishou status --json
@@ -64,6 +68,8 @@ tuishou roll --nodes inventory.toml --component lu --version v0.4.0 --dry-run
 ```
 
 Global flags: `--json`, `--quiet`, `--verbose`, `--config <path>` (or `TUISHOU_CONFIG`). `NO_COLOR` is respected.
+
+`--allow-unattested` is an explicit local opt-in that warns and continues when verification fails. Auto-update refuses it.
 
 ## Documentation
 

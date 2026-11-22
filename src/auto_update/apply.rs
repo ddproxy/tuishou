@@ -3,7 +3,7 @@
 
 use crate::auto_update::state::AutoState;
 use crate::component::Component;
-use crate::config::{AutoUpdateConfig, ControllerPolicy};
+use crate::config::{AutoUpdateConfig, ControllerPolicy, VerifyConfig};
 use crate::duration::{in_window, parse_duration, parse_hhmm};
 use crate::error::{Error, Result};
 use crate::install::{self, InstallOptions, InstallOutcome};
@@ -11,10 +11,12 @@ use crate::logging::{journal, one_line};
 use crate::process::{self, CommandOutput};
 use crate::release::SCHEMA_MARKER;
 use crate::rollback;
+use crate::verify::AttestationVerifier;
 use crate::{lu, state};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
@@ -25,6 +27,12 @@ pub struct ApplyContext<'a> {
     /// Config path passed as `lu backup --config` so the controller backs up
     /// the same configuration the CLI loaded.
     pub config_path: Option<&'a Path>,
+    /// Production callers inject the configured verifier; tests that replace
+    /// `install` can leave it unset.
+    #[allow(dead_code)]
+    pub verifier: Option<Arc<dyn AttestationVerifier>>,
+    #[allow(dead_code)]
+    pub verify_config: Option<&'a VerifyConfig>,
 }
 
 /// Everything that touches the outside world during an apply, kept behind a
@@ -75,7 +83,11 @@ pub fn install_options(
         // The staged file is smoke-checked before any binary is replaced.
         smoke_check: true,
         commit_state,
-        signer_workflow: ctx.cfg.attestation_signer.clone(),
+        verifier: ctx
+            .verifier
+            .clone()
+            .unwrap_or_else(crate::verify::default_verifier),
+        verify_config: ctx.verify_config.cloned().unwrap_or_default(),
     }
 }
 
@@ -958,6 +970,8 @@ mod tests {
             cfg: &cfg(&td.path().join("backups")),
             prefix: Some(td.path()),
             config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
         };
         let c = component();
         let mut st = AutoState::default();
@@ -1001,6 +1015,8 @@ mod tests {
             cfg: &cfg(&td.path().join("backups")),
             prefix: Some(td.path()),
             config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
         };
         let mut runner = FakeRunner::new();
         runner.archive_names = Some(vec!["lu".to_string()]);
@@ -1030,6 +1046,8 @@ mod tests {
             cfg: &cfg(&td.path().join("backups")),
             prefix: Some(td.path()),
             config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
         };
         let mut runner = FakeRunner::new();
         *runner.nodes.lock().unwrap() = NODES_NEW.to_string();
@@ -1055,6 +1073,8 @@ mod tests {
             cfg: &cfg(&td.path().join("backups")),
             prefix,
             config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
         };
         let mut runner = FakeRunner::new();
         runner.fail.insert(
@@ -1091,6 +1111,8 @@ mod tests {
             cfg: &cfg(&td.path().join("backups")),
             prefix,
             config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
         };
         let mut runner = FakeRunner::new();
         runner.fail.insert(
@@ -1131,6 +1153,8 @@ mod tests {
             cfg: &cfg(&td.path().join("backups")),
             prefix: Some(td.path()),
             config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
         };
         let runner = FakeRunner::new();
         *runner.status.lock().unwrap() = STATUS_IDLE_NEW.to_string();
@@ -1174,6 +1198,8 @@ mod tests {
             cfg: &cfg(&td.path().join("backups")),
             prefix: Some(td.path()),
             config_path: Some(Path::new("tuishou.toml")),
+            verifier: None,
+            verify_config: None,
         };
         let runner = FakeRunner::new();
         *runner.status.lock().unwrap() =

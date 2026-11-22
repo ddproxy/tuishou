@@ -93,11 +93,11 @@ mod tests {
         let _guard = crate::test_env_lock();
         let previous = std::env::var_os("GITHUB_TOKEN");
         std::env::set_var("GITHUB_TOKEN", "unit-test-secret");
-        let line = one_line("gh failed with unit-test-secret");
+        let line = one_line("verification failed with unit-test-secret");
         match previous {
             Some(value) => std::env::set_var("GITHUB_TOKEN", value),
             None => std::env::remove_var("GITHUB_TOKEN"),
         }
-        assert_eq!(line, "gh failed with [redacted]");
+        assert_eq!(line, "verification failed with [redacted]");
     }
 }

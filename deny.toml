@@ -1,6 +1,14 @@
 [advisories]
 version = 2
 yanked = "warn"
+# Both advisories are reached only through the `sigstore` crate's OIDC signing dependencies
+# (openidconnect, oauth2), which tuishou never calls: it only verifies release attestations.
+# Review them whenever `sigstore` is updated, and drop the entries when they stop applying; the
+# plan for removing the dependency is the verifier rewrite in the backlog.
+ignore = [
+  { id = "RUSTSEC-2023-0071", reason = "Marvin timing attack on rsa private-key operations (decryption and signing); tuishou performs no RSA private-key operation, and the crate arrives only through sigstore's unused OIDC client" },
+  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained (no vulnerability); it arrives only through sigstore's unused OIDC client and is used for date formatting there" },
+]
 
 [licenses]
 version = 2

@@ -13,6 +13,7 @@ pub const COMMANDS: &[&str] = &[
     "adopt",
     "completions",
     "man",
+    "verify",
 ];
 
 const GLOBAL_OPTIONS: &[&str] = &[
@@ -84,6 +85,7 @@ pub fn command_options(command: &str) -> &'static [&'static str] {
         "adopt" => &["--version", "--prefix"],
         "completions" => &[],
         "man" => &[],
+        "verify" => &["--repo", "--signer-workflow", "--tag"],
         _ => &[],
     }
 }
@@ -159,6 +161,12 @@ mod tests {
     fn completes_flags_for_command() {
         let out = candidates(&words(&["install", "--dry"]));
         assert_eq!(out, "--dry-run");
+    }
+
+    #[test]
+    fn completes_verify_flags() {
+        let out = candidates(&words(&["verify", "--sig"]));
+        assert_eq!(out, "--signer-workflow");
     }
 
     #[test]

@@ -84,11 +84,6 @@ pub fn handle_run(
             "--allow-unattested is refused in auto-update mode: attestations are mandatory",
         ));
     }
-    if !crate::verify::gh_available() {
-        return Err(Error::msg(
-            "auto-update requires gh on PATH for attestation verification; install gh (attestations cannot be disabled in auto mode)",
-        ));
-    }
     let _ = once; // This tool never runs a daemon; one invocation is one cycle.
     let _guard = match state::CycleLock::try_acquire(prefix)? {
         Some(guard) => guard,
@@ -181,6 +176,7 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
     }
 
     let agent = crate::http::agent();
+    let verifier = crate::verify::default_verifier();
     let mut any_failed = false;
     for name in &cfg.components {
         let component = match resolve_component(name, components) {
@@ -268,6 +264,8 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
             cfg,
             prefix,
             config_path: Some(loaded.config_path.as_path()),
+            verifier: Some(verifier.clone()),
+            verify_config: Some(&loaded.verify),
         };
         let outcome = if is_controller {
             apply::apply_controller(&component, &release.tag, &release.body, &ctx, &mut st)

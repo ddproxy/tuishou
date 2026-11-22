@@ -3,12 +3,18 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 pub const EXIT_ERROR: u8 = 1;
+pub const EXIT_USAGE: u8 = 2;
 pub const EXIT_UPDATES_AVAILABLE: u8 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("{0}")]
     Message(String),
+
+    /// Bad command-line input. Distinct from a verification refusal so the
+    /// process can exit 2 for usage errors and 1 for failed verification.
+    #[error("{0}")]
+    Usage(String),
 
     #[error("unknown component '{0}'")]
     UnknownComponent(String),
@@ -53,8 +59,11 @@ pub enum Error {
     #[error("attestation verification failed: {0}")]
     Attestation(String),
 
-    #[error("attestation verification requires gh; install gh or pass --allow-unattested")]
-    AttestationUnavailable,
+    #[error("attestation refused: {0}")]
+    AttestationRefused(String),
+
+    #[error("attestation verification unavailable: {0}")]
+    AttestationUnavailable(String),
 
     #[error("archive error: {0}")]
     Archive(String),
@@ -83,6 +92,7 @@ impl Error {
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Message(m) if m == "updates available" => ExitCode::from(EXIT_UPDATES_AVAILABLE),
+            Self::Usage(_) => ExitCode::from(EXIT_USAGE),
             _ => ExitCode::from(EXIT_ERROR),
         }
     }

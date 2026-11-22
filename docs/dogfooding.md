@@ -1,63 +1,67 @@
-# Dogfooding tuishou
+# Dogfooding
 
-This guide covers adopting tuishou on nodes that already have `lu`/`ting` installed by hand, and installing tuishou on a fresh node.
+Host the release pipeline in the same repository as the deployed config: the checked-in
+config, `tuishou.toml`, is the source of truth for both verification and rollout.
 
-## Existing node (adopt, no replacement)
+## Minimal config
 
-If a node already has working binaries installed manually, record them in tuishou state without replacing files:
+```toml
+[install]
+method = "copy"
+source = "github"
+repo = "acme/infra"
+asset = "lu-agent-{version}-{target}.tar.gz"
+
+[verify]
+signer_workflow = ".github/workflows/release.yml"
+cache_ttl = "24h"
+
+[service]
+name = "lu-agent.service"
+mode = "user"
+
+[auto_update]
+enabled = true
+check_interval = "6h"
+```
+
+The release workflow signs artifacts with GitHub OIDC and publishes the attestation
+bundle to GitHub. The verifier reads the expected signer workflow from the config and
+requires the SLSA provenance predicate and GitHub identity described in
+[verify-release.md](verify-release.md). No external GitHub CLI is needed on nodes; the
+producer workflow publishes the release and its attestation separately.
+
+## Check and install
 
 ```sh
-tuishou adopt lu --version v0.4.0 --prefix /usr/local/bin
-tuishou adopt ting --version v0.4.0 --prefix /usr/local/bin
-tuishou status --json --prefix /usr/local/bin
+tuishou verify lu-agent-1.2.3-x86_64-unknown-linux-gnu.tar.gz \
+  --repo acme/infra --tag v1.2.3
+tuishou install --config tuishou.toml
+tuishou roll --config tuishou.toml
 ```
 
-`adopt` checks that at least one expected component binary exists in the install directory, records the version/target/checksum in state, and does not download or replace binaries. It is safe to run before the first managed update. With no `--prefix` flag, `adopt` uses `auto_update.prefix` from the loaded config when present.
+For a test install without a signed release, `--allow-unattested` warns and continues.
+It is an explicit local opt-in; auto-update always refuses it.
 
-## Fresh node
+## Remote roll
 
-1. Install `tuishou` itself from a verified release (see [Verify a tuishou release](verify-release.md)).
-2. Install components:
+```toml
+[[nodes]]
+host = "deploy@10.0.0.11"
 
-```sh
-tuishou install lu --version v0.4.0
-tuishou install ting --version v0.4.0
+[[nodes]]
+host = "deploy@10.0.0.12"
+unit = "custom.service"
 ```
 
-3. Confirm state:
+`tuishou roll` copies the binary, installs the artifact, and restarts the unit on each
+node. Each node verifies in process; make sure its config and any `GITHUB_TOKEN` needed
+for `api.github.com` are present. Trust-root refresh may need access to
+`tuf-repo-cdn.sigstore.dev`, or pin `[verify].trust_root` to an operator-managed file.
 
-```sh
-tuishou status --json
-```
+## Safe practice
 
-## Component naming
-
-The default component table points at `ddproxy/tuishou-lu`. Release assets use the real naming scheme:
-
-- `lu-<tag>-<target>.tar.gz`
-- `lu-<tag>-<target>.tar.gz.sha256`
-
-The `lu` component installs `lu`, `ting`, and accepts `lu-agent` while the rename lands. The `ting` component installs the node agent binaries from the same archive.
-
-## Ansible snippet
-
-`tuishou status --json` is stable and machine-readable. Example Ansible task that adopts an existing binary only when it is missing from state:
-
-```yaml
-- name: Read tuishou status
-  command: tuishou status --json --prefix /usr/local/bin
-  register: tuishou_status
-  changed_when: false
-  failed_when: false
-
-- name: Adopt existing lu binary
-  command: tuishou adopt lu --version {{ lu_version }} --prefix /usr/local/bin
-  when: >-
-    (tuishou_status.stdout | default('[]') | from_json)
-    | selectattr('component', 'equalto', 'lu')
-    | selectattr('installed_version')
-    | list
-    | length == 0
-```
-
-For scheduled updates, keep auto-update off unless the fleet explicitly opts in and the risks in [auto-update.md](auto-update.md) are acceptable.
+- Keep `.github/workflows/release.yml` fixed; change it only with a reviewed PR.
+- Use `cache_ttl` to bound TUF refresh frequency.
+- Check the reported identity, workflow, ref, and log index from `tuishou verify`.
+- Upgrade one node first, then roll the rest.

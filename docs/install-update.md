@@ -1,70 +1,54 @@
 # Install and update
 
-## Install
+## GitHub source
 
-```sh
-tuishou install <component|all> [--version vX.Y.Z] [--prefix DIR] [--dry-run] [--allow-unattested] [--allow-major]
+```toml
+[install]
+method = "copy"
+source = "github"
+repo = "owner/name"
+asset = "tool-{version}-{target}.tar.gz"
+
+[verify]
+signer_workflow = ".github/workflows/release.yml"
 ```
 
-- Resolves the release from GitHub (latest by default).
-- Downloads the archive and `.sha256` checksum into a temporary directory.
-- Verifies SHA-256.
-- Verifies build attestation with `gh attestation verify` when `gh` is installed. If `gh` is absent, pass `--allow-unattested` to continue with checksum verification only.
-- Extracts only expected binary names from the archive. Absolute paths, `..`, and symlinks are rejected.
-- Installs atomically: write to a temp file in the target directory, `chmod 0755`, rename over.
-- Keeps the previous binary as `<name>.prev`.
-- Records the install in a state file: `$XDG_STATE_HOME/tuishou/installed.json`, or `<prefix>/.tuishou.json` when `--prefix` is set.
+`tuishou install` resolves the version, downloads the asset, and verifies its
+GitHub attestation in process before installation. Verification checks the artifact
+digest, Sigstore/Fulcio chain, Rekor SET and inclusion proof, certificate validity at
+signing time, and the GitHub OIDC workflow identity and SLSA provenance. A TUF refresh
+may contact `tuf-repo-cdn.sigstore.dev`. Details are in
+[verify-release.md](verify-release.md).
+
+If verification fails or no attestation exists, the install is refused with exit 1.
+`--allow-unattested` warns and continues after an explicit opt-in; it is intended only
+for local testing of unattested builds and is rejected in `auto` mode.
+
+## Local source
+
+```toml
+[install]
+method = "copy"
+source = "local"
+path = "./dist/tool.tar.gz"
+```
+
+Local files are not attested by this flow; use `--allow-unattested` only when you trust
+the file out of band.
 
 ## Update
 
 ```sh
-tuishou update [component|all] [--check] [--allow-major] [--allow-unattested] [--prefix DIR]
+tuishou update
+tuishou update --version v1.2.3
+tuishou self-update
 ```
 
-- Compares installed versions with the latest release.
-- `--check` reports updates and exits with code 10 when updates exist.
-- Updates do not cross a major version boundary unless `--allow-major` is passed.
-- When release notes contain a heading for the new version, `tuishou` prints it.
+Each command applies the same verification rules before replacing files. `tuishou`
+uses `GITHUB_TOKEN`/`GH_TOKEN` only for `api.github.com`; asset downloads use the
+configured host allowlist and never receive the token.
 
-## Adopt
+## Rollback and receipts
 
-```sh
-tuishou adopt <component> --version vX.Y.Z [--prefix DIR]
-```
-
-Records an existing binary in tuishou state without downloading or replacing it. This is the dogfooding path for nodes that already have `lu`/`ting` installed by hand. At least one expected component binary must exist in the install directory.
-
-## Status
-
-```sh
-tuishou status [--json] [--prefix DIR]
-```
-
-Shows installed versions, latest versions, and whether a component service unit is active when `systemctl` is present. The `--json` output is a stable array of objects with fields `component`, `installed_version`, `latest_version`, `update_available`, `service_unit`, and `service_active`, intended for automation.
-
-## Rollback
-
-```sh
-tuishou rollback <component> [--prefix DIR]
-```
-
-Restores `<name>.prev` for the component binaries.
-
-## Self-update
-
-```sh
-tuishou self-update [--version vX.Y.Z] [--prefix DIR] [--allow-unattested] [--allow-major] [--dry-run]
-```
-
-Updates the `tuishou` binary itself from its own release archive. It uses the
-same checksum and attestation verification as component installs, writes the
-new binary atomically next to the running executable (or into `--prefix`), and
-keeps the old binary as `tuishou.prev`. See
-[Verify a tuishou release](verify-release.md) for manual verification steps.
-
-## Generated docs
-
-`cargo build` writes shell completions (`dist/tuishou.bash`, `dist/tuishou.zsh`,
-`dist/tuishou.fish`) and the man page (`dist/tuishou.1`) into `dist/`. Those
-files are generated at build time and are not committed. The same content is
-available on demand via `tuishou completions <bash|zsh|fish>` and `tuishou man`.
+`tuishou rollback` uses saved receipts; `tuishou status` shows installed versions and
+update state. Receipts record the digest and verification decision.

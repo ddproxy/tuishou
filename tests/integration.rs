@@ -115,8 +115,10 @@ fn sha256_hex(data: &[u8]) -> String {
 
 fn tuishou_cmd() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_tuishou"));
-    // Hide any real `gh` (CI runners ship one); tests that need a fake one set PATH themselves.
-    cmd.env("PATH", "/nonexistent-tuishou-test-bin");
+    // Debug-only fake keeps these HTTP-focused tests offline. PATH is empty to
+    // prove that verification never needs an external CLI.
+    cmd.env("TUISHOU_FAKE_ATTESTATION", "1")
+        .env("PATH", "/nonexistent-tuishou-test-bin");
     cmd
 }
 
@@ -170,8 +172,9 @@ fn base_env(cmd: &mut Command, server: &FakeServer, home: &Path) {
     cmd.env("XDG_STATE_HOME", home.join(".local/state"));
     cmd.env_remove("GITHUB_TOKEN");
     cmd.env_remove("GH_TOKEN");
-    // Hide any real `gh` (CI runners ship one) so these tests exercise the unattested path.
-    cmd.env("PATH", home.join("no-such-bin"));
+    // Keep verification offline and prove it does not need an external CLI.
+    cmd.env("TUISHOU_FAKE_ATTESTATION", "1")
+        .env("PATH", home.join("no-such-bin"));
 }
 
 #[test]
