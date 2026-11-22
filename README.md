@@ -15,7 +15,7 @@ This repository holds the installer, updater and fleet roll tooling only. Contro
 Download the release archive for your target and place `tuishou` on your `PATH`:
 
 ```sh
-TAG=v0.1.0
+TAG=v0.2.0
 TARGET=x86_64-unknown-linux-musl
 curl -fsSLO "https://github.com/ddproxy/tuishou/releases/download/${TAG}/tuishou-${TAG}-${TARGET}.tar.gz"
 tar -xzf "tuishou-${TAG}-${TARGET}.tar.gz"

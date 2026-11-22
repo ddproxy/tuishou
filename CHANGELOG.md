@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.2.0 - 2026-11-22
+
 ### Changed
 
 - Attestation verification now runs in process via the official `sigstore` Rust crate instead of spawning an external CLI. No external GitHub CLI, login, or subprocess is required for install, update, self-update, roll, or auto-update. Verification is fail closed across all paths; auto-update still refuses `--allow-unattested`.
