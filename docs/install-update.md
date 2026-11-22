@@ -62,5 +62,6 @@ Every component is reported even when another one fails.
 ## Rollback and receipts
 
 `tuishou rollback` restores the previous binary. `tuishou status` shows the same fixed
-vocabulary used by `update` and `auto-update`. Receipts record the digest and
-verification decision.
+vocabulary used by `update` and `auto-update`, plus one line per component with the
+installed version, latest known version and last check time (`never` until a check is
+recorded). Receipts record the digest and verification decision.

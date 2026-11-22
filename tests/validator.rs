@@ -1,3 +1,4 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -56,4 +57,35 @@ fn validator_rejects_out_of_range_sha_lengths() {
         let out = run(&dir.join(name));
         assert!(!out.status.success(), "{name} was accepted");
     }
+}
+
+#[test]
+fn release_workflow_builds_both_musl_targets() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
+    let text = fs::read_to_string(&path).unwrap();
+    for target in ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"] {
+        assert!(
+            text.contains(&format!("target: {target}")),
+            "missing {target} in release matrix"
+        );
+    }
+    assert!(text.contains("arch: x86_64"));
+    assert!(text.contains("arch: aarch64"));
+    assert!(text.contains("OUT=\"tuishou-${TAG}-${TARGET}\""));
+    assert!(text.contains("tuishou-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"));
+    assert!(
+        text.contains("AARCH64_MUSL_LINKER"),
+        "cross-linker limit must be explicit"
+    );
+    assert!(
+        text.contains("skipping aarch64 release target"),
+        "unsupported cross-linking must be skipped, not guessed"
+    );
+    assert!(!text.contains("aarch64-linux-gnu-gcc"));
+    let out = run(&path);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

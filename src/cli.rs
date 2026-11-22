@@ -585,7 +585,7 @@ pub fn run() -> Result<ExitCode> {
                 hold.as_deref(),
                 &bad,
             )?;
-            status::print_status(&entries, cli.json, cli.quiet)?;
+            status::print_status(&entries, cli.json, cli.quiet, prefix.as_deref())?;
             Ok(ExitCode::SUCCESS)
         }
         Commands::Rollback { component, prefix } => {

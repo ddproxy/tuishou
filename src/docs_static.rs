@@ -1,6 +1,6 @@
 // Static shell-completion and man-page sources. These are shared by the CLI
 // (`tuishou completions` / `tuishou man`) and by the build script, which
-// materialises them into `dist/` at build time.
+// materialises them under OUT_DIR at build time.
 
 pub const BASH_COMPLETIONS: &str = r#"# bash completion for tuishou
 _tuishou() {
@@ -65,7 +65,9 @@ fixed phrase: \fBup to date (vX)\fR, \fBupdate available vA -> vB\fR,
 \fBupdated vA -> vB\fR, \fBnot installed (latest vB)\fR,
 \fBnot in this release (archive lacks: <binaries>)\fR, \fBheld (reason)\fR,
 \fBbad version skipped (vX)\fR, \fBskipped (reason)\fR or \fBfailed (reason)\fR.
-\fB--json\fR carries the same data.
+Each line also carries \fBinstalled=\fR, \fBlatest=\fR and \fBlast_check=\fR fields;
+the check time comes from auto-update state and falls back to the cycle check time
+or \fBnever\fR. \fB--json\fR carries the same data.
 .TP
 .B rollback <component>
 Restore the previous binary for a component.

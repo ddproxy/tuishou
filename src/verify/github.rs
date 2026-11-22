@@ -9,6 +9,9 @@ use crate::http;
 
 pub const MAX_ATTESTATION_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_ATTESTATION_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+/// The attestation API uses 404 for both a missing attestation and an
+/// inaccessible repository. Never surface the latter as an authentication hint.
+pub const ATTESTATION_NOT_FOUND_MESSAGE: &str = "no attestation found for this digest";
 
 /// Fetch every attestation bundle associated with a subject digest.
 pub fn fetch_bundles(agent: &ureq::Agent, repo: &str, sha256_hex: &str) -> Result<Vec<Vec<u8>>> {
@@ -27,16 +30,29 @@ pub fn fetch_bundles(agent: &ureq::Agent, repo: &str, sha256_hex: &str) -> Resul
         ("Accept", "application/vnd.github+json".to_string()),
         ("User-Agent", "tuishou".to_string()),
     ];
-    let body =
-        http::get_limited(agent, &url, &headers, MAX_ATTESTATION_RESPONSE_BYTES).map_err(|e| {
-            match e {
+    let response =
+        http::get_limited_response(agent, &url, &headers, MAX_ATTESTATION_RESPONSE_BYTES).map_err(
+            |e| match e {
                 Error::DownloadTooLarge { limit } => Error::AttestationRefused(format!(
                     "attestation API response exceeded {limit} bytes"
                 )),
                 other => other,
-            }
-        })?;
-    parse_attestation_response(&body)
+            },
+        )?;
+    if response.status == 404 {
+        return Err(Error::AttestationUnavailable(
+            ATTESTATION_NOT_FOUND_MESSAGE.to_string(),
+        ));
+    }
+    if !(200..300).contains(&response.status) {
+        return Err(http::status_error_body(
+            "GET",
+            &url,
+            response.status,
+            &response.body,
+        ));
+    }
+    parse_attestation_response(&response.body)
 }
 
 /// Parse the REST response. Kept separate so malformed responses can be
@@ -156,5 +172,66 @@ mod tests {
         assert!(parse_attestation_response(br#"{}"#).is_err());
         assert!(parse_attestation_response(br#"{"attestations":[]}"#).is_err());
         assert!(parse_attestation_response(br#"{"attestations":[{}]}"#).is_err());
+    }
+
+    #[cfg(feature = "test-hooks")]
+    #[test]
+    fn not_found_attestation_hides_authentication_hints() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let _guard = crate::test_env_lock();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body =
+            br#"{"message":"Must have admin rights to the repository; authentication required"}"#;
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(_) => return,
+                }
+            };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.write_all(body);
+        });
+
+        let old_base = std::env::var_os("TUISHOU_GITHUB_API_BASE");
+        let old_http = std::env::var_os("TUISHOU_ALLOW_INSECURE_HTTP");
+        std::env::set_var("TUISHOU_GITHUB_API_BASE", &base);
+        std::env::set_var("TUISHOU_ALLOW_INSECURE_HTTP", "1");
+        let err = fetch_bundles(&crate::http::agent(), "owner/repo", &"a".repeat(64)).unwrap_err();
+        server.join().unwrap();
+        match old_base {
+            Some(value) => std::env::set_var("TUISHOU_GITHUB_API_BASE", value),
+            None => std::env::remove_var("TUISHOU_GITHUB_API_BASE"),
+        }
+        match old_http {
+            Some(value) => std::env::set_var("TUISHOU_ALLOW_INSECURE_HTTP", value),
+            None => std::env::remove_var("TUISHOU_ALLOW_INSECURE_HTTP"),
+        }
+
+        let message = err.to_string();
+        assert!(message.contains(ATTESTATION_NOT_FOUND_MESSAGE), "{message}");
+        assert!(
+            !message.to_ascii_lowercase().contains("authentication"),
+            "{message}"
+        );
     }
 }
