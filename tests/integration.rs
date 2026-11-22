@@ -185,7 +185,7 @@ fn install_success_and_state_round_trip() {
     let archive = make_tar_gz(&[("lu", b"#!/bin/sh\necho lu\n", Some(0o755))]);
     let asset = format!("lu-v0.4.0-{target}.tar.gz");
     let server = FakeServer::start_with(|base| {
-        setup_release(base, "ddproxy/lu", "v0.4.0", &asset, &archive)
+        setup_release(base, "ddproxy/tuishou-lu", "v0.4.0", &asset, &archive)
     });
 
     let mut cmd = tuishou_cmd();
@@ -251,7 +251,7 @@ fn wrong_checksum_fails() {
         }).to_string();
         vec![
             (
-                "/repos/ddproxy/lu/releases/tags/v0.4.0".to_string(),
+                "/repos/ddproxy/tuishou-lu/releases/tags/v0.4.0".to_string(),
                 release_json.into_bytes(),
                 "application/json".to_string(),
             ),
@@ -308,7 +308,7 @@ fn truncated_download_fails_closed() {
         }).to_string();
         vec![
             (
-                "/repos/ddproxy/lu/releases/tags/v0.4.0".to_string(),
+                "/repos/ddproxy/tuishou-lu/releases/tags/v0.4.0".to_string(),
                 release_json.into_bytes(),
                 "application/json".to_string(),
             ),
@@ -361,7 +361,7 @@ fn oversize_download_fails() {
         }).to_string();
         vec![
             (
-                "/repos/ddproxy/lu/releases/tags/v0.4.0".to_string(),
+                "/repos/ddproxy/tuishou-lu/releases/tags/v0.4.0".to_string(),
                 release_json.into_bytes(),
                 "application/json".to_string(),
             ),
@@ -493,7 +493,7 @@ fn archive_path_traversal_rejected() {
         .to_string();
         vec![
             (
-                "/repos/ddproxy/lu/releases/tags/v0.4.0".to_string(),
+                "/repos/ddproxy/tuishou-lu/releases/tags/v0.4.0".to_string(),
                 release_json.into_bytes(),
                 "application/json".to_string(),
             ),
@@ -548,7 +548,7 @@ fn archive_symlink_rejected() {
         .to_string();
         vec![
             (
-                "/repos/ddproxy/lu/releases/tags/v0.4.0".to_string(),
+                "/repos/ddproxy/tuishou-lu/releases/tags/v0.4.0".to_string(),
                 release_json.into_bytes(),
                 "application/json".to_string(),
             ),
@@ -609,7 +609,7 @@ fn prev_retention_and_rollback() {
             ]})
             .to_string();
             routes.push((
-                format!("/repos/ddproxy/lu/releases/tags/{tag}"),
+                format!("/repos/ddproxy/tuishou-lu/releases/tags/{tag}"),
                 rel.into_bytes(),
                 "application/json".to_string(),
             ));
@@ -630,7 +630,7 @@ fn prev_retention_and_rollback() {
             {"name":format!("{asset2}.sha256"),"browser_download_url":format!("{base}/dl/{asset2}.sha256")}
         ]}).to_string();
         routes.push((
-            "/repos/ddproxy/lu/releases/latest".to_string(),
+            "/repos/ddproxy/tuishou-lu/releases/latest".to_string(),
             latest.into_bytes(),
             "application/json".to_string(),
         ));
@@ -716,7 +716,7 @@ fn update_check_exit_codes() {
             ]})
             .to_string();
             routes.push((
-                format!("/repos/ddproxy/lu/releases/tags/{tag}"),
+                format!("/repos/ddproxy/tuishou-lu/releases/tags/{tag}"),
                 rel.into_bytes(),
                 "application/json".to_string(),
             ));
@@ -736,7 +736,7 @@ fn update_check_exit_codes() {
             {"name":format!("{asset2}.sha256"),"browser_download_url":format!("{base}/dl/{asset2}.sha256")}
         ]}).to_string();
         routes.push((
-            "/repos/ddproxy/lu/releases/latest".to_string(),
+            "/repos/ddproxy/tuishou-lu/releases/latest".to_string(),
             latest.into_bytes(),
             "application/json".to_string(),
         ));
@@ -820,7 +820,7 @@ fn major_version_refusal() {
             ]})
             .to_string();
             routes.push((
-                format!("/repos/ddproxy/lu/releases/tags/{tag}"),
+                format!("/repos/ddproxy/tuishou-lu/releases/tags/{tag}"),
                 rel.into_bytes(),
                 "application/json".to_string(),
             ));
@@ -840,7 +840,7 @@ fn major_version_refusal() {
             {"name":format!("{asset2}.sha256"),"browser_download_url":format!("{base}/dl/{asset2}.sha256")}
         ]}).to_string();
         routes.push((
-            "/repos/ddproxy/lu/releases/latest".to_string(),
+            "/repos/ddproxy/tuishou-lu/releases/latest".to_string(),
             latest.into_bytes(),
             "application/json".to_string(),
         ));

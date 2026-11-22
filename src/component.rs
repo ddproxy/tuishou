@@ -26,12 +26,23 @@ impl Component {
 
 pub fn builtin_components() -> Vec<Component> {
     vec![
+        // Both `lu` (controller) and `ting` (node agent) ship in the same
+        // release archive, named lu-<tag>-<target>.tar.gz, in the
+        // ddproxy/tuishou-lu repository. `lu-agent` is accepted in the binary
+        // list while the rename to `ting` lands.
         Component {
             name: "lu".to_string(),
-            repo: "ddproxy/lu".to_string(),
+            repo: "ddproxy/tuishou-lu".to_string(),
             asset_pattern: "lu-{tag}-{target}.tar.gz".to_string(),
-            binaries: vec!["lu".to_string(), "lu-agent".to_string(), "ting".to_string()],
+            binaries: vec!["lu".to_string(), "ting".to_string(), "lu-agent".to_string()],
             service_unit: None,
+        },
+        Component {
+            name: "ting".to_string(),
+            repo: "ddproxy/tuishou-lu".to_string(),
+            asset_pattern: "lu-{tag}-{target}.tar.gz".to_string(),
+            binaries: vec!["ting".to_string(), "lu-agent".to_string()],
+            service_unit: Some("lu-agent.service".to_string()),
         },
         Component {
             name: "tuishou".to_string(),
@@ -59,4 +70,30 @@ pub fn resolve_components(names: &[String], components: &[Component]) -> Result<
         .iter()
         .map(|n| resolve_component(n, components))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_components_use_real_release_naming() {
+        let components = builtin_components();
+        let lu = resolve_component("lu", &components).unwrap();
+        let ting = resolve_component("ting", &components).unwrap();
+        for c in [&lu, &ting] {
+            assert_eq!(c.repo, "ddproxy/tuishou-lu");
+            assert_eq!(
+                c.asset_name("v0.4.0", "x86_64-unknown-linux-musl"),
+                "lu-v0.4.0-x86_64-unknown-linux-musl.tar.gz"
+            );
+            assert_eq!(
+                c.checksum_asset_name("v0.4.0", "x86_64-unknown-linux-musl"),
+                "lu-v0.4.0-x86_64-unknown-linux-musl.tar.gz.sha256"
+            );
+        }
+        assert!(lu.binaries.iter().any(|b| b == "lu"));
+        assert!(ting.binaries.iter().any(|b| b == "ting"));
+        assert!(ting.binaries.iter().any(|b| b == "lu-agent"));
+    }
 }

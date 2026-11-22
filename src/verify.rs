@@ -100,7 +100,15 @@ pub fn verify_checksum(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn verify_attestation(archive: &Path, repo: &str, allow_unattested: bool) -> Result<()> {
+/// Verify a release with `gh attestation verify`. In auto mode the caller
+/// passes a signer workflow identity which is forwarded to
+/// `--signer-workflow` and never interpreted as a shell string.
+pub fn verify_attestation_with_signer(
+    archive: &Path,
+    repo: &str,
+    allow_unattested: bool,
+    signer_workflow: Option<&str>,
+) -> Result<()> {
     let gh = match which_gh() {
         Some(p) => p,
         None => {
@@ -113,12 +121,18 @@ pub fn verify_attestation(archive: &Path, repo: &str, allow_unattested: bool) ->
             return Err(Error::AttestationUnavailable);
         }
     };
-    let output = Command::new(gh)
-        .arg("attestation")
+    let mut cmd = Command::new(gh);
+    cmd.arg("attestation")
         .arg("verify")
         .arg(archive)
         .arg("--repo")
-        .arg(repo)
+        .arg(repo);
+    if let Some(signer) = signer_workflow {
+        if !signer.is_empty() {
+            cmd.arg("--signer-workflow").arg(signer);
+        }
+    }
+    let output = cmd
         .output()
         .map_err(|e| Error::Attestation(format!("failed to run gh: {e}")))?;
     if output.status.success() {
@@ -136,6 +150,10 @@ pub fn verify_attestation(archive: &Path, repo: &str, allow_unattested: bool) ->
         }
     );
     Err(Error::Attestation(msg.trim().to_string()))
+}
+
+pub fn gh_available() -> bool {
+    which_gh().is_some()
 }
 
 fn which_gh() -> Option<String> {

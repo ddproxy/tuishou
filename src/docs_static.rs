@@ -64,6 +64,17 @@ Run a controlled fleet roll over SSH.
 .B self-update
 Update the \fBtuishou\fR binary itself from its own release archive.
 .TP
+.B auto-update <run|install-timer|status|hold|release|clear-bad>
+Opt-in scheduled auto-update. \fBrun\fR performs one cycle under an exclusive
+flock; \fBinstall-timer\fR prints (never installs) a systemd service/timer pair;
+\fBstatus\fR reports the last check and per-component results; \fBhold\fR and
+\fBrelease\fR manage the HOLD file; \fBclear-bad\fR forgets bad versions.
+This mode is off by default and is not recommended for production: it installs
+new releases without human review.
+.TP
+.B adopt <component> --version <tag>
+Record an existing binary in state without replacing it.
+.TP
 .B completions <bash|zsh|fish>
 Print a shell completion script to stdout.
 .TP
@@ -83,6 +94,10 @@ Print verbose output.
 .TP
 .I $XDG_STATE_HOME/tuishou/installed.json
 Default install state (or \fI<prefix>/.tuishou.json\fR with \fB--prefix\fR).
+.TP
+.I $XDG_STATE_HOME/tuishou/
+Auto-update state (HOLD, lock, ETag cache, results); directory mode 0700.
+With \fB--prefix\fR this is \fI<prefix>/.tuishou\fR instead.
 .TP
 .I dist/
 Generated completions and man page; not committed to source control.

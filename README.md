@@ -33,8 +33,8 @@ tuishou install lu
 # Install a specific version into a prefix
 tuishou install lu --version v0.4.0 --prefix /opt/tuishou/bin
 
-# Install every known component
-tuishou install all --allow-unattested
+# Record an existing binary without replacing it
+tuishou adopt lu --version v0.4.0 --prefix /usr/local/bin
 
 # Check for updates (exit 10 when updates exist)
 tuishou update --check
@@ -42,11 +42,15 @@ tuishou update --check
 # Update installed components
 tuishou update --allow-unattested
 
-# Show installed and latest versions
+# Show installed and latest versions (stable JSON for automation)
 tuishou status --json
 
 # Roll back a component to the previous binary
 tuishou rollback lu
+
+# Opt-in scheduled auto-update (off by default, not recommended for production)
+tuishou auto-update status --json
+tuishou auto-update install-timer --interval 10m
 
 # Update the tuishou binary itself from its own release
 tuishou self-update --version v0.2.0
@@ -67,6 +71,8 @@ Global flags: `--json`, `--quiet`, `--verbose`. `NO_COLOR` is respected.
 - [Install and update](docs/install-update.md)
 - [Verify a tuishou release](docs/verify-release.md)
 - [Fleet roll](docs/fleet-roll.md)
+- [Scheduled auto-update (opt-in)](docs/auto-update.md)
+- [Dogfooding / adoption](docs/dogfooding.md)
 - [Security](docs/security.md)
 - [FAQ](docs/faq.md)
 

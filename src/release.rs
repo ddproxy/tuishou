@@ -1,14 +1,21 @@
 use crate::error::{Error, Result};
-use crate::http;
+use crate::http::{self, ConditionalJson};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Release {
     pub tag: String,
     pub body: String,
     pub assets: Vec<ReleaseAsset>,
+    #[serde(default)]
+    pub published_at: Option<String>,
+    #[serde(default)]
+    pub prerelease: bool,
+    #[serde(default)]
+    pub draft: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseAsset {
     pub name: String,
     pub url: String,
@@ -25,6 +32,15 @@ pub fn normalize_tag(version: &str) -> String {
     } else {
         format!("v{version}")
     }
+}
+
+/// Marker that the Lu release notes carry when the controller database schema
+/// changes. Auto-update refuses to cross such a release; humans must handle
+/// the migration.
+pub const SCHEMA_MARKER: &str = "Requires: new controller database";
+
+pub fn requires_new_database(body: &str) -> bool {
+    body.lines().any(|line| line.trim() == SCHEMA_MARKER)
 }
 
 pub fn fetch_latest(agent: &ureq::Agent, repo: &str) -> Result<Release> {
@@ -52,7 +68,19 @@ pub fn fetch_tagged(agent: &ureq::Agent, repo: &str, version: &str) -> Result<Re
     parse_release(value)
 }
 
-fn parse_release(value: serde_json::Value) -> Result<Release> {
+/// List releases with a conditional request. `attempts` controls how many
+/// times a rate-limited response is retried.
+pub fn fetch_releases(
+    agent: &ureq::Agent,
+    repo: &str,
+    etag: Option<&str>,
+    attempts: usize,
+) -> Result<ConditionalJson> {
+    let url = format!("{}/repos/{repo}/releases?per_page=30", github_api_base());
+    http::get_json_conditional(agent, &url, etag, attempts)
+}
+
+pub fn parse_release(value: serde_json::Value) -> Result<Release> {
     let tag = value
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -78,7 +106,30 @@ fn parse_release(value: serde_json::Value) -> Result<Release> {
             Some(ReleaseAsset { name, url })
         })
         .collect();
-    Ok(Release { tag, body, assets })
+    Ok(Release {
+        tag,
+        body,
+        assets,
+        published_at: value
+            .get("published_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        prerelease: value
+            .get("prerelease")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        draft: value
+            .get("draft")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    })
+}
+
+pub fn parse_releases(value: &serde_json::Value) -> Result<Vec<Release>> {
+    let arr = value
+        .as_array()
+        .ok_or_else(|| Error::Http("releases response is not an array".to_string()))?;
+    arr.iter().cloned().map(parse_release).collect()
 }
 
 pub fn find_asset<'a>(release: &'a Release, name: &str) -> Result<&'a ReleaseAsset> {
@@ -101,4 +152,19 @@ pub fn changelog_heading(body: &str, tag: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_marker_requires_whole_line() {
+        assert!(requires_new_database(
+            "notes\nRequires: new controller database\n"
+        ));
+        assert!(!requires_new_database(
+            "Requires: new controller database soon"
+        ));
+    }
 }

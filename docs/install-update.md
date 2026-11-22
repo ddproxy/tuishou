@@ -26,13 +26,21 @@ tuishou update [component|all] [--check] [--allow-major] [--allow-unattested] [-
 - Updates do not cross a major version boundary unless `--allow-major` is passed.
 - When release notes contain a heading for the new version, `tuishou` prints it.
 
+## Adopt
+
+```sh
+tuishou adopt <component> --version vX.Y.Z [--prefix DIR]
+```
+
+Records an existing binary in tuishou state without downloading or replacing it. This is the dogfooding path for nodes that already have `lu`/`ting` installed by hand. At least one expected component binary must exist in the install directory.
+
 ## Status
 
 ```sh
 tuishou status [--json] [--prefix DIR]
 ```
 
-Shows installed versions, latest versions, and whether a component service unit is active when `systemctl` is present.
+Shows installed versions, latest versions, and whether a component service unit is active when `systemctl` is present. The `--json` output is a stable array of objects with fields `component`, `installed_version`, `latest_version`, `update_available`, `service_unit`, and `service_active`, intended for automation.
 
 ## Rollback
 
