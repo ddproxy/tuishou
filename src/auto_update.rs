@@ -11,17 +11,14 @@ pub mod state;
 
 use crate::component::resolve_component;
 use crate::config::{AutoUpdateConfig, LoadedConfig};
-use crate::duration::parse_duration;
+use crate::duration::{format_duration, parse_duration};
 use crate::error::{Error, Result};
 use crate::logging::{journal, journal_err, notify, one_line};
 use crate::state::InstalledComponent;
 use serde::Serialize;
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::Duration;
-
-const AUTO_LOCK_ENV: &str = "TUISHOU_AUTO_LOCK_HELD";
 
 #[derive(Debug, Serialize)]
 struct NotifySummary<'a> {
@@ -49,7 +46,14 @@ fn send_notification(
         reason,
         at: crate::state::now_rfc3339().unwrap_or_default(),
     };
-    if let Err(e) = notify(&cfg.notify_command, &summary) {
+    let timeout = match parse_duration(&cfg.command_timeout) {
+        Ok(t) => t,
+        Err(e) => {
+            journal_err("notify_failed", &[("reason", &one_line(&e.to_string()))]);
+            return;
+        }
+    };
+    if let Err(e) = notify(&cfg.notify_command, &summary, timeout) {
         journal_err("notify_failed", &[("reason", &one_line(&e.to_string()))]);
     }
 }
@@ -64,15 +68,16 @@ fn require_enabled(cfg: &AutoUpdateConfig) -> Result<()> {
     Ok(())
 }
 
-/// Parent entry point: validate the opt-in, then re-exec the cycle under
-/// `flock -n` so concurrent runs are harmless.
+/// Run one cycle while holding the OS advisory lock. The kernel releases the
+/// lock even if the process is killed, so a stale lock cannot block later runs.
 pub fn handle_run(
-    cfg: &AutoUpdateConfig,
+    loaded: &LoadedConfig,
     prefix: Option<&Path>,
     once: bool,
     quiet: bool,
     allow_unattested: bool,
 ) -> Result<ExitCode> {
+    let cfg = &loaded.auto_update;
     require_enabled(cfg)?;
     if allow_unattested {
         return Err(Error::msg(
@@ -85,98 +90,14 @@ pub fn handle_run(
         ));
     }
     let _ = once; // This tool never runs a daemon; one invocation is one cycle.
-    let dir = state::ensure_state_dir(prefix)?;
-    let lock = state::lock_path(prefix);
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock)
-        .map_err(|source| Error::Write {
-            path: lock.clone(),
-            source,
-        })?;
-
-    if let Some(flock) = find_tool("flock") {
-        let exe = std::env::current_exe()
-            .map_err(|e| Error::msg(format!("cannot locate running tuishou binary: {e}")))?;
-        let mut cmd = Command::new(flock);
-        cmd.arg("-n")
-            .arg("-E")
-            .arg("99")
-            .arg(&lock)
-            .arg(&exe)
-            .arg("__auto-update-locked")
-            .env(AUTO_LOCK_ENV, "1");
-        if let Some(p) = prefix {
-            cmd.arg("--prefix").arg(p);
-        }
-        if quiet {
-            cmd.arg("--quiet");
-        }
-        let status = cmd
-            .status()
-            .map_err(|e| Error::msg(format!("failed to run flock: {e}")))?;
-        if status.code() == Some(99) {
+    let _guard = match state::CycleLock::try_acquire(prefix)? {
+        Some(guard) => guard,
+        None => {
             journal("auto_update_lock_busy", &[]);
             return Ok(ExitCode::SUCCESS);
-        }
-        return Ok(match status.code() {
-            Some(code) => ExitCode::from(code as u8),
-            None => ExitCode::FAILURE,
-        });
-    }
-
-    // Fallback when util-linux flock is unavailable: an atomic directory lock
-    // with the same "second run exits quietly" semantics.
-    let guard = match fs::create_dir(dir.join("lock.d")) {
-        Ok(()) => DirLock(dir.join("lock.d")),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            journal("auto_update_lock_busy", &[]);
-            return Ok(ExitCode::SUCCESS);
-        }
-        Err(e) => {
-            return Err(Error::Write {
-                path: dir.join("lock.d"),
-                source: e,
-            })
         }
     };
-    let loaded = crate::config::load_config(None)?;
-    let result = execute_cycle(&loaded, prefix, quiet);
-    drop(guard);
-    result
-}
-
-struct DirLock(PathBuf);
-
-impl Drop for DirLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.0);
-    }
-}
-
-/// Child process invoked with the lock already held.
-pub fn handle_locked(prefix: Option<&Path>, quiet: bool) -> Result<ExitCode> {
-    if std::env::var(AUTO_LOCK_ENV).ok().as_deref() != Some("1") {
-        return Err(Error::msg(
-            "internal auto-update command may only be invoked through the lock",
-        ));
-    }
-    let loaded = crate::config::load_config(None)?;
-    require_enabled(&loaded.auto_update)?;
-    execute_cycle(&loaded, prefix, quiet)
-}
-
-fn find_tool(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    execute_cycle(loaded, prefix, quiet)
 }
 
 fn installed_versions(
@@ -343,12 +264,17 @@ fn execute_cycle(loaded: &LoadedConfig, prefix: Option<&Path>, quiet: bool) -> R
                 continue;
             }
         };
-        let ctx = apply::ApplyContext { cfg, prefix };
+        let ctx = apply::ApplyContext {
+            cfg,
+            prefix,
+            config_path: Some(loaded.config_path.as_path()),
+        };
         let outcome = if is_controller {
-            apply::apply_controller(&component, &release.tag, &release.body, &ctx)
+            apply::apply_controller(&component, &release.tag, &release.body, &ctx, &mut st)
                 .map(|skip| skip.map(|reason| ("skipped", reason)))
         } else if is_agent {
-            apply::apply_agent(&component, &release.tag, &ctx, &mut st).map(|_| None)
+            apply::apply_agent(&component, &release.tag, &ctx, &mut st)
+                .map(|skip| skip.map(|reason| ("skipped", reason)))
         } else {
             apply::plain_install(&component, &release.tag, &ctx).map(|_| None)
         };
@@ -461,6 +387,15 @@ pub fn handle_status(
     json: bool,
     quiet: bool,
 ) -> Result<ExitCode> {
+    state::with_cycle_lock(prefix, || handle_status_locked(loaded, prefix, json, quiet))
+}
+
+fn handle_status_locked(
+    loaded: &LoadedConfig,
+    prefix: Option<&Path>,
+    json: bool,
+    quiet: bool,
+) -> Result<ExitCode> {
     let cfg = &loaded.auto_update;
     let st = state::load(prefix)?;
     let installed = installed_versions(prefix)?;
@@ -562,6 +497,17 @@ pub fn handle_hold(
     expires_at: Option<String>,
     expires_in: Option<String>,
 ) -> Result<()> {
+    state::with_cycle_lock(prefix, || {
+        handle_hold_locked(prefix, reason, expires_at, expires_in)
+    })
+}
+
+fn handle_hold_locked(
+    prefix: Option<&Path>,
+    reason: Option<String>,
+    expires_at: Option<String>,
+    expires_in: Option<String>,
+) -> Result<()> {
     if expires_at.is_some() && expires_in.is_some() {
         return Err(Error::msg(
             "use either --expires-at or --expires-in, not both",
@@ -600,6 +546,10 @@ pub fn handle_hold(
 }
 
 pub fn handle_release_hold(prefix: Option<&Path>) -> Result<()> {
+    state::with_cycle_lock(prefix, || handle_release_hold_locked(prefix))
+}
+
+fn handle_release_hold_locked(prefix: Option<&Path>) -> Result<()> {
     if state::remove_hold(prefix)? {
         journal("hold_released", &[]);
     } else {
@@ -609,6 +559,10 @@ pub fn handle_release_hold(prefix: Option<&Path>) -> Result<()> {
 }
 
 pub fn handle_clear_bad(prefix: Option<&Path>, component: Option<&str>) -> Result<()> {
+    state::with_cycle_lock(prefix, || handle_clear_bad_locked(prefix, component))
+}
+
+fn handle_clear_bad_locked(prefix: Option<&Path>, component: Option<&str>) -> Result<()> {
     let mut st = state::load(prefix)?;
     match component {
         Some(name) => {
@@ -625,10 +579,48 @@ pub fn handle_clear_bad(prefix: Option<&Path>, component: Option<&str>) -> Resul
     state::save(prefix, &st)
 }
 
-/// Print (never install) a systemd service/timer pair. `OnUnitActiveSec` is
-/// the configured interval; jitter and `Persistent=true` are always present.
-pub fn print_timer(interval_override: Option<&str>) -> Result<()> {
-    let interval_text = interval_override.unwrap_or("10m");
+/// Print (never install) a systemd service/timer pair. Both `OnBootSec` and
+/// `OnActiveSec` are emitted, with jitter and `Persistent=true`.
+pub fn print_timer(
+    interval_override: Option<&str>,
+    config_path: Option<&Path>,
+    prefix: Option<&Path>,
+    configured_interval: &str,
+) -> Result<()> {
+    let (service, timer) =
+        timer_units(interval_override, config_path, prefix, configured_interval)?;
+    println!("{service}");
+    println!("{timer}");
+    Ok(())
+}
+
+fn absolute_path(path: Option<&Path>, label: &str) -> Result<PathBuf> {
+    let path = match path {
+        Some(p) => p.to_path_buf(),
+        None => crate::config::default_config_path(),
+    };
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let cwd = std::env::current_dir().map_err(|e| {
+        Error::msg(format!(
+            "cannot determine current directory for {label}: {e}"
+        ))
+    })?;
+    Ok(cwd.join(path))
+}
+
+fn absolute_config_path(config_path: Option<&Path>) -> Result<PathBuf> {
+    absolute_path(config_path, "config path")
+}
+
+fn timer_units(
+    interval_override: Option<&str>,
+    config_path: Option<&Path>,
+    prefix: Option<&Path>,
+    configured_interval: &str,
+) -> Result<(String, String)> {
+    let interval_text = interval_override.unwrap_or(configured_interval);
     let interval = parse_duration(interval_text)?;
     if interval < Duration::from_secs(300) {
         return Err(Error::msg(format!(
@@ -643,6 +635,14 @@ pub fn print_timer(interval_override: Option<&str>) -> Result<()> {
     };
     let exe =
         std::env::var("TUISHOU_TIMER_EXE").unwrap_or_else(|_| "/usr/local/bin/tuishou".to_string());
+    let config = absolute_config_path(config_path)?;
+    let prefix_arg = match prefix {
+        Some(p) => format!(
+            " --prefix {}",
+            absolute_path(Some(p), "install prefix")?.display()
+        ),
+        None => String::new(),
+    };
     let service = format!(
         "# tuishou-auto-update.service\n\
          [Unit]\n\
@@ -652,8 +652,10 @@ pub fn print_timer(interval_override: Option<&str>) -> Result<()> {
          \n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart={exe} auto-update run --once\n\
-         EnvironmentFile=-/etc/tuishou/auto-update.env\n"
+         ExecStart={exe} --config {} auto-update run --once{}\n\
+         EnvironmentFile=-/etc/tuishou/auto-update.env\n",
+        config.display(),
+        prefix_arg
     );
     let timer = format!(
         "# tuishou-auto-update.timer\n\
@@ -661,18 +663,18 @@ pub fn print_timer(interval_override: Option<&str>) -> Result<()> {
          Description=Run tuishou auto-update on a schedule\n\
          \n\
          [Timer]\n\
-         OnUnitActiveSec={}\n\
+         OnBootSec={}\n\
+         OnActiveSec={}\n\
          RandomizedDelaySec={}\n\
          Persistent=true\n\
          \n\
          [Install]\n\
          WantedBy=timers.target\n",
-        crate::duration::format_duration(interval),
-        crate::duration::format_duration(jitter)
+        format_duration(interval),
+        format_duration(interval),
+        format_duration(jitter)
     );
-    println!("{service}");
-    println!("{timer}");
-    Ok(())
+    Ok((service, timer))
 }
 
 #[cfg(test)]
@@ -681,11 +683,32 @@ mod tests {
 
     #[test]
     fn timer_defaults_are_ten_minutes_with_jitter() {
-        // Printing goes to stdout; validate the underlying values instead.
-        assert_eq!(
-            crate::duration::parse_duration("10m").unwrap(),
-            Duration::from_secs(600)
-        );
+        assert_eq!(parse_duration("10m").unwrap(), Duration::from_secs(600));
         assert!(parse_duration("2m").unwrap() < Duration::from_secs(300));
+    }
+
+    #[test]
+    fn generated_timer_uses_boot_and_active_timers_and_absolute_config() {
+        let (service, timer) =
+            timer_units(Some("10m"), Some(Path::new("relative.toml")), None, "10m").unwrap();
+        assert!(timer.contains("OnBootSec=10m"));
+        assert!(timer.contains("OnActiveSec=10m"));
+        assert!(service.contains("--config /"));
+        assert!(!service.contains("--config relative.toml"));
+        assert!(!service.contains("--prefix"));
+    }
+
+    #[test]
+    fn generated_timer_carries_an_absolute_prefix() {
+        let (service, timer) = timer_units(
+            None,
+            Some(Path::new("tuishou.toml")),
+            Some(Path::new("relative-prefix")),
+            "15m",
+        )
+        .unwrap();
+        assert!(timer.contains("OnBootSec=15m"));
+        assert!(service.contains("--prefix /"));
+        assert!(!service.contains("--prefix relative-prefix"));
     }
 }

@@ -17,6 +17,7 @@ pub fn self_component(components: &[Component]) -> Component {
             asset_pattern: "tuishou-{tag}-{target}.tar.gz".to_string(),
             binaries: vec![SELF_COMPONENT.to_string()],
             service_unit: None,
+            binary_ranges: Vec::new(),
         })
 }
 

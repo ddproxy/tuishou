@@ -35,11 +35,35 @@ pub fn github_token() -> Option<String> {
     None
 }
 
-fn auth_headers() -> Vec<(&'static str, String)> {
+/// GitHub tokens are only sent to GitHub API endpoints. Asset hosts and hosts
+/// added through `TUISHOU_ALLOWED_HOSTS` never receive credentials.
+fn auth_headers_for(url: &str) -> Vec<(&'static str, String)> {
+    if !is_github_api(url) {
+        return Vec::new();
+    }
     match github_token() {
         Some(token) => vec![("Authorization", format!("Bearer {token}"))],
         None => Vec::new(),
     }
+}
+
+fn is_github_api(url: &str) -> bool {
+    let Ok((_, host, _, path)) = url_parts(url) else {
+        return false;
+    };
+    host == "api.github.com" || (host == "github.com" && path.starts_with("/api/"))
+}
+
+/// Replace any known token with a placeholder before a message is logged or
+/// returned as an error.
+pub fn redact_secrets(text: &str) -> String {
+    let mut out = text.to_string();
+    if let Some(token) = github_token() {
+        if !token.is_empty() {
+            out = out.replace(&token, "[redacted]");
+        }
+    }
+    out
 }
 
 #[derive(Debug)]
@@ -62,7 +86,7 @@ pub fn get_json_conditional(
         ("Accept", "application/vnd.github+json".to_string()),
         ("User-Agent", "tuishou".to_string()),
     ];
-    headers.extend(auth_headers());
+    headers.extend(auth_headers_for(url));
     if let Some(tag) = etag {
         headers.push(("If-None-Match", tag.to_string()));
     }
@@ -123,7 +147,7 @@ pub fn get_json(agent: &ureq::Agent, url: &str) -> Result<serde_json::Value> {
         ("Accept", "application/vnd.github+json".to_string()),
         ("User-Agent", "tuishou".to_string()),
     ];
-    headers.extend(auth_headers());
+    headers.extend(auth_headers_for(url));
     let resp = get_response(agent, url, &headers)?;
     if !(200..300).contains(&resp.status()) {
         return Err(status_error("GET", url, resp));
@@ -138,8 +162,8 @@ pub fn download_to_writer(
     mut writer: impl std::io::Write,
     max_bytes: u64,
 ) -> Result<u64> {
-    let mut headers: Vec<(&str, String)> = vec![("User-Agent", "tuishou".to_string())];
-    headers.extend(auth_headers());
+    // Asset downloads never carry credentials, even when a token is present.
+    let headers: Vec<(&str, String)> = vec![("User-Agent", "tuishou".to_string())];
     let resp = get_response(agent, url, &headers)?;
     if !(200..300).contains(&resp.status()) {
         return Err(status_error("GET", url, resp));
@@ -174,10 +198,17 @@ pub fn get_response(
     headers: &[(&str, String)],
 ) -> Result<ureq::Response> {
     let mut current = url.to_string();
+    let initial_origin = origin(&current)?;
     for _ in 0..=MAX_REDIRECTS {
         ensure_allowed_url(&current)?;
+        let hop_origin = origin(&current)?;
         let mut req = agent.get(&current).set("User-Agent", "tuishou");
         for (name, value) in headers {
+            // Credentials never cross an origin boundary, and are never sent
+            // to a host that is not a GitHub API endpoint.
+            if name.eq_ignore_ascii_case("authorization") && hop_origin != initial_origin {
+                continue;
+            }
             req = req.set(name, value.as_str());
         }
         match req.call() {
@@ -242,25 +273,53 @@ pub fn ensure_https(url: &str) -> Result<()> {
     Err(Error::Http(format!("only https URLs are allowed: {url}")))
 }
 
+/// Split a URL into scheme, host, effective port and path. The port is
+/// normalised so scheme changes count as an origin change.
+fn url_parts(url: &str) -> Result<(String, String, u16, String)> {
+    let (scheme, rest) = url
+        .split_once("://")
+        .ok_or_else(|| Error::Http(format!("invalid URL {url}")))?;
+    let authority = rest.split('/').next().unwrap_or(rest);
+    let host_port = authority
+        .rsplit_once('@')
+        .map(|(_, h)| h)
+        .unwrap_or(authority);
+    let (host, port) = match host_port.strip_prefix('[') {
+        Some(rest) => {
+            let (host, tail) = rest
+                .split_once(']')
+                .ok_or_else(|| Error::Http(format!("invalid URL {url}")))?;
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|p| p.parse::<u16>().ok())
+                .unwrap_or(if scheme == "https" { 443 } else { 80 });
+            (host.to_ascii_lowercase(), port)
+        }
+        None => {
+            let (host, port) = host_port
+                .split_once(':')
+                .map(|(h, p)| (h, p.parse::<u16>().ok()))
+                .unwrap_or((host_port, None));
+            (
+                host.to_ascii_lowercase(),
+                port.unwrap_or(if scheme == "https" { 443 } else { 80 }),
+            )
+        }
+    };
+    let path = rest.strip_prefix(authority).unwrap_or("").to_string();
+    Ok((scheme.to_ascii_lowercase(), host, port, path))
+}
+
+fn origin(url: &str) -> Result<(String, String, u16)> {
+    let (scheme, host, port, _) = url_parts(url)?;
+    Ok((scheme, host, port))
+}
+
 /// Host allowlist for redirects. Loopback is permitted only for local tests
 /// via `TUISHOU_ALLOW_INSECURE_HTTP=1`.
 fn ensure_allowed_url(url: &str) -> Result<()> {
     ensure_https(url)?;
-    let rest = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .ok_or_else(|| Error::Http(format!("invalid URL {url}")))?;
-    let host_with_port = rest.split('/').next().unwrap_or(rest);
-    let host = host_with_port
-        .rsplit_once('@')
-        .map(|(_, h)| h)
-        .unwrap_or(host_with_port)
-        .split(':')
-        .next()
-        .unwrap_or(host_with_port)
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .to_ascii_lowercase();
+    let (_, host, _, _) = url_parts(url)?;
     let extra = std::env::var("TUISHOU_ALLOWED_HOSTS")
         .unwrap_or_default()
         .split(',')
@@ -312,24 +371,26 @@ fn read_body(resp: ureq::Response, max_bytes: u64) -> Result<String> {
 fn status_error(method: &str, url: &str, resp: ureq::Response) -> Error {
     let code = resp.status();
     let body = resp.into_string().unwrap_or_default();
-    let body = crate::logging::one_line(body.trim());
-    if body.is_empty() {
-        Error::Http(format!("{method} {url} failed with status {code}"))
+    let body = redact_secrets(&crate::logging::one_line(body.trim()));
+    let message = if body.is_empty() {
+        format!("{method} {url} failed with status {code}")
     } else {
-        Error::Http(format!("{method} {url} failed with status {code}: {body}"))
-    }
+        format!("{method} {url} failed with status {code}: {body}")
+    };
+    Error::Http(redact_secrets(&message))
 }
 
 fn map_ureq_err(method: &str, url: &str, err: ureq::Error) -> Error {
     match err {
         ureq::Error::Status(_, resp) => status_error(method, url, resp),
-        other => Error::Http(format!("{method} {url} failed: {other}")),
+        other => Error::Http(redact_secrets(&format!("{method} {url} failed: {other}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn rate_limit_header_parsing() {
@@ -359,5 +420,97 @@ mod tests {
         assert!(ensure_allowed_url("https://github.com/ddproxy/tuishou").is_ok());
         assert!(ensure_allowed_url("https://evil.test/x").is_err());
         assert!(ensure_allowed_url("http://127.0.0.1:8080/x").is_err());
+    }
+
+    #[test]
+    fn github_auth_is_only_for_api_endpoints() {
+        assert!(is_github_api("https://api.github.com/repos/a/b/releases"));
+        assert!(!is_github_api(
+            "https://objects.githubusercontent.com/asset"
+        ));
+        assert!(!is_github_api("https://example.test/api/v3/releases"));
+        assert_eq!(origin("http://localhost:1/a").unwrap().2, 1);
+        assert_eq!(origin("http://localhost/a").unwrap().2, 80);
+    }
+
+    fn spawn_capture_server(
+        body: &'static [u8],
+        redirect: Option<String>,
+    ) -> (String, Arc<Mutex<Vec<String>>>, std::sync::mpsc::Sender<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        let (stop, rx) = std::sync::mpsc::channel::<()>();
+        let handle = thread::spawn(move || {
+            while rx.try_recv().is_err() {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut buf = [0u8; 4096];
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        seen2
+                            .lock()
+                            .unwrap()
+                            .push(String::from_utf8_lossy(&buf[..n]).to_string());
+                        let response = match &redirect {
+                            Some(location) => format!(
+                                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            ),
+                            None => format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            ),
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.write_all(body);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        // The server thread is leaked only for the duration of the test
+        // process; the channel stops its loop when the test ends.
+        let _ = handle;
+        (base, seen, stop)
+    }
+
+    #[test]
+    fn redirect_to_another_origin_drops_credentials() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("TUISHOU_ALLOW_INSECURE_HTTP", "1");
+        let (second, seen_second, stop_second) = spawn_capture_server(b"ok", None);
+        let (first, seen_first, stop_first) = spawn_capture_server(b"", Some(second.clone()));
+        let headers = [
+            (
+                "Authorization".to_string(),
+                "Bearer secret-token".to_string(),
+            ),
+            ("X-Test".to_string(), "kept".to_string()),
+        ];
+        let refs: Vec<(&str, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect();
+        let agent = agent();
+        let response = get_response(&agent, &format!("{first}/start"), &refs).unwrap();
+        assert_eq!(response.status(), 200);
+        let first_requests = seen_first.lock().unwrap();
+        assert!(first_requests[0].contains("secret-token"));
+        drop(first_requests);
+        let second_requests = seen_second.lock().unwrap();
+        assert!(!second_requests[0]
+            .to_ascii_lowercase()
+            .contains("authorization"));
+        assert!(!second_requests[0].contains("secret-token"));
+        assert!(second_requests[0].to_ascii_lowercase().contains("x-test"));
+        drop(second_requests);
+        let _ = stop_first.send(());
+        let _ = stop_second.send(());
+        std::env::remove_var("TUISHOU_ALLOW_INSECURE_HTTP");
     }
 }

@@ -37,6 +37,10 @@ pub struct Cli {
     /// Verbose output
     #[arg(long, global = true)]
     pub verbose: bool,
+
+    /// Path to tuishou.toml (defaults to ./tuishou.toml; env TUISHOU_CONFIG)
+    #[arg(long, global = true, env = "TUISHOU_CONFIG")]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -147,13 +151,6 @@ pub enum Commands {
         prefix: Option<PathBuf>,
     },
 
-    #[command(hide = true, name = "__auto-update-locked")]
-    AutoUpdateLocked {
-        /// Install prefix directory
-        #[arg(long)]
-        prefix: Option<PathBuf>,
-    },
-
     /// Roll a component across a fleet over SSH
     Roll {
         /// Inventory file path or comma-separated node list
@@ -193,15 +190,25 @@ pub enum AutoUpdateAction {
         /// Always refused: attestations are mandatory in auto mode
         #[arg(long)]
         allow_unattested: bool,
+        /// Install prefix (overrides [auto_update].prefix)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
     },
     /// Print, but do not install, a systemd service and timer unit pair
     InstallTimer {
-        /// OnUnitActiveSec value (default 10m, minimum 5m)
+        /// OnBootSec/OnActiveSec value (default: configured interval, minimum 5m)
         #[arg(long)]
         interval: Option<String>,
+        /// Install prefix passed to the generated service (overrides config)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
     },
     /// Show last check, per-component results, hold state and next version
-    Status,
+    Status {
+        /// Install prefix (overrides [auto_update].prefix)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+    },
     /// Pause all automatic updates by creating the HOLD file
     Hold {
         /// Why updates are paused
@@ -213,13 +220,23 @@ pub enum AutoUpdateAction {
         /// Duration after which the hold expires (e.g. 2h)
         #[arg(long)]
         expires_in: Option<String>,
+        /// Install prefix (overrides [auto_update].prefix)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
     },
     /// Remove the HOLD file and resume automatic updates
-    Release,
+    Release {
+        /// Install prefix (overrides [auto_update].prefix)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
+    },
     /// Forget bad versions so they can be retried
     ClearBad {
         /// Component to clear (default: all)
         component: Option<String>,
+        /// Install prefix (overrides [auto_update].prefix)
+        #[arg(long)]
+        prefix: Option<PathBuf>,
     },
 }
 
@@ -240,6 +257,15 @@ impl CompletionShell {
     }
 }
 
+/// CLI `--prefix` wins over the configured value so one config can serve
+/// multiple roots without editing it.
+fn auto_update_prefix(
+    loaded: &crate::config::LoadedConfig,
+    flag: Option<PathBuf>,
+) -> Option<PathBuf> {
+    flag.or_else(|| loaded.auto_update.prefix.clone())
+}
+
 pub fn run() -> Result<ExitCode> {
     let cli = Cli::parse();
     // NO_COLOR respected - we emit no ANSI color; keep placeholder for future.
@@ -251,9 +277,9 @@ pub fn run() -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let loaded = config::load_config(None)?;
-    let components = loaded.components;
-    let auto_cfg = loaded.auto_update;
+    let config_path = cli.config.as_deref();
+    let loaded = config::load_config(config_path)?;
+    let components = loaded.components.clone();
     let agent = http::agent();
 
     match cli.command {
@@ -278,6 +304,7 @@ pub fn run() -> Result<ExitCode> {
                 verbose: cli.verbose,
                 smoke_check,
                 signer_workflow: None,
+                commit_state: true,
             };
             let mut outcomes = Vec::new();
             for c in &targets {
@@ -369,6 +396,7 @@ pub fn run() -> Result<ExitCode> {
                     verbose: cli.verbose,
                     smoke_check: false,
                     signer_workflow: None,
+                    commit_state: true,
                 };
                 install::install_component(&agent, c, &opts)?;
             }
@@ -420,6 +448,7 @@ pub fn run() -> Result<ExitCode> {
                 verbose: cli.verbose,
                 smoke_check: false,
                 signer_workflow: None,
+                commit_state: true,
             };
             let outcome = install::install_component(&agent, &component, &opts)?;
             if cli.json {
@@ -460,6 +489,7 @@ pub fn run() -> Result<ExitCode> {
         } => {
             let c = resolve_component(&component, &components)?;
             let tag = release::normalize_tag(&version);
+            let prefix = auto_update_prefix(&loaded, prefix);
             let bin_dir = install::install_dir(prefix.as_deref());
             let present: Vec<String> = c
                 .binaries
@@ -505,35 +535,52 @@ pub fn run() -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
-        Commands::AutoUpdateLocked { prefix } => {
-            auto_update::handle_locked(prefix.as_deref(), cli.quiet)
-        }
         Commands::AutoUpdate(action) => match action {
             AutoUpdateAction::Run {
                 once,
                 allow_unattested,
-            } => auto_update::handle_run(&auto_cfg, None, once, cli.quiet, allow_unattested),
-            AutoUpdateAction::InstallTimer { interval } => {
-                auto_update::print_timer(interval.as_deref())?;
+                prefix,
+            } => auto_update::handle_run(
+                &loaded,
+                auto_update_prefix(&loaded, prefix).as_deref(),
+                once,
+                cli.quiet,
+                allow_unattested,
+            ),
+            AutoUpdateAction::InstallTimer { interval, prefix } => {
+                let prefix = auto_update_prefix(&loaded, prefix);
+                auto_update::print_timer(
+                    interval.as_deref(),
+                    config_path,
+                    prefix.as_deref(),
+                    &loaded.auto_update.interval,
+                )?;
                 Ok(ExitCode::SUCCESS)
             }
-            AutoUpdateAction::Status => {
-                auto_update::handle_status(&config::load_config(None)?, None, cli.json, cli.quiet)
-            }
+            AutoUpdateAction::Status { prefix } => auto_update::handle_status(
+                &loaded,
+                auto_update_prefix(&loaded, prefix).as_deref(),
+                cli.json,
+                cli.quiet,
+            ),
             AutoUpdateAction::Hold {
                 reason,
                 expires_at,
                 expires_in,
+                prefix,
             } => {
-                auto_update::handle_hold(None, reason, expires_at, expires_in)?;
+                let prefix = auto_update_prefix(&loaded, prefix);
+                auto_update::handle_hold(prefix.as_deref(), reason, expires_at, expires_in)?;
                 Ok(ExitCode::SUCCESS)
             }
-            AutoUpdateAction::Release => {
-                auto_update::handle_release_hold(None)?;
+            AutoUpdateAction::Release { prefix } => {
+                let prefix = auto_update_prefix(&loaded, prefix);
+                auto_update::handle_release_hold(prefix.as_deref())?;
                 Ok(ExitCode::SUCCESS)
             }
-            AutoUpdateAction::ClearBad { component } => {
-                auto_update::handle_clear_bad(None, component.as_deref())?;
+            AutoUpdateAction::ClearBad { component, prefix } => {
+                let prefix = auto_update_prefix(&loaded, prefix);
+                auto_update::handle_clear_bad(prefix.as_deref(), component.as_deref())?;
                 Ok(ExitCode::SUCCESS)
             }
         },

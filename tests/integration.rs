@@ -913,18 +913,35 @@ fn roll_plan_and_failure_stop() {
     let log = td.path().join("log");
 
     let fake_lu = bindir.join("lu");
+    // Real Lu 0.4 shape: `lu nodes --json` is an array of node objects; the
+    // version has no leading `v`. Drain/undrain are top-level commands.
+    let nodes = serde_json::json!([{
+        "name": "node1", "version": "0.5.0", "draining": true, "current_job": null,
+        "last_seen": "2026-01-01T00:00:00Z", "harness": "systemd", "labels": [],
+        "cordons": [], "cordon_details": [], "stuck": false, "load1": 0.0
+    }, {
+        "name": "node2", "version": "0.5.0", "draining": true, "current_job": null,
+        "last_seen": "2026-01-01T00:00:00Z", "harness": "systemd", "labels": [],
+        "cordons": [], "cordon_details": [], "stuck": false, "load1": 0.0
+    }, {
+        "name": "node3", "version": "0.5.0", "draining": true, "current_job": null,
+        "last_seen": "2026-01-01T00:00:00Z", "harness": "systemd", "labels": [],
+        "cordons": [], "cordon_details": [], "stuck": false, "load1": 0.0
+    }])
+    .to_string();
     fs::write(
         &fake_lu,
         format!(
             r#"#!/bin/sh
-echo "$@" >> {log}
-if [ "$1" = "node" ] && [ "$3" = "--json" ]; then
-  echo '{{"drained":true,"version":"v0.5.0"}}'
+echo "lu $@" >> {log}
+if [ "$1" = "nodes" ] && [ "$2" = "--json" ]; then
+  echo '{nodes}'
   exit 0
 fi
 exit 0
 "#,
-            log = log.display()
+            log = log.display(),
+            nodes = nodes
         ),
     )
     .unwrap();
@@ -1030,8 +1047,14 @@ unit = "lu-agent.service"
         String::from_utf8_lossy(&out.stderr)
     );
     let log_text = fs::read_to_string(&log).unwrap_or_default();
-    assert!(log_text.contains("node1"), "log={log_text}");
-    assert!(log_text.contains("node2"), "log={log_text}");
-    // node3 should not be drained/installed if failure stops the roll
-    assert!(!log_text.contains("node drain node3"), "log={log_text}");
+    assert!(log_text.contains("lu drain node1"), "log={log_text}");
+    assert!(log_text.contains("lu nodes --json"), "log={log_text}");
+    assert!(log_text.contains("lu drain node2"), "log={log_text}");
+    // node3 must not be touched when a preceding node fails.
+    assert!(!log_text.contains("lu drain node3"), "log={log_text}");
+    // No legacy Lu 0.3 command forms may appear in the roll.
+    assert!(!log_text.contains("lu node "), "log={log_text}");
+    assert!(!log_text.contains("lu node drain"), "log={log_text}");
+    assert!(!log_text.contains("lu node undrain"), "log={log_text}");
+    assert!(!log_text.contains("lu job list"), "log={log_text}");
 }

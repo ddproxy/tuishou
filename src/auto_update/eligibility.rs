@@ -84,9 +84,10 @@ pub fn choose(
         }
     };
     let min_age = crate::duration::parse_duration(&cfg.min_release_age)?;
+    let require_published_at = !min_age.is_zero();
     let now = OffsetDateTime::now_utc();
     let policy: Policy = cfg.policy.into();
-    let mut best: Option<(Version, Release)> = None;
+    let mut candidates: Vec<(Version, Release)> = Vec::new();
     let mut first_reason: Option<String> = None;
 
     for rel in &listing.releases {
@@ -112,26 +113,40 @@ pub fn choose(
         if !version.is_newer_than(&installed_version) {
             continue;
         }
-        if let Some(published) = &rel.published_at {
-            match OffsetDateTime::parse(published, &Rfc3339) {
-                Ok(published) => {
-                    if published + min_age > now {
-                        if first_reason.is_none() {
-                            first_reason = Some(format!(
-                                "{} is younger than min_release_age {}",
-                                rel.tag, cfg.min_release_age
-                            ));
-                        }
-                        continue;
-                    }
-                }
-                Err(e) => {
+        if require_published_at {
+            // An unknown publication time does not establish age. Missing,
+            // null and unparseable timestamps are all skipped when an age
+            // delay is configured, just as a too-young release is.
+            match rel.published_at.as_deref() {
+                None => {
                     if first_reason.is_none() {
-                        first_reason =
-                            Some(format!("{} has an unparseable published_at ({e})", rel.tag));
+                        first_reason = Some(format!(
+                            "{} has no published_at; cannot satisfy min_release_age {}",
+                            rel.tag, cfg.min_release_age
+                        ));
                     }
                     continue;
                 }
+                Some(published) => match OffsetDateTime::parse(published, &Rfc3339) {
+                    Ok(published) => {
+                        if published + min_age > now {
+                            if first_reason.is_none() {
+                                first_reason = Some(format!(
+                                    "{} is younger than min_release_age {}",
+                                    rel.tag, cfg.min_release_age
+                                ));
+                            }
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        if first_reason.is_none() {
+                            first_reason =
+                                Some(format!("{} has an unparseable published_at ({e})", rel.tag));
+                        }
+                        continue;
+                    }
+                },
             }
         }
         let (allowed, reason) = version::eligible(
@@ -169,9 +184,25 @@ pub fn choose(
             }
             continue;
         }
-        match &best {
-            Some((current, _)) if version.cmp_core(current) != std::cmp::Ordering::Greater => {}
-            _ => best = Some((version, rel.clone())),
+        candidates.push((version, rel.clone()));
+    }
+
+    // Sorting before selection makes the result independent of release list
+    // order, including among prereleases of the same numeric core.
+    candidates.sort_by(|(a, rel_a), (b, rel_b)| a.cmp(b).then_with(|| rel_a.tag.cmp(&rel_b.tag)));
+    let best = candidates.pop();
+
+    if let Some((_, winner)) = &best {
+        if is_controller {
+            if let Some(reason) =
+                controller_schema_gate(&listing.releases, &installed_version, winner)
+            {
+                return Ok(Eligibility {
+                    candidate: None,
+                    next_eligible_version: None,
+                    reason: Some(reason),
+                });
+            }
         }
     }
 
@@ -187,6 +218,41 @@ pub fn choose(
             reason: first_reason.or_else(|| Some("no eligible release".to_string())),
         },
     })
+}
+
+/// A controller update may not cross any release whose notes are missing or
+/// which requires a database migration, including intermediate releases.
+/// Missing/unparseable notes fail closed.
+fn controller_schema_gate(
+    releases: &[Release],
+    installed: &Version,
+    target: &Release,
+) -> Option<String> {
+    let target_version = Version::parse(&target.tag).ok()?;
+    for rel in releases {
+        let Ok(v) = Version::parse(&rel.tag) else {
+            continue;
+        };
+        let greater = v.cmp_core(installed) == std::cmp::Ordering::Greater;
+        let at_or_below_target = v.cmp_core(&target_version) != std::cmp::Ordering::Greater;
+        if !(greater && at_or_below_target) {
+            continue;
+        }
+        if rel.body.trim().is_empty() {
+            return Some(format!(
+                "{} has no release notes; refusing to cross an unverified controller schema change",
+                rel.tag
+            ));
+        }
+        if release::requires_new_database(&rel.body) {
+            return Some(format!(
+                "{}: {} - controller update requires manual migration",
+                rel.tag,
+                release::SCHEMA_MARKER
+            ));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -249,6 +315,97 @@ mod tests {
         let result = choose(&l, &cfg(), Some("v0.4.0"), &[], true).unwrap();
         assert!(result.candidate.is_none());
         assert!(result.reason.unwrap().contains("controller database"));
+    }
+
+    #[test]
+    fn schema_marker_in_intermediate_release_blocks_controller() {
+        let l = listing(vec![
+            rel("v0.4.1", None, "notes", false),
+            rel("v0.4.2", None, "Requires: new controller database\n", false),
+            rel("v0.4.3", None, "safe notes", false),
+        ]);
+        let mut c = cfg();
+        c.policy = crate::config::AutoPolicy::Any;
+        let result = choose(&l, &c, Some("v0.4.0"), &[], true).unwrap();
+        assert!(result.candidate.is_none());
+        assert!(result.reason.unwrap().contains("v0.4.2"));
+    }
+
+    #[test]
+    fn missing_intermediate_notes_fail_closed_for_controller() {
+        let l = listing(vec![
+            rel("v0.4.1", None, "", false),
+            rel("v0.4.2", None, "safe", false),
+        ]);
+        let result = choose(&l, &cfg(), Some("v0.4.0"), &[], true).unwrap();
+        assert!(result.candidate.is_none());
+        assert!(result.reason.unwrap().contains("no release notes"));
+    }
+
+    #[test]
+    fn missing_published_at_is_skipped_when_age_delay_is_configured() {
+        let mut aged = cfg();
+        aged.min_release_age = "10m".to_string();
+        let l = listing(vec![rel("v0.4.1", None, "", false)]);
+        let skipped = choose(&l, &aged, Some("v0.4.0"), &[], false).unwrap();
+        assert!(skipped.candidate.is_none());
+        assert!(
+            skipped.reason.unwrap().contains("published_at"),
+            "unknown publication time must not establish age"
+        );
+
+        let l = listing(vec![rel("v0.4.1", Some("2020-01-01T00:00:00Z"), "", false)]);
+        assert_eq!(
+            choose(&l, &aged, Some("v0.4.0"), &[], false)
+                .unwrap()
+                .candidate
+                .unwrap()
+                .tag,
+            "v0.4.1"
+        );
+
+        // Without an age delay, a missing publication time does not matter.
+        assert_eq!(
+            choose(
+                &listing(vec![rel("v0.4.1", None, "", false)]),
+                &cfg(),
+                Some("v0.4.0"),
+                &[],
+                false
+            )
+            .unwrap()
+            .candidate
+            .unwrap()
+            .tag,
+            "v0.4.1"
+        );
+    }
+
+    #[test]
+    fn candidate_selection_uses_semver_precedence_not_list_order() {
+        let mut c = cfg();
+        c.channel = crate::config::Channel::Prerelease;
+        let l = listing(vec![
+            rel("v1.2.1-rc1", None, "", true),
+            rel("v1.2.1-rc.10", None, "", true),
+            rel("v1.2.1-rc2", None, "", true),
+        ]);
+        for reversed in [false, true] {
+            let mut releases = l.releases.clone();
+            if reversed {
+                releases.reverse();
+            }
+            let choice = choose(&listing(releases), &c, Some("v1.2.1-rc1"), &[], false).unwrap();
+            assert_eq!(choice.candidate.unwrap().tag, "v1.2.1-rc.10");
+        }
+
+        c.channel = crate::config::Channel::Release;
+        let l = listing(vec![
+            rel("v1.2.1-rc2", None, "", true),
+            rel("v1.2.1", None, "", false),
+        ]);
+        let choice = choose(&l, &c, Some("v1.2.1-rc1"), &[], false).unwrap();
+        assert_eq!(choice.candidate.unwrap().tag, "v1.2.1");
     }
 
     #[test]

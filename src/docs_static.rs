@@ -71,6 +71,10 @@ flock; \fBinstall-timer\fR prints (never installs) a systemd service/timer pair;
 \fBrelease\fR manage the HOLD file; \fBclear-bad\fR forgets bad versions.
 This mode is off by default and is not recommended for production: it installs
 new releases without human review.
+Every \fBauto-update\fR action accepts \fB--prefix\fR, which overrides
+\fB[auto_update].prefix\fR for state, binaries and the generated service.
+\fBinstall-timer\fR uses the configured \fBinterval\fR unless \fB--interval\fR
+is given; both are subject to the 5m minimum.
 .TP
 .B adopt <component> --version <tag>
 Record an existing binary in state without replacing it.
@@ -90,6 +94,11 @@ Suppress non-essential output.
 .TP
 .B --verbose
 Print verbose output.
+.TP
+.B --config \fIpath\fR
+Load \fIpath\fR instead of \fI./tuishou.toml\fR. The environment variable
+\fBTUISHOU_CONFIG\fR sets the same value; the command-line flag wins.
+Generated systemd units always pass an absolute configuration path.
 .SH FILES
 .TP
 .I $XDG_STATE_HOME/tuishou/installed.json

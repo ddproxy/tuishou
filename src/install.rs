@@ -20,11 +20,21 @@ pub struct InstallOptions {
     pub quiet: bool,
     #[allow(dead_code)]
     pub verbose: bool,
-    /// Run `<binary> --version` after install. This is the only code from a
-    /// release archive that tuishou ever executes.
+    /// Run `<binary> --version` on the staged file before commit. This is the
+    /// only code from a release archive that tuishou ever executes.
     pub smoke_check: bool,
+    /// Write the new version to state. Deferred callers (agent/controller
+    /// auto-update) only record it after their health check succeeds.
+    pub commit_state: bool,
     /// Expected workflow identity for `gh attestation verify --signer-workflow`.
     pub signer_workflow: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InstallReceipt {
+    pub checksum: String,
+    pub target: String,
+    pub installed_at: String,
 }
 
 pub struct InstallOutcome {
@@ -32,6 +42,40 @@ pub struct InstallOutcome {
     pub version: String,
     pub binaries: Vec<String>,
     pub dry_run: bool,
+    pub receipt: Option<InstallReceipt>,
+}
+
+/// Names of the files shipped in a release archive, used as a preflight check
+/// before draining a node for a component that may not be in this release.
+pub fn archive_binary_names(
+    agent: &ureq::Agent,
+    component: &Component,
+    version: &str,
+) -> Result<Vec<String>> {
+    let target = Target::detect()?;
+    let rel = release::fetch_tagged(agent, &component.repo, version)?;
+    let asset_name = component.asset_name(&rel.tag, target.as_str());
+    let checksum_name = component.checksum_asset_name(&rel.tag, target.as_str());
+    let asset = release::find_asset(&rel, &asset_name)?;
+    let checksum_asset = release::find_asset(&rel, &checksum_name)?;
+    let tmp = tempfile_dir()?;
+    let downloaded = download::download_release_assets(
+        agent,
+        &asset.url,
+        &checksum_asset.url,
+        &asset_name,
+        &checksum_name,
+        &tmp,
+        crate::http::max_download_bytes(),
+    );
+    let result = downloaded.and_then(|d| {
+        let content = download::read_checksum_file(&d.checksum_path)?;
+        let expected = verify::parse_checksum_file(&content, &asset_name)?;
+        verify::verify_checksum(&d.archive_path, &expected)?;
+        archive::list_binary_names(&d.archive_path)
+    });
+    let _ = fs::remove_dir_all(&tmp);
+    result
 }
 
 pub fn install_component(
@@ -51,13 +95,14 @@ pub fn install_component(
         None => release::fetch_latest(agent, &component.repo)?,
     };
     let tag = rel.tag.clone();
+    let expected_binaries = component.expected_binaries(&tag);
     let asset_name = component.asset_name(&tag, target.as_str());
     let checksum_name = component.checksum_asset_name(&tag, target.as_str());
     let asset = release::find_asset(&rel, &asset_name)?;
     let checksum_asset = release::find_asset(&rel, &checksum_name)?;
 
     let state_path = state::default_state_path(opts.prefix.as_deref());
-    let mut st = state::load(&state_path)?;
+    let st = state::load(&state_path)?;
 
     if let Some(installed) = st.components.get(&component.name) {
         if !opts.allow_major {
@@ -87,8 +132,9 @@ pub fn install_component(
         return Ok(InstallOutcome {
             component: component.name.clone(),
             version: tag,
-            binaries: component.binaries.clone(),
+            binaries: expected_binaries,
             dry_run: true,
+            receipt: None,
         });
     }
 
@@ -114,12 +160,12 @@ pub fn install_component(
 
     let extract_dir = tmp.join("extract");
     let extracted =
-        archive::extract_binaries(&downloaded.archive_path, &component.binaries, &extract_dir)?;
+        archive::extract_binaries(&downloaded.archive_path, &expected_binaries, &extract_dir)?;
     if extracted.is_empty() {
         return Err(Error::Archive(format!(
             "archive {} contained no expected binaries ({})",
             asset_name,
-            component.binaries.join(", ")
+            expected_binaries.join(", ")
         )));
     }
 
@@ -129,31 +175,22 @@ pub fn install_component(
         source,
     })?;
 
-    let mut installed_names = Vec::new();
-    for bin in &extracted {
-        install_binary(&bin.path, &bin_dir, &bin.name)?;
-        installed_names.push(bin.name.clone());
-    }
-
+    let installed_names: Vec<String> = extracted.iter().map(|b| b.name.clone()).collect();
     if opts.smoke_check {
-        smoke_check(&bin_dir, &installed_names)?;
+        // Validate the staged binaries in place: a failed smoke check must
+        // leave the installed binaries and their `.prev` files untouched.
+        smoke_check(&extract_dir, &installed_names)?;
     }
 
-    let prev_version = st
-        .components
-        .get(&component.name)
-        .map(|c| c.version.clone());
-    st.components.insert(
-        component.name.clone(),
-        InstalledComponent {
-            version: tag.clone(),
-            target: target.as_str().to_string(),
-            checksum: expected,
-            installed_at: state::now_rfc3339()?,
-            previous_version: prev_version,
-        },
-    );
-    state::save(&state_path, &st)?;
+    let receipt = InstallReceipt {
+        checksum: expected,
+        target: target.as_str().to_string(),
+        installed_at: state::now_rfc3339()?,
+    };
+    commit_binaries(&extracted, &bin_dir)?;
+    if opts.commit_state {
+        record_installed(component, &tag, &receipt, opts.prefix.as_deref())?;
+    }
 
     let _ = fs::remove_dir_all(&tmp);
 
@@ -165,7 +202,197 @@ pub fn install_component(
         version: tag,
         binaries: installed_names,
         dry_run: false,
+        receipt: Some(receipt),
     })
+}
+
+/// Record an install after a deferred health check has confirmed it.
+pub fn record_installed(
+    component: &Component,
+    version: &str,
+    receipt: &InstallReceipt,
+    prefix: Option<&Path>,
+) -> Result<()> {
+    let state_path = state::default_state_path(prefix);
+    let mut st = state::load(&state_path)?;
+    let previous_version = st
+        .components
+        .get(&component.name)
+        .map(|c| c.version.clone());
+    st.components.insert(
+        component.name.clone(),
+        InstalledComponent {
+            version: version.to_string(),
+            target: receipt.target.clone(),
+            checksum: receipt.checksum.clone(),
+            installed_at: receipt.installed_at.clone(),
+            previous_version,
+        },
+    );
+    state::save(&state_path, &st)
+}
+
+/// Commit every staged binary, restoring destinations and the last good
+/// `.prev` if any step fails. `.prev` is only replaced after all new binaries
+/// are in place.
+fn commit_binaries(extracted: &[archive::ExtractedBinary], bin_dir: &Path) -> Result<()> {
+    fs::create_dir_all(bin_dir).map_err(|source| Error::Write {
+        path: bin_dir.to_path_buf(),
+        source,
+    })?;
+
+    struct Pending {
+        dest: PathBuf,
+        staged: PathBuf,
+        dest_backup: Option<PathBuf>,
+        prev: PathBuf,
+        prev_backup: Option<PathBuf>,
+    }
+
+    let mut pending: Vec<Pending> = Vec::new();
+    let result = (|| {
+        for bin in extracted {
+            let dest = bin_dir.join(&bin.name);
+            let prev = bin_dir.join(format!("{}.prev", bin.name));
+            let dest_backup = if dest.exists() {
+                let path = unique_temp(bin_dir, &format!(".{}.backup-", bin.name));
+                fs::copy(&dest, &path).map_err(|source| Error::Write {
+                    path: path.clone(),
+                    source,
+                })?;
+                Some(path)
+            } else {
+                None
+            };
+            let prev_backup = if prev.exists() {
+                let path = unique_temp(bin_dir, &format!(".{}.prevkeep-", bin.name));
+                fs::copy(&prev, &path).map_err(|source| Error::Write {
+                    path: path.clone(),
+                    source,
+                })?;
+                Some(path)
+            } else {
+                None
+            };
+            let staged = unique_temp(bin_dir, &format!(".{}.commit-", bin.name));
+            fs::copy(&bin.path, &staged).map_err(|source| Error::Write {
+                path: staged.clone(),
+                source,
+            })?;
+            make_executable(&staged)?;
+            pending.push(Pending {
+                dest,
+                staged,
+                dest_backup,
+                prev,
+                prev_backup,
+            });
+        }
+        for item in &pending {
+            fs::rename(&item.staged, &item.dest).map_err(|source| Error::Write {
+                path: item.dest.clone(),
+                source,
+            })?;
+        }
+        for item in &pending {
+            if let Some(backup) = &item.dest_backup {
+                fs::rename(backup, &item.prev).map_err(|source| Error::Write {
+                    path: item.prev.clone(),
+                    source,
+                })?;
+            }
+        }
+        Ok(())
+    })();
+
+    if let Err(e) = result {
+        // Restore the last good `.prev` first, then the installed binaries.
+        for item in pending.iter().rev() {
+            match &item.prev_backup {
+                Some(backup) => {
+                    let _ = fs::rename(backup, &item.prev);
+                }
+                None => {
+                    let _ = fs::remove_file(&item.prev);
+                }
+            }
+        }
+        for item in pending.iter().rev() {
+            match &item.dest_backup {
+                Some(backup) => {
+                    let _ = fs::rename(backup, &item.dest);
+                }
+                None => {
+                    let _ = fs::remove_file(&item.dest);
+                }
+            }
+        }
+        for item in &pending {
+            let _ = fs::remove_file(&item.staged);
+        }
+        return Err(e);
+    }
+
+    for item in &pending {
+        if let Some(backup) = &item.prev_backup {
+            let _ = fs::remove_file(backup);
+        }
+    }
+    Ok(())
+}
+
+/// Restore `<name>.prev` over the installed binary, keeping the last known
+/// good `.prev` in place so a later retry cannot overwrite it with a bad build.
+pub fn restore_previous_binary(bin_dir: &Path, name: &str) -> Result<()> {
+    let dest = bin_dir.join(name);
+    let prev = bin_dir.join(format!("{name}.prev"));
+    if !prev.exists() {
+        return Err(Error::NoPrevious(name.to_string()));
+    }
+    let tmp = unique_temp(bin_dir, &format!(".{name}.restore-"));
+    fs::copy(&prev, &tmp).map_err(|source| Error::Write {
+        path: tmp.clone(),
+        source,
+    })?;
+    make_executable(&tmp)?;
+    fs::rename(&tmp, &dest).map_err(|source| Error::Write {
+        path: dest.clone(),
+        source,
+    })?;
+    // Refresh `.prev` from the restored good binary (same bytes).
+    let keep = unique_temp(bin_dir, &format!(".{name}.keep-"));
+    fs::copy(&dest, &keep).map_err(|source| Error::Write {
+        path: keep.clone(),
+        source,
+    })?;
+    fs::rename(&keep, &prev).map_err(|source| Error::Write { path: prev, source })?;
+    Ok(())
+}
+
+fn make_executable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(path)
+            .map_err(|source| Error::Write {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).map_err(|source| Error::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn unique_temp(dir: &Path, prefix: &str) -> PathBuf {
+    let nanos = now_nanos();
+    dir.join(format!("{prefix}{}-{nanos}", std::process::id()))
 }
 
 pub fn install_dir(prefix: Option<&Path>) -> PathBuf {
@@ -187,86 +414,17 @@ fn default_bin_dir() -> PathBuf {
 /// The only release-provided code tuishou executes: `--version` on each
 /// installed binary. A non-zero exit or empty output fails the install.
 pub fn smoke_check(bin_dir: &Path, binaries: &[String]) -> Result<()> {
+    let timeout = std::time::Duration::from_secs(30);
     for name in binaries {
         let path = bin_dir.join(name);
-        let output = std::process::Command::new(&path)
-            .arg("--version")
-            .output()
-            .map_err(|e| {
-                Error::msg(format!(
-                    "smoke check failed for {}: could not run {}: {e}",
-                    name,
-                    path.display()
-                ))
-            })?;
-        if !output.status.success() {
-            return Err(Error::msg(format!(
-                "smoke check failed for {name}: --version exited with {}",
-                output.status
-            )));
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if stdout.trim().is_empty() {
+        let output = crate::process::checked(&path.to_string_lossy(), &["--version"], timeout)
+            .map_err(|e| Error::msg(format!("smoke check failed for {name}: {e}")))?;
+        if output.stdout.trim().is_empty() {
             return Err(Error::msg(format!(
                 "smoke check failed for {name}: --version produced no output"
             )));
         }
     }
-    Ok(())
-}
-
-fn install_binary(src: &Path, bin_dir: &Path, name: &str) -> Result<()> {
-    let dest = bin_dir.join(name);
-    let prev = bin_dir.join(format!("{name}.prev"));
-    let tmp = bin_dir.join(format!(".{name}.tmp-{}", std::process::id()));
-
-    fs::copy(src, &tmp).map_err(|source| Error::Write {
-        path: tmp.clone(),
-        source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&tmp)
-            .map_err(|source| Error::Write {
-                path: tmp.clone(),
-                source,
-            })?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&tmp, perms).map_err(|source| Error::Write {
-            path: tmp.clone(),
-            source,
-        })?;
-    }
-
-    if dest.exists() {
-        // Copy current to .prev first so a failed rename leaves dest in place.
-        if prev.exists() {
-            let _ = fs::remove_file(&prev);
-        }
-        fs::copy(&dest, &prev).map_err(|source| Error::Write {
-            path: prev.clone(),
-            source,
-        })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = fs::metadata(&prev) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o755);
-                let _ = fs::set_permissions(&prev, perms);
-            }
-        }
-    }
-
-    fs::rename(&tmp, &dest).map_err(|source| {
-        let _ = fs::remove_file(&tmp);
-        Error::Write {
-            path: dest.clone(),
-            source,
-        }
-    })?;
     Ok(())
 }
 

@@ -15,7 +15,14 @@ pub const COMMANDS: &[&str] = &[
     "man",
 ];
 
-const GLOBAL_OPTIONS: &[&str] = &["--json", "--quiet", "--verbose", "--help", "--version"];
+const GLOBAL_OPTIONS: &[&str] = &[
+    "--json",
+    "--quiet",
+    "--verbose",
+    "--config",
+    "--help",
+    "--version",
+];
 const COMPONENTS: &[&str] = &["lu", "ting", "tuishou", "all"];
 const AUTO_ACTIONS: &[&str] = &[
     "run",
@@ -25,6 +32,24 @@ const AUTO_ACTIONS: &[&str] = &[
     "release",
     "clear-bad",
 ];
+const AUTO_RUN_OPTIONS: &[&str] = &["--once", "--allow-unattested", "--prefix"];
+const AUTO_TIMER_OPTIONS: &[&str] = &["--interval", "--prefix"];
+const AUTO_STATUS_OPTIONS: &[&str] = &["--prefix"];
+const AUTO_HOLD_OPTIONS: &[&str] = &["--reason", "--expires-at", "--expires-in", "--prefix"];
+const AUTO_RELEASE_OPTIONS: &[&str] = &["--prefix"];
+const AUTO_CLEAR_BAD_OPTIONS: &[&str] = &["--prefix"];
+
+fn auto_action_options(action: &str) -> &'static [&'static str] {
+    match action {
+        "run" => AUTO_RUN_OPTIONS,
+        "install-timer" => AUTO_TIMER_OPTIONS,
+        "status" => AUTO_STATUS_OPTIONS,
+        "hold" => AUTO_HOLD_OPTIONS,
+        "release" => AUTO_RELEASE_OPTIONS,
+        "clear-bad" => AUTO_CLEAR_BAD_OPTIONS,
+        _ => &[],
+    }
+}
 
 pub fn command_options(command: &str) -> &'static [&'static str] {
     match command {
@@ -72,7 +97,9 @@ pub fn candidates(words: &[String]) -> String {
     if current.starts_with('-') {
         pool.extend_from_slice(GLOBAL_OPTIONS);
         if let Some(first) = words.first() {
-            if COMMANDS.contains(&first.as_str()) {
+            if first == "auto-update" && words.len() >= 3 {
+                pool.extend_from_slice(auto_action_options(&words[1]));
+            } else if COMMANDS.contains(&first.as_str()) {
                 pool.extend_from_slice(command_options(first));
             }
         }
@@ -87,6 +114,9 @@ pub fn candidates(words: &[String]) -> String {
         }
         pool.extend_from_slice(GLOBAL_OPTIONS);
         pool.extend_from_slice(command_options(first));
+        if first == "auto-update" && words.len() >= 3 {
+            pool.extend_from_slice(auto_action_options(&words[1]));
+        }
     }
 
     let mut seen = std::collections::BTreeSet::new();
@@ -114,6 +144,12 @@ mod tests {
     }
 
     #[test]
+    fn completes_global_config_flag() {
+        let out = candidates(&words(&["--con"]));
+        assert_eq!(out, "--config");
+    }
+
+    #[test]
     fn completes_shell_names() {
         let out = candidates(&words(&["completions", "z"]));
         assert_eq!(out, "zsh");
@@ -123,5 +159,13 @@ mod tests {
     fn completes_flags_for_command() {
         let out = candidates(&words(&["install", "--dry"]));
         assert_eq!(out, "--dry-run");
+    }
+
+    #[test]
+    fn completes_auto_update_action_flags() {
+        let out = candidates(&words(&["auto-update", "run", "--pre"]));
+        assert_eq!(out, "--prefix");
+        let out = candidates(&words(&["auto-update", "install-timer", "--int"]));
+        assert_eq!(out, "--interval");
     }
 }
