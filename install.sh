@@ -13,6 +13,14 @@ readonly EXIT_UNSUPPORTED=3
 readonly EXIT_VERIFY=4
 readonly EXIT_INSTALL=5
 
+# Bounds for the pre-verifier bootstrap path. The binary-side caps in
+# src/http.rs do not apply to this shell installer.
+readonly MAX_METADATA_BYTES=1048576
+readonly MAX_ARCHIVE_BYTES=209715200
+readonly MAX_CHECKSUM_BYTES=65536
+readonly MAX_TAR_ENTRIES=128
+readonly MAX_TAR_ENTRY_BYTES=209715200
+
 COMPONENTS=()
 RESULTS=()
 stage_dir=""
@@ -139,14 +147,57 @@ rerun_command() {
 }
 
 fail_prefix() {
-  fail "prefix $prefix is not writable by this user"
+  if (($# > 0)); then
+    fail "$1"
+  else
+    fail "prefix $prefix is not writable by this user"
+  fi
   printf 'Rerun as root with:\n  ' >&2
   rerun_command >&2
   exit "$EXIT_INSTALL"
 }
 
+check_no_symlink_components() {
+  local target="$1" path="" part
+  local -a parts=()
+  IFS='/' read -ra parts <<<"$target"
+  for part in "${parts[@]}"; do
+    [[ -n $part ]] || continue
+    if [[ $target == /* && -z $path ]]; then
+      path="/$part"
+    else
+      path="${path:+$path/}$part"
+    fi
+    [[ -L $path ]] && fail_prefix "prefix path contains a symlink: $path"
+  done
+  return 0
+}
+
+check_dir_trust() {
+  local dir="$1" mode owner uid
+  [[ -L $dir ]] && fail_prefix "prefix path contains a symlink: $dir"
+  if [[ -e $dir ]]; then
+    [[ -d $dir ]] || fail_prefix "prefix path is not a directory: $dir"
+    mode=$(stat -c '%a' -- "$dir") || fail_prefix "cannot inspect $dir"
+    owner=$(stat -c '%u' -- "$dir") || fail_prefix "cannot inspect $dir"
+    uid=$(id -u)
+    if (( (8#$mode & 8#022) != 0 )); then
+      fail_prefix "directory $dir is writable by group or others"
+    fi
+    if (( uid == 0 )); then
+      (( owner == 0 )) || fail_prefix "directory $dir must be owned by root for a privileged install"
+    else
+      (( owner == uid || owner == 0 )) || fail_prefix "directory $dir is owned by another user"
+    fi
+  fi
+  return 0
+}
+
 check_prefix_writable() {
   local ancestor="$prefix"
+  check_no_symlink_components "$prefix"
+  check_dir_trust "$prefix"
+  check_dir_trust "$bin_dir"
   if [[ -e $prefix ]]; then
     [[ -d $prefix && -w $prefix ]] || fail_prefix
   else
@@ -160,6 +211,93 @@ check_prefix_writable() {
   fi
   if [[ -e $bin_dir && ! -d $bin_dir ]]; then
     fail_prefix
+  fi
+  if [[ -L $dest ]]; then
+    fail_prefix "existing $dest is a symlink"
+  fi
+  if [[ -e $dest && ! -f $dest ]]; then
+    fail_prefix "existing $dest is not a regular file"
+  fi
+}
+
+installed_state_path() {
+  if [[ $prefix_explicit -eq 1 ]]; then
+    printf '%s\n' "$bin_dir/.tuishou.json"
+  elif [[ -n ${XDG_STATE_HOME:-} ]]; then
+    printf '%s\n' "$XDG_STATE_HOME/tuishou/installed.json"
+  elif [[ -n ${HOME:-} ]]; then
+    printf '%s\n' "$HOME/.local/state/tuishou/installed.json"
+  else
+    printf '%s\n' ".tuishou.json"
+  fi
+}
+
+# The previous version comes from local state, never from executing an
+# unverified binary that might already sit in the destination directory.
+installed_version() {
+  local state_file
+  state_file=$(installed_state_path)
+  if [[ -f $state_file && ! -L $state_file ]]; then
+    awk '
+      {
+        line = $0
+        if (!tuishou) {
+          if (!match(line, /"tuishou"[[:space:]]*:/)) next
+          tuishou = 1
+          line = substr(line, RSTART)
+        }
+        if (match(line, /"version"[[:space:]]*:/)) {
+          value = substr(line, RSTART + RLENGTH)
+          sub(/^[[:space:]]*"/, "", value)
+          sub(/".*$/, "", value)
+          print value
+          exit
+        }
+        if (index(line, "}") > 0) tuishou = 0
+      }
+    ' "$state_file"
+  fi
+}
+
+download_file() {
+  local url="$1" out="$2" limit="$3" label="$4" size
+  if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 300 \
+    --max-filesize "$limit" -o "$out" "$url"; then
+    die_install "download failed for $label"
+  fi
+  size=$(wc -c < "$out") || die_install "cannot measure $label"
+  if (( size == 0 || size > limit )); then
+    die_install "download size out of bounds for $label"
+  fi
+}
+
+# Accept exactly one ordinary file named tuishou. Any link, device, absolute
+# path, parent path or duplicate entry is rejected before extraction.
+validate_archive() {
+  local archive="$1" listing="$2" line perms size name extra count
+  if ! tar -tvzf "$archive" 2>/dev/null |
+    awk -v max="$MAX_TAR_ENTRIES" '
+      length($0) > 4096 { exit 1 }
+      NR <= max { print }
+      END { if (NR > max) exit 1 }
+    ' > "$listing"; then
+    die_install "archive listing is missing, too long or unreadable"
+  fi
+  count=$(wc -l < "$listing") || die_install "cannot read archive listing"
+  if (( count != 1 )); then
+    die_install "archive must contain exactly one top-level tuishou entry"
+  fi
+  IFS= read -r line < "$listing"
+  read -r perms _ size _ _ name extra <<<"$line"
+  if [[ ${perms:0:1} != '-' ]]; then
+    die_install "archive entry tuishou must be a regular file"
+  fi
+  if [[ $name != tuishou || -n ${extra:-} ]]; then
+    die_install "archive contains an unsafe entry name or link target"
+  fi
+  [[ $size =~ ^[0-9]+$ ]] || die_install "archive entry has no valid size"
+  if (( size > MAX_TAR_ENTRY_BYTES )); then
+    die_install "archive entry tuishou exceeds the size limit"
   fi
 }
 
@@ -319,7 +457,8 @@ else
   metadata_url="$api_base/repos/$REPO/releases/latest"
 fi
 
-if ! release_json=$(curl -fsSL --retry 3 --connect-timeout 10 "$metadata_url"); then
+if ! release_json=$(curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+    --max-filesize "$MAX_METADATA_BYTES" "$metadata_url"); then
   die_install "could not fetch release metadata for $REPO"
 fi
 tag=$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | awk 'NR == 1 { print; exit }')
@@ -356,11 +495,25 @@ fi
 
 check_prefix_writable
 
+# Read the previous version from local state. Executing an existing $dest here
+# would run unverified code before any checksum or attestation check.
+previous_tag=$(installed_version)
+
 if [[ -e $dest && $yes -eq 0 ]] && ! confirm_replace; then
   die_install "install cancelled; pass --yes to replace without a prompt"
 fi
 
 mkdir -p -- "$prefix" "$bin_dir" || fail_prefix
+# Directory trust can change between the first check and mkdir.
+check_no_symlink_components "$prefix"
+check_dir_trust "$prefix"
+check_dir_trust "$bin_dir"
+if [[ -L $dest ]]; then
+  fail_prefix "existing $dest is a symlink"
+fi
+if [[ -e $dest && ! -f $dest ]]; then
+  fail_prefix "existing $dest is not a regular file"
+fi
 stage_dir=$(mktemp -d "$prefix/.tuishou-install.XXXXXX") || fail_prefix
 
 asset_url() {
@@ -392,16 +545,12 @@ checksum_url=$(asset_url "$checksum_name")
 check_asset_url "$archive_url"
 check_asset_url "$checksum_url"
 
-if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$stage_dir/$archive_name" "$archive_url"; then
-  die_install "download failed for $archive_name"
-fi
+download_file "$archive_url" "$stage_dir/$archive_name" "$MAX_ARCHIVE_BYTES" "$archive_name"
 actual=$(sha256sum "$stage_dir/$archive_name" | awk '{ print $1 }')
 if [[ -n $expect_sha256 && $actual != "$expect_sha256" ]]; then
   die_verify "pinned SHA-256 mismatch for $archive_name: expected $expect_sha256, got $actual"
 fi
-if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$stage_dir/$checksum_name" "$checksum_url"; then
-  die_install "download failed for $checksum_name"
-fi
+download_file "$checksum_url" "$stage_dir/$checksum_name" "$MAX_CHECKSUM_BYTES" "$checksum_name"
 
 expected=$(awk 'NF { print $1; exit }' "$stage_dir/$checksum_name" | tr '[:upper:]' '[:lower:]')
 if [[ ! $expected =~ ^[0-9a-f]{64}$ ]]; then
@@ -419,21 +568,25 @@ else
 fi
 info "bootstrap: only the checksum can be checked before tuishou exists; in-process attestation cannot verify the verifier"
 
+validate_archive "$stage_dir/$archive_name" "$stage_dir/archive.listing"
 mkdir -p "$stage_dir/extract"
-# Capture the listing first: with pipefail, grep -q exiting early makes tar die of SIGPIPE.
-archive_listing=$(tar -tzf "$stage_dir/$archive_name" 2>/dev/null) || die_install "could not list $archive_name"
-if ! grep -qx 'tuishou' <<<"$archive_listing"; then
-  die_install "archive $archive_name does not contain a top-level tuishou binary"
-fi
 if ! tar -xzf "$stage_dir/$archive_name" -C "$stage_dir/extract" tuishou; then
   die_install "could not extract tuishou from $archive_name"
 fi
+if [[ -L $stage_dir/extract/tuishou || ! -f $stage_dir/extract/tuishou ]]; then
+  die_install "staged tuishou is not a regular file"
+fi
 chmod 0755 "$stage_dir/extract/tuishou"
 
-previous_tag=""
-if [[ -x $dest ]]; then
-  previous_tag=$("$dest" --version 2>/dev/null || true)
+# Run the downloaded verifier from private staging. Nothing at $dest is
+# executed or replaced until its attestation check succeeds.
+if ! verify_out=$("$stage_dir/extract/tuishou" verify "$stage_dir/$archive_name" --repo "$REPO" --tag "$tag" 2>&1); then
+  warn "attestation: FAIL (tuishou verify $archive_name)"
+  printf '%s\n' "$verify_out" >&2
+  die_verify "attestation verification failed; no binary was installed"
 fi
+pass "attestation: PASS (tuishou verify $archive_name)"
+printf '%s\n' "$verify_out"
 
 staged="$bin_dir/.tuishou-commit.$$.tmp"
 backup="$bin_dir/.tuishou-prev.$$.tmp"
@@ -446,21 +599,13 @@ if [[ -e $dest ]]; then
   mv -f "$backup" "$bin_dir/tuishou.prev" || die_install "could not keep the rollback copy"
   had_previous=1
 fi
-mv -f "$staged" "$dest" || die_install "could not install $dest"
-
-if ! verify_out=$("$dest" verify "$stage_dir/$archive_name" --repo "$REPO" --tag "$tag" 2>&1); then
-  warn "attestation: FAIL (tuishou verify $archive_name)"
-  printf '%s\n' "$verify_out" >&2
-  if [[ $had_previous -eq 1 && -f $bin_dir/tuishou.prev ]]; then
-    mv -f "$bin_dir/tuishou.prev" "$dest"
-  else
-    rm -f "$dest"
-  fi
+if ! mv -f "$staged" "$dest"; then
   rm -f "$staged"
-  die_verify "attestation verification failed; the new binary was removed"
+  if [[ $had_previous -eq 1 && -f $bin_dir/tuishou.prev ]]; then
+    mv -f "$bin_dir/tuishou.prev" "$dest" || die_install "could not restore the previous binary"
+  fi
+  die_install "could not install $dest"
 fi
-pass "attestation: PASS (tuishou verify $archive_name)"
-printf '%s\n' "$verify_out"
 
 if ! "$dest" adopt tuishou --version "$tag" "${prefix_args[@]}" >/dev/null; then
   die_install "could not record tuishou $tag in state"

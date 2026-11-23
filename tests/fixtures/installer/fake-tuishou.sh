@@ -33,7 +33,49 @@ case "$command" in
     printf 'log index: 0\n'
     ;;
   adopt)
-    printf 'adopted %s %s\n' "${1:-}" "${FAKE_TUISHOU_VERSION:-v9.9.9}"
+    component="${1:-tuishou}"
+    tag="${FAKE_TUISHOU_VERSION:-v9.9.9}"
+    state_prefix=""
+    while (($# > 0)); do
+      case "$1" in
+        --prefix)
+          (($# >= 2)) || { printf 'adopt: --prefix needs a value\n' >&2; exit 2; }
+          state_prefix="$2"
+          shift 2
+          ;;
+        --prefix=*)
+          state_prefix="${1#*=}"
+          shift
+          ;;
+        --version | --tag)
+          (($# >= 2)) || { printf 'adopt: %s needs a value\n' "$1" >&2; exit 2; }
+          shift 2
+          ;;
+        --version=* | --tag=*) shift ;;
+        *) shift ;;
+      esac
+    done
+    if [[ -n $state_prefix ]]; then
+      state_file="$state_prefix/.tuishou.json"
+    elif [[ -n ${XDG_STATE_HOME:-} ]]; then
+      state_file="$XDG_STATE_HOME/tuishou/installed.json"
+    else
+      state_file="${HOME:-.}/.local/state/tuishou/installed.json"
+    fi
+    mkdir -p "$(dirname "$state_file")"
+    cat > "$state_file" <<EOF
+{
+  "components": {
+    "$component": {
+      "version": "$tag",
+      "target": "x86_64-unknown-linux-musl",
+      "checksum": "fixture",
+      "installed_at": "2026-01-01T00:00:00Z"
+    }
+  }
+}
+EOF
+    printf 'adopted %s %s\n' "$component" "$tag"
     ;;
   install)
     component="${1:-}"

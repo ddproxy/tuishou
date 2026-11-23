@@ -47,6 +47,12 @@ assert_absent() {
   fi
 }
 
+make_malicious_release() {
+  local tag="$1" archive="$2" checksum="$3"
+  fixture_write_release "$FIX_SERVER_ROOT/repos/$FIX_REPO/releases/tags/$tag" \
+    "$tag" "$archive" "$checksum"
+}
+
 section "usage error"
 out=$(expect_exit 2 fixture_installer_env bash "$installer" --components bogus --prefix "$work/usage")
 assert_contains "$out" "unknown component 'bogus'"
@@ -94,6 +100,120 @@ bad_digest=$(sha256sum "$FIX_SERVER_ROOT/assets/$FIX_ARCHIVE_BAD" | awk '{ print
 out=$(expect_exit 4 fixture_installer_env bash "$installer" --prefix "$work/pinned-checksum" --yes --version "$FIX_BAD_TAG" --expect-sha256 "$bad_digest")
 assert_contains "$out" "checksum mismatch"
 assert_absent "$work/pinned-checksum/bin/tuishou"
+
+section "archive with symlink entry is rejected"
+mal_tag="v9.9.7"
+mal_archive="tuishou-$mal_tag-x86_64-unknown-linux-musl.tar.gz"
+mal_checksum="$mal_archive.sha256"
+mal_root="$work/mal-symlink/root"
+mkdir -p "$mal_root"
+ln -s /bin/sh "$mal_root/tuishou"
+tar -czf "$FIX_SERVER_ROOT/assets/$mal_archive" -C "$mal_root" tuishou
+sha256sum "$FIX_SERVER_ROOT/assets/$mal_archive" |
+  awk -v name="$mal_checksum" '{ print $1 "  " name }' > "$FIX_SERVER_ROOT/assets/$mal_checksum"
+make_malicious_release "$mal_tag" "$mal_archive" "$mal_checksum"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$work/mal-symlink" --yes --version "$mal_tag")
+assert_contains "$out" "must be a regular file"
+assert_absent "$work/mal-symlink/bin/tuishou"
+
+section "archive with absolute entry name is rejected"
+mal_tag="v9.9.6"
+mal_archive="tuishou-$mal_tag-x86_64-unknown-linux-musl.tar.gz"
+mal_checksum="$mal_archive.sha256"
+mal_root="$work/mal-absolute/root"
+mkdir -p "$mal_root"
+printf 'untrusted\n' > "$mal_root/evil"
+tar -czf "$FIX_SERVER_ROOT/assets/$mal_archive" --absolute-names "$mal_root/evil"
+sha256sum "$FIX_SERVER_ROOT/assets/$mal_archive" |
+  awk -v name="$mal_checksum" '{ print $1 "  " name }' > "$FIX_SERVER_ROOT/assets/$mal_checksum"
+make_malicious_release "$mal_tag" "$mal_archive" "$mal_checksum"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$work/mal-absolute" --yes --version "$mal_tag")
+assert_contains "$out" "unsafe entry name or link target"
+assert_absent "$work/mal-absolute/bin/tuishou"
+
+section "archive with parent path entry is rejected"
+mal_tag="v9.9.5"
+mal_archive="tuishou-$mal_tag-x86_64-unknown-linux-musl.tar.gz"
+mal_checksum="$mal_archive.sha256"
+mal_root="$work/mal-parent/root"
+mkdir -p "$mal_root"
+printf 'untrusted\n' > "$mal_root/evil"
+tar -czf "$FIX_SERVER_ROOT/assets/$mal_archive" -C "$mal_root" \
+  --transform='s|^evil|../evil|' evil 2>/dev/null
+sha256sum "$FIX_SERVER_ROOT/assets/$mal_archive" |
+  awk -v name="$mal_checksum" '{ print $1 "  " name }' > "$FIX_SERVER_ROOT/assets/$mal_checksum"
+make_malicious_release "$mal_tag" "$mal_archive" "$mal_checksum"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$work/mal-parent" --yes --version "$mal_tag")
+assert_contains "$out" "unsafe entry name or link target"
+assert_absent "$work/mal-parent/bin/tuishou"
+
+section "archive with duplicate entries is rejected"
+mal_tag="v9.9.4"
+mal_archive="tuishou-$mal_tag-x86_64-unknown-linux-musl.tar.gz"
+mal_checksum="$mal_archive.sha256"
+mal_root="$work/mal-duplicate/root"
+mkdir -p "$mal_root"
+printf 'one\n' > "$mal_root/a"
+printf 'two\n' > "$mal_root/b"
+tar -czf "$FIX_SERVER_ROOT/assets/$mal_archive" -C "$mal_root" \
+  --transform='s|^[ab]$|tuishou|' a b
+sha256sum "$FIX_SERVER_ROOT/assets/$mal_archive" |
+  awk -v name="$mal_checksum" '{ print $1 "  " name }' > "$FIX_SERVER_ROOT/assets/$mal_checksum"
+make_malicious_release "$mal_tag" "$mal_archive" "$mal_checksum"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$work/mal-duplicate" --yes --version "$mal_tag")
+assert_contains "$out" "exactly one top-level tuishou entry"
+assert_absent "$work/mal-duplicate/bin/tuishou"
+
+section "archive listing with too many entries is rejected"
+mal_tag="v9.9.3"
+mal_archive="tuishou-$mal_tag-x86_64-unknown-linux-musl.tar.gz"
+mal_checksum="$mal_archive.sha256"
+mal_root="$work/mal-many/root"
+mkdir -p "$mal_root"
+for number in {1..129}; do printf 'x\n' > "$mal_root/file$number"; done
+tar -czf "$FIX_SERVER_ROOT/assets/$mal_archive" -C "$mal_root" file{1..129}
+sha256sum "$FIX_SERVER_ROOT/assets/$mal_archive" |
+  awk -v name="$mal_checksum" '{ print $1 "  " name }' > "$FIX_SERVER_ROOT/assets/$mal_checksum"
+make_malicious_release "$mal_tag" "$mal_archive" "$mal_checksum"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$work/mal-many" --yes --version "$mal_tag")
+assert_contains "$out" "archive listing is missing, too long or unreadable"
+assert_absent "$work/mal-many/bin/tuishou"
+
+section "oversized checksum asset is rejected"
+mal_tag="v9.9.2"
+mal_checksum="tuishou-$mal_tag-x86_64-unknown-linux-musl.tar.gz.sha256"
+head -c 70000 /dev/zero | tr '\000' 'x' > "$FIX_SERVER_ROOT/assets/$mal_checksum"
+mal_archive="tuishou-$mal_tag-x86_64-unknown-linux-musl.tar.gz"
+cp "$FIX_SERVER_ROOT/assets/$FIX_ARCHIVE_GOOD" "$FIX_SERVER_ROOT/assets/$mal_archive"
+make_malicious_release "$mal_tag" "$mal_archive" "$mal_checksum"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$work/large-checksum" --yes --version "$mal_tag")
+assert_contains "$out" "download failed for $mal_checksum"
+assert_absent "$work/large-checksum/bin/tuishou"
+
+section "world-writable prefix is rejected"
+world_prefix="$work/world-writable"
+mkdir -p "$world_prefix"
+chmod 0777 "$world_prefix"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$world_prefix" --yes)
+assert_contains "$out" "writable by group or others"
+assert_absent "$world_prefix/bin/tuishou"
+
+section "symlinked prefix is rejected"
+ln -s "$work/symlink-target" "$work/symlink-prefix"
+out=$(expect_exit 5 fixture_installer_env bash "$installer" --prefix "$work/symlink-prefix" --yes)
+assert_contains "$out" "prefix path contains a symlink"
+assert_absent "$work/symlink-prefix/bin/tuishou"
+
+section "existing destination is never executed before verification"
+preexec_prefix="$work/preexec"
+preexec_marker="$work/preexec-ran"
+mkdir -p "$preexec_prefix/bin"
+printf '#!/bin/sh\n: > "%s"\n' "$preexec_marker" > "$preexec_prefix/bin/tuishou"
+chmod 0755 "$preexec_prefix/bin/tuishou"
+out=$(fixture_installer_env bash "$installer" --prefix "$preexec_prefix" --yes --no-components)
+assert_contains "$out" "attestation: PASS (tuishou verify"
+assert_absent "$preexec_marker"
+[[ -x $preexec_prefix/bin/tuishou ]]
 
 section "attestation failure removes the new binary"
 # shellcheck disable=SC2030

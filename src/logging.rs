@@ -15,8 +15,9 @@ pub fn one_line(text: &str) -> String {
     crate::http::redact_secrets(text)
         .chars()
         .map(|c| match c {
-            '\n' | '\r' => ' ',
-            '\t' => ' ',
+            // Child output and error text never reach the host terminal or a
+            // journal line with C0/C1 controls intact.
+            c if c.is_control() => ' ',
             other => other,
         })
         .collect::<String>()
@@ -86,6 +87,14 @@ mod tests {
     #[test]
     fn one_line_flattens_output() {
         assert_eq!(one_line("a\nb\t c"), "a b c");
+    }
+
+    #[test]
+    fn one_line_removes_terminal_controls() {
+        let flat = one_line("ok\u{1b}]52;c;payload\u{7}\u{9b}31mtext");
+        assert!(!flat.chars().any(char::is_control), "{flat}");
+        assert!(!flat.contains('\u{1b}'), "{flat}");
+        assert!(flat.contains("payload"), "{flat}");
     }
 
     #[test]

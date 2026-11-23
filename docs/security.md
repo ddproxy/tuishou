@@ -13,20 +13,20 @@ BOOTSTRAP_SHA256=$(awk '{ print $1; exit }' /etc/tuishou/bootstrap.sha256)
 curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu --expect-sha256 "$BOOTSTRAP_SHA256"
 ```
 
-After both checks pass, the installer extracts and stages the downloaded binary and runs its own `verify` command on the archive:
+After both checks pass, the installer validates the tar listing and extracts only a single regular `tuishou` entry into a private staging directory. It then runs that staged binary's own `verify` command on the archive:
 
 ```sh
 tuishou verify <archive> --repo ddproxy/tuishou --tag <tag>
 ```
 
-That command checks the GitHub attestation in process. If it fails, the installer removes the new binary, restores `tuishou.prev` when present, and exits 4. The bootstrap caveat remains: the verifier is the artifact being installed, so in-process attestation cannot verify the verifier. There is no offline installer attestation. Pinning is optional in this build; mandatory pinned digests and signed packages are a residual design decision. See [limits.md](limits.md).
+That command checks the GitHub attestation in process. The destination binary is neither executed nor replaced before this check succeeds; on failure it stays untouched and the installer exits 4. The prefix is refused when a path component is a symlink or the prefix or binary directory is foreign-owned or writable by group or others. The previous version comes from local state, never from executing an existing destination. Downloads, tar listings and extracted entries are size-bounded. The bootstrap caveat remains: the verifier is the artifact being installed, so in-process attestation cannot verify the verifier. There is no offline installer attestation. Pinning is optional in this build; mandatory pinned digests and signed packages are a residual design decision. See [limits.md](limits.md).
 
 ## Trust boundaries
 
 | Boundary | What crosses it | Trust rule |
 | --- | --- | --- |
 | GitHub release API and assets | Tag metadata, archives, `.sha256` files and attestation bundles | Metadata comes from the GitHub API; asset downloads carry no token. The digest and attestation decide whether an artifact is accepted. |
-| Shell installer | `install.sh` fetched over https | Resolves a release, checks an optional out-of-band pinned digest before extraction, checks the release `.sha256` as a consistency check, stages the binary and runs its `verify` command. It never invokes `sudo`; an unwritable prefix prints a root rerun command. |
+| Shell installer | `install.sh` fetched over https | Resolves a release, checks an optional out-of-band pinned digest before extraction, checks the release `.sha256` as a consistency check, validates the archive entry, stages the binary in a private directory and runs its `verify` command before touching the destination. It refuses unsafe prefixes, never invokes `sudo`, and prints a root rerun command for an unwritable prefix. |
 | Verifier binary | The installed `tuishou` executable | Its `verify` command checks the archive's attestation in process; no external CLI or login is used. Component installs fail closed unless the operator passes `--allow-unattested` explicitly; auto-update refuses that flag. |
 | Config file | `tuishou.toml` | Refused unless owned by the running user or root and not writable by group or others. Unknown keys are errors. Repositories and asset hosts cannot be overridden. |
 | Host execution | Local install, update and service commands | Runs with the privileges of the invoking account; no privilege elevation and no fleet SSH. Only trusted configs should be used. |
@@ -76,6 +76,17 @@ GitHub release assets.
 `tuishou` is executed. Updates are performed by each node locally; no commands are sent
 to nodes from a central host. Only use trusted configs. `tuishou` does not elevate
 privileges for you; run it with the account that should own the files and services.
+
+## Hosted TUIs
+
+`tuishou top` spawns the `reiki` and `lu` TUI children. Config overrides are
+argument vectors, never shell commands. Child executables are resolved through
+the safe program resolver and vetted before spawn; state never supplies
+executable argv. Children start with a cleared environment plus a small
+allowlist, so updater tokens are not inherited. TUI state is scoped per config
+and prefix, is opened without following symlinks, and is accepted only with a
+trusted owner and mode. Child-derived text is sanitized before it reaches the
+host footer. See [top.md](top.md).
 
 ## Receipts
 

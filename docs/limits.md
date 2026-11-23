@@ -21,13 +21,13 @@ Manual install for another target is outside the installer's scope. The manual p
 
 Before `tuishou` exists on the host, the shell can check only the SHA-256 digest from the `.sha256` release asset against the downloaded archive. Both assets come from the same release. A checksum-only check ties the archive to that digest; it does not prove who built the archive. This caveat is the reason the installer does not claim attestation success at the checksum step.
 
-After the checksum passes, the installer extracts and stages `tuishou`, then runs the downloaded binary's own command:
+After the checksum passes, the installer validates the tar listing, extracts only a single regular `tuishou` entry into a private staging directory, then runs the staged binary's own command:
 
 ```sh
 tuishou verify <archive> --repo ddproxy/tuishou --tag <tag>
 ```
 
-That step checks the GitHub attestation: OIDC issuer, signer workflow, tag ref, Rekor inclusion, source repository, ref and digest. If it fails, the installer removes the new binary, restores `tuishou.prev` when one exists, and exits 4. Automatic verification needs API access; there is no offline installer attestation.
+That step checks the GitHub attestation: OIDC issuer, signer workflow, tag ref, Rekor inclusion, source repository, ref and digest. Nothing at the install destination is executed or replaced before this check succeeds. If it fails, the installer leaves the existing binary untouched and exits 4. The prefix and binary directory are refused when symlinked, foreign-owned or writable by group or others, and existing version information is read from state rather than executing the destination. Downloads, archive listings and extracted entries are size-bounded. Automatic verification needs API access; there is no offline installer attestation.
 
 ## Fail-closed behavior and exit codes
 
@@ -51,7 +51,7 @@ The `tuishou` binary uses `0` ok, `1` error, `2` usage, and `10` updates availab
 - It does not install or enable system services, manage component configuration, or manage databases.
 - `tuishou auto-update install-timer` prints systemd units; it does not install or enable them.
 - Remote fleet SSH is out of scope. Removed commands and config sections are not part of the installer.
-- `tuishou top` does not exist in this build. The installer prints it as planned in its next-steps block; do not automate it.
+- `tuishou top` hosts the `reiki` and `lu` TUIs when the `top` feature is enabled by default. It spawns child processes with a cleared environment and config-scoped state; see [top.md](top.md).
 - No offline installer attestation: the verifier is the artifact being installed.
 - Auto-update is opt-in, off by default, stable-only and not recommended for production.
 - One rollback copy per binary (`<name>.prev`) is kept. It is not a backup system.

@@ -10,8 +10,8 @@ use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
-const ENV_PASSTHROUGH: &[&str] = &[
+pub(crate) const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+pub(crate) const ENV_PASSTHROUGH: &[&str] = &[
     "HOME",
     "LANG",
     "LC_ALL",
@@ -169,14 +169,21 @@ pub fn checked(program: &str, args: &[&str], timeout: Duration) -> Result<Comman
     )))
 }
 
-fn resolve_program(program: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_program(program: &str) -> Result<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_else(|| SAFE_PATH.into());
+    resolve_program_with_path(program, &path)
+}
+
+/// Resolve a program against an explicit PATH and vet the resulting file.
+/// Callers that spawn children use this instead of trusting inherited state.
+pub(crate) fn resolve_program_with_path(program: &str, path: &std::ffi::OsStr) -> Result<PathBuf> {
     if program.is_empty() {
         return Err(Error::msg("empty program name"));
     }
     let candidate = if program.contains(std::path::MAIN_SEPARATOR) {
         PathBuf::from(program)
     } else {
-        find_in_path(program)?
+        find_in_path(program, path)?
     };
     let absolute = if candidate.is_absolute() {
         candidate
@@ -189,9 +196,8 @@ fn resolve_program(program: &str) -> Result<PathBuf> {
     Ok(absolute)
 }
 
-fn find_in_path(program: &str) -> Result<PathBuf> {
-    let path = std::env::var_os("PATH").unwrap_or_else(|| SAFE_PATH.into());
-    for dir in std::env::split_paths(&path) {
+fn find_in_path(program: &str, path: &std::ffi::OsStr) -> Result<PathBuf> {
+    for dir in std::env::split_paths(path) {
         let dir = if dir.as_os_str().is_empty() {
             PathBuf::from(".")
         } else {
@@ -205,7 +211,7 @@ fn find_in_path(program: &str) -> Result<PathBuf> {
     Err(Error::msg(format!("{program} not found in PATH")))
 }
 
-fn validate_executable(path: &Path) -> Result<()> {
+pub(crate) fn validate_executable(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;

@@ -258,6 +258,7 @@ fn execute_cycle(
     quiet: bool,
     json: bool,
 ) -> Result<ExitCode> {
+    validate_environment_file()?;
     let cfg = &loaded.auto_update;
     let components = &loaded.components;
     let names = cycle_names(cfg);
@@ -303,6 +304,7 @@ fn execute_cycle(
         return Ok(ExitCode::SUCCESS);
     }
 
+    state::expire_hold(prefix)?;
     if let Some(hold) = state::active_hold(prefix)? {
         let reason = hold
             .reason
@@ -665,6 +667,7 @@ fn handle_status_locked(
     let cfg = &loaded.auto_update;
     let st = state::load(prefix)?;
     let installed = installed_versions(prefix)?;
+    state::expire_hold(prefix)?;
     let hold = state::active_hold(prefix)?;
     let names = cycle_names(cfg);
     let ordered: Vec<_> = names
@@ -916,7 +919,8 @@ fn validate_unit_value(value: &str, label: &str) -> Result<()> {
     let unsafe_char = value
         .chars()
         .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '%' | '$' | '"' | '\'' | '\\'));
-    if value.is_empty() || unsafe_char {
+    let parent_dir = value.split(['/', '\\']).any(|part| part == "..");
+    if value.is_empty() || unsafe_char || parent_dir {
         return Err(Error::msg(format!(
             "{label} contains characters that cannot be safely embedded in a systemd unit"
         )));
@@ -924,9 +928,14 @@ fn validate_unit_value(value: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
+const TRUSTED_TIMER_DIRS: [&str; 4] = ["/usr/local/bin", "/usr/bin", "/bin", "/opt/tuishou/bin"];
+const DEFAULT_TIMER_EXE: &str = "/usr/local/bin/tuishou";
+
 fn timer_executable() -> Result<String> {
-    let exe =
-        std::env::var("TUISHOU_TIMER_EXE").unwrap_or_else(|_| "/usr/local/bin/tuishou".to_string());
+    let override_exe = std::env::var("TUISHOU_TIMER_EXE").ok();
+    let exe = override_exe
+        .clone()
+        .unwrap_or_else(|| DEFAULT_TIMER_EXE.to_string());
     validate_unit_value(&exe, "TUISHOU_TIMER_EXE")?;
     let path = Path::new(&exe);
     if !path.is_absolute() {
@@ -934,29 +943,74 @@ fn timer_executable() -> Result<String> {
             "TUISHOU_TIMER_EXE must be an absolute path in a trusted directory",
         ));
     }
-    let trusted = ["/usr/local/bin", "/usr/bin", "/bin", "/opt/tuishou/bin"];
-    if !trusted.iter().any(|dir| path.starts_with(dir)) {
+    let in_trusted_dir = |candidate: &Path| {
+        TRUSTED_TIMER_DIRS
+            .iter()
+            .any(|dir| candidate.starts_with(dir))
+    };
+    if !in_trusted_dir(path) {
         return Err(Error::msg(
             "TUISHOU_TIMER_EXE must be under /usr/local/bin, /usr/bin, /bin or /opt/tuishou/bin",
         ));
     }
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() || !meta.is_file() {
-            return Err(Error::msg(
-                "TUISHOU_TIMER_EXE must be a regular file, not a symlink",
-            ));
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if meta.permissions().mode() & 0o022 != 0 {
-                return Err(Error::msg(
-                    "TUISHOU_TIMER_EXE must not be group/other-writable",
-                ));
-            }
-        }
+    let Some(_) = override_exe else {
+        // The compiled-in default is a fixed, trusted absolute path. It is
+        // printed for an operator to install; the file need not exist on the
+        // machine generating the unit.
+        return Ok(exe);
+    };
+    let canonical = std::fs::canonicalize(path).map_err(|e| {
+        Error::msg(format!(
+            "TUISHOU_TIMER_EXE must name an existing regular file: {e}"
+        ))
+    })?;
+    let trusted: Vec<PathBuf> = TRUSTED_TIMER_DIRS
+        .iter()
+        .filter_map(|dir| std::fs::canonicalize(dir).ok())
+        .collect();
+    if !trusted.iter().any(|dir| canonical.starts_with(dir)) {
+        return Err(Error::msg(
+            "TUISHOU_TIMER_EXE must resolve inside a trusted directory",
+        ));
     }
-    Ok(exe)
+    crate::process::validate_executable(&canonical)?;
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+/// The shipped service reads an optional EnvironmentFile. A file writable by
+/// other users could replace PATH before children are resolved, so refuse to
+/// start a cycle when that file is not root-owned and private.
+fn validate_environment_file() -> Result<()> {
+    validate_environment_file_at(Path::new("/etc/tuishou/auto-update.env"))
+}
+
+#[cfg(unix)]
+fn validate_environment_file_at(path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !meta.file_type().is_file() {
+        return Err(Error::msg(
+            "auto-update environment file must be a regular file",
+        ));
+    }
+    if meta.mode() & 0o022 != 0 {
+        return Err(Error::msg(
+            "auto-update environment file must not be writable by group or others",
+        ));
+    }
+    if meta.uid() != 0 {
+        return Err(Error::msg(
+            "auto-update environment file must be owned by root",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_environment_file_at(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 fn timer_units(
@@ -998,9 +1052,9 @@ fn timer_units(
          \n\
          [Service]\n\
          Type=oneshot\n\
+         EnvironmentFile=-/etc/tuishou/auto-update.env\n\
          Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
-         ExecStart={exe} --config {} auto-update run --once{}\n\
-         EnvironmentFile=-/etc/tuishou/auto-update.env\n",
+         ExecStart={exe} --config {} auto-update run --once{}\n",
         config.display(),
         prefix_arg
     );
@@ -1066,6 +1120,10 @@ mod tests {
             service.contains("Environment=PATH=/usr/local/sbin:/usr/local/bin"),
             "{service}"
         );
+        assert!(
+            service.find("EnvironmentFile=").unwrap() < service.find("Environment=PATH=").unwrap(),
+            "PATH pin must follow the EnvironmentFile: {service}"
+        );
 
         let err = timer_units(None, Some(Path::new("bad%i.toml")), None, "15m").unwrap_err();
         assert!(err.to_string().contains("systemd unit"), "{err}");
@@ -1090,6 +1148,39 @@ mod tests {
         let err = timer_units(None, Some(Path::new("tuishou.toml")), None, "15m").unwrap_err();
         assert!(err.to_string().contains("absolute path"), "{err}");
         std::env::remove_var("TUISHOU_TIMER_EXE");
+    }
+
+    #[test]
+    fn timer_executable_rejects_parent_dirs_and_canonicalizes_trusted_files() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("TUISHOU_TIMER_EXE", "/usr/local/bin/../../../tmp/evil");
+        let err = timer_executable().unwrap_err().to_string();
+        assert!(err.contains("systemd unit"), "{err}");
+
+        std::env::set_var("TUISHOU_TIMER_EXE", "/bin/true");
+        let exe = timer_executable().unwrap();
+        let canonical = std::fs::canonicalize("/bin/true").unwrap();
+        assert_eq!(Path::new(&exe), canonical.as_path());
+
+        std::env::set_var("TUISHOU_TIMER_EXE", "/usr/local/bin/missing-tuishou");
+        let err = timer_executable().unwrap_err().to_string();
+        assert!(err.contains("existing regular file"), "{err}");
+        std::env::remove_var("TUISHOU_TIMER_EXE");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn environment_file_must_be_root_owned_and_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("auto-update.env");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let err = validate_environment_file_at(&path).unwrap_err().to_string();
+        assert!(err.contains("writable by group or others"), "{err}");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let err = validate_environment_file_at(&path).unwrap_err().to_string();
+        assert!(err.contains("owned by root"), "{err}");
     }
 
     #[test]
