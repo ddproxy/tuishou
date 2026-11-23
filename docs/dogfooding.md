@@ -34,8 +34,8 @@ producer workflow publishes the release and its attestation separately.
 ## Check and install
 
 ```sh
-tuishou verify reiki-v0.2.1-x86_64-unknown-linux-musl.tar.gz \
-  --repo ddproxy/reiki --tag v0.2.1
+tuishou verify reiki-v0.3.0-x86_64-unknown-linux-musl.tar.gz \
+  --repo ddproxy/reiki --tag v0.3.0
 tuishou verify lu-v0.4.1-x86_64-unknown-linux-musl.tar.gz \
   --repo ddproxy/tuishou-lu --tag v0.4.1
 tuishou install reiki

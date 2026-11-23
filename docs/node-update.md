@@ -175,7 +175,7 @@ bootstrap:
           - "bash"
           - "/tmp/tuishou-install.sh"
           - "--version"
-          - "v0.2.1"
+          - "v0.3.0"
           - "--no-components"
           - "--prefix"
           - "/usr/local"

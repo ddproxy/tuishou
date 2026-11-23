@@ -213,7 +213,21 @@ fn validate_executable(path: &Path) -> Result<()> {
             .map_err(|e| Error::msg(format!("refusing {}: {e}", path.display())))?;
         let kind = meta.file_type();
         if kind.is_symlink() {
-            return Err(Error::msg(format!("refusing {}: symlink", path.display())));
+            // Distribution tools are often symlinks (alternatives, multicall coreutils). Accept
+            // one only when the link itself is owned by root or the running user and its fully
+            // resolved target passes the same checks as a plain file; the link path stays argv0.
+            if let Some(uid) = current_uid() {
+                let owner = meta.uid();
+                if owner != uid && owner != 0 {
+                    return Err(Error::msg(format!(
+                        "refusing {}: symlink owned by uid {owner}",
+                        path.display()
+                    )));
+                }
+            }
+            let target = fs::canonicalize(path)
+                .map_err(|e| Error::msg(format!("refusing {}: {e}", path.display())))?;
+            return validate_executable(&target);
         }
         if !kind.is_file() {
             return Err(Error::msg(format!(
@@ -358,6 +372,22 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_is_accepted_only_when_its_target_passes_the_same_checks() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tool-real");
+        fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.path().join("tool");
+        symlink(&target, &link).unwrap();
+        validate_executable(&link).expect("symlink to a trusted file");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o775)).unwrap();
+        let err = validate_executable(&link).unwrap_err().to_string();
+        assert!(err.contains("writable"), "{err}");
     }
 
     #[cfg(unix)]
