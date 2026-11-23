@@ -134,6 +134,14 @@ if [ "$explicit_paths" -eq 0 ]; then
   fi
 fi
 
+# Full syntax and expression check when actionlint is available (CI installs it).
+if command -v actionlint >/dev/null 2>&1; then
+  if ! (cd "$root" && actionlint .github/workflows/*.yml); then
+    echo "actionlint reported problems" >&2
+    fail=1
+  fi
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "workflow validation failed" >&2
   exit 1
