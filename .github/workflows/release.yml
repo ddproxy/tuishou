@@ -37,7 +37,8 @@ jobs:
           targets: ${{ matrix.target }}
       - name: Skip aarch64 without a musl cross-linker
         if: matrix.arch == 'aarch64' && vars.AARCH64_MUSL_LINKER == ''
-        run: echo "::notice::skipping aarch64 release target: no musl cross-linker configured"
+        run: |
+          echo "::notice::skipping aarch64 release target, no musl cross-linker configured"
       - name: Cache Rust
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Install musl tools
@@ -96,7 +97,7 @@ jobs:
       - name: Generate CycloneDX SBOM
         run: |
           cargo install cargo-cyclonedx --locked
-          cargo cyclonedx --format json --override-filename tuishou-${GITHUB_REF_NAME}.cdx
+          cargo cyclonedx --format json --override-filename "tuishou-${GITHUB_REF_NAME}.cdx"
       - name: Upload SBOM
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
