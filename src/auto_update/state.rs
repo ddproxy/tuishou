@@ -302,23 +302,37 @@ pub fn read_hold(prefix: Option<&Path>) -> Result<Option<Hold>> {
     Ok(Some(parse_hold(&text)))
 }
 
-/// A hold with an expiry in the past is inactive and is removed on sight.
+fn hold_expired(hold: &Hold) -> Result<bool> {
+    let Some(expires) = &hold.expires_at else {
+        return Ok(false);
+    };
+    let until = OffsetDateTime::parse(expires, &Rfc3339)
+        .map_err(|e| Error::msg(format!("invalid hold expiry '{expires}': {e}")))?;
+    Ok(OffsetDateTime::now_utc() >= until)
+}
+
+/// Read-only hold lookup: an expired hold is reported as inactive but is never
+/// removed here. Removing state is reserved for locked, mutating paths.
 pub fn active_hold(prefix: Option<&Path>) -> Result<Option<Hold>> {
     match read_hold(prefix)? {
         None => Ok(None),
-        Some(hold) => {
-            if let Some(expires) = &hold.expires_at {
-                let until = OffsetDateTime::parse(expires, &Rfc3339)
-                    .map_err(|e| Error::msg(format!("invalid hold expiry '{expires}': {e}")))?;
-                if OffsetDateTime::now_utc() >= until {
-                    let _ = fs::remove_file(hold_path(prefix));
-                    crate::logging::journal("hold_expired", &[]);
-                    return Ok(None);
-                }
+        Some(hold) if hold_expired(&hold)? => Ok(None),
+        Some(hold) => Ok(Some(hold)),
+    }
+}
+
+/// Remove an expired hold. Callers must hold the cycle lock.
+pub fn expire_hold(prefix: Option<&Path>) -> Result<()> {
+    if let Some(hold) = read_hold(prefix)? {
+        if hold_expired(&hold)? {
+            let path = hold_path(prefix);
+            if fs::symlink_metadata(&path).is_ok() {
+                let _ = fs::remove_file(&path);
+                crate::logging::journal("hold_expired", &[]);
             }
-            Ok(Some(hold))
         }
     }
+    Ok(())
 }
 
 pub fn write_hold(prefix: Option<&Path>, hold: &Hold) -> Result<()> {
@@ -348,6 +362,26 @@ mod tests {
         let hold = parse_hold(json);
         assert_eq!(hold.reason.as_deref(), Some("x"));
         assert!(hold.expires_at.is_some());
+    }
+
+    #[test]
+    fn active_hold_is_read_only_and_expiry_is_explicit() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        write_hold(
+            Some(prefix),
+            &Hold {
+                created_at: "2020-01-01T00:00:00Z".to_string(),
+                reason: None,
+                expires_at: Some("2020-01-02T00:00:00Z".to_string()),
+            },
+        )
+        .unwrap();
+        let path = hold_path(Some(prefix));
+        assert!(active_hold(Some(prefix)).unwrap().is_none());
+        assert!(path.exists(), "reader deleted the hold file");
+        expire_hold(Some(prefix)).unwrap();
+        assert!(!path.exists());
     }
 
     #[test]

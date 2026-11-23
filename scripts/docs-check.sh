@@ -214,14 +214,14 @@ check_drift() {
       fail "global flag missing from docs/cli.md: $flag"
   done
   for command in install update status rollback self-update completions man verify \
-    adopt auto-update; do
+    adopt auto-update top; do
     grep -qF -- "$command" "$root/docs/cli.md" ||
       fail "command missing from docs/cli.md: $command"
   done
-  if grep -qF 'tuishou top' "$root/docs/cli.md" &&
-    ! grep -qE 'not implemented|planned|reserved|does not exist' "$root/docs/cli.md"; then
-    fail 'docs/cli.md must mark tuishou top as unimplemented'
-  fi
+  grep -qF 'tuishou top' "$root/docs/cli.md" ||
+    fail 'docs/cli.md must document tuishou top'
+  grep -qF 'state' "$root/docs/top.md" ||
+    fail 'docs/top.md must document TUI state trust'
 }
 check_drift
 printf '%s\n' 'docs-check: flag drift checks passed'

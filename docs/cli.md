@@ -106,9 +106,16 @@ Opt-in scheduled updates. Requires `[auto_update] enabled = true`. Every subcomm
 
 Hidden completion hook used by the generated scripts. It runs before config loading so completion still works with a broken config. Generated scripts pass `--` followed by the typed words.
 
-### Command not present
+### `tuishou top [FLAGS]`
 
-`tuishou top` does not exist in this build. The installer prints it as planned in its next-steps block; do not call it from scripts. Use `tuishou status`.
+Host `reiki top` and `lu top` in one terminal. The `top` feature is enabled by default; a build without it exits with a usage error explaining how to rebuild.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--reiki-cmd <ARGV>` | component registry | Override the reiki child argv. |
+| `--lu-cmd <ARGV>` | component registry | Override the lu child argv. |
+
+Override strings are argument vectors, not shell commands: quotes group arguments, backslash escapes the next character, and nothing is expanded. A CLI flag wins over `[top]` config. Saved argv from state is never executed. Children are resolved through the safe program resolver and started with a cleared environment plus a small allowlist; `GITHUB_TOKEN` and `GH_TOKEN` are not inherited. TUI state is scoped to the config file and install prefix and is read only after ownership, mode and symlink checks. See [top.md](top.md).
 
 ## Exit codes
 
@@ -145,7 +152,7 @@ Installer exit codes are separate:
 | `TUISHOU_NODE_NAME` | Binary apply paths | Node identity when `[auto_update].node_name` is unset; falls back to `HOSTNAME`, then `localhost`. |
 | `NO_COLOR` | Installer and binary | The installer suppresses ANSI styling when set, and uses styling only on a terminal. The binary emits no ANSI color in any case. |
 | `TUISHOU_MAX_DOWNLOAD_BYTES` | Binary | Overrides the `200 * 1024 * 1024` byte download cap; invalid values fall back to the default. |
-| `TUISHOU_TIMER_EXE` | Binary | Executable path written into printed systemd units; default `/usr/local/bin/tuishou`. |
+| `TUISHOU_TIMER_EXE` | Binary | Executable path written into printed systemd units; default `/usr/local/bin/tuishou`. Overrides must be existing regular files in a trusted directory: `..` components are rejected, the path is canonicalized, and owner and mode are checked. |
 
 Test-only hooks are ignored by normal release binaries because they are gated behind the `test-hooks` feature:
 

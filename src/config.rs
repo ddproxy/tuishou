@@ -5,6 +5,7 @@ use crate::version;
 use serde::{Deserialize, Deserializer};
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -337,14 +338,8 @@ impl AutoUpdateConfig {
         parse_duration(&self.controller_wait_timeout)?;
         parse_duration(&self.health_timeout)?;
         parse_duration(&self.heartbeat_max_age)?;
-        if self.reiki_health_url.trim().is_empty()
-            || !self.reiki_health_url.starts_with("http://")
-                && !self.reiki_health_url.starts_with("https://")
-        {
-            return Err(Error::msg(
-                "auto_update.reiki_health_url must be an http(s) URL",
-            ));
-        }
+        crate::http::validate_health_url(&self.reiki_health_url)
+            .map_err(|e| Error::msg(format!("auto_update.reiki_health_url: {e}")))?;
         if parse_duration(&self.command_timeout)?.is_zero() {
             return Err(Error::msg(
                 "auto_update.command_timeout must be greater than zero",
@@ -464,17 +459,59 @@ pub(crate) fn current_uid() -> Option<u32> {
     None
 }
 
+/// Open the config exactly once without following a final symlink. The
+/// returned descriptor is the same one used for the trust check and the read,
+/// so the path cannot be swapped between those operations.
+#[cfg(unix)]
+fn open_config(path: &Path) -> Result<Option<fs::File>> {
+    use rustix::fs::{open, Mode, OFlags};
+    let fd = match open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => {
+            return Err(Error::msg(format!(
+                "refusing unsafe config {}: {e}",
+                path.display()
+            )))
+        }
+    };
+    let file: fs::File = fd.into();
+    Ok(Some(file))
+}
+
+#[cfg(not(unix))]
+fn open_config(path: &Path) -> Result<Option<fs::File>> {
+    match fs::File::open(path) {
+        Ok(file) => Ok(Some(file)),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(Error::Read {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 /// Refuse configs that another user can influence. Root-owned configs stay
 /// usable from unprivileged nodes (a common deployment pattern), but group or
 /// other write bits are never acceptable.
-fn check_config_trust(path: &Path) -> Result<()> {
+fn check_config_trust(file: &fs::File, path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let metadata = fs::metadata(path).map_err(|source| Error::Read {
+        let metadata = file.metadata().map_err(|source| Error::Read {
             path: path.to_path_buf(),
             source,
         })?;
+        if !metadata.file_type().is_file() {
+            return Err(Error::ConfigTrust {
+                path: path.to_path_buf(),
+                reason: "must be a regular file".to_string(),
+            });
+        }
         let mode = metadata.mode();
         if mode & 0o022 != 0 {
             return Err(Error::ConfigTrust {
@@ -495,7 +532,7 @@ fn check_config_trust(path: &Path) -> Result<()> {
         }
     }
     #[cfg(not(unix))]
-    let _ = path;
+    let _ = (file, path);
     Ok(())
 }
 
@@ -504,29 +541,30 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
     let path = config_path
         .map(PathBuf::from)
         .unwrap_or_else(default_config_path);
-    if path.exists() {
-        check_config_trust(&path)?;
-    }
-    let cfg: ConfigFile = if !path.exists() {
-        if config_path.is_some() {
+    let cfg: ConfigFile = match open_config(&path)? {
+        Some(mut file) => {
+            check_config_trust(&file, &path)?;
+            let mut text = String::new();
+            file.read_to_string(&mut text)
+                .map_err(|source| Error::Read {
+                    path: path.clone(),
+                    source,
+                })?;
+            toml::from_str(&text).map_err(|e| config_error(&path, &e.to_string()))?
+        }
+        None if config_path.is_some() => {
             return Err(Error::Read {
                 path,
                 source: std::io::Error::new(std::io::ErrorKind::NotFound, "config file not found"),
-            });
+            })
         }
-        ConfigFile {
+        None => ConfigFile {
             component: Vec::new(),
             auto_update: AutoUpdateConfig::default(),
             update: UpdateConfig::default(),
             verify: VerifyConfig::default(),
             top: TopConfig::default(),
-        }
-    } else {
-        let text = std::fs::read_to_string(&path).map_err(|source| Error::Read {
-            path: path.clone(),
-            source,
-        })?;
-        toml::from_str(&text).map_err(|e| config_error(&path, &e.to_string()))?
+        },
     };
     cfg.auto_update.validate().map_err(|e| Error::Config {
         path: path.clone(),
@@ -718,6 +756,40 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_symlink_is_refused() {
+        use std::os::unix::fs::symlink;
+        let td = tempfile::tempdir().unwrap();
+        let trusted = td.path().join("trusted.toml");
+        fs::write(&trusted, "").unwrap();
+        let link = td.path().join("tuishou.toml");
+        symlink(&trusted, &link).unwrap();
+        let err = load_config(Some(&link)).unwrap_err().to_string();
+        assert!(err.contains("refusing unsafe config"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_config_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("tuishou.toml");
+        fs::write(&path, "").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        let err = load_config(Some(&path)).unwrap_err().to_string();
+        assert!(err.contains("writable by group or others"), "{err}");
+    }
+
+    #[test]
+    fn health_url_with_userinfo_is_rejected() {
+        let c = AutoUpdateConfig {
+            reiki_health_url: "http://127.0.0.1:80@internal.example/health".to_string(),
+            ..AutoUpdateConfig::default()
+        };
+        assert!(c.validate().is_err());
     }
 
     #[test]

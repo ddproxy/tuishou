@@ -6,6 +6,7 @@ use std::time::Duration;
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const MAX_REDIRECTS: u32 = 5;
 pub const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 200 * 1024 * 1024;
+pub const MAX_ERROR_BODY_BYTES: u64 = 64 * 1024;
 pub const MAX_RATE_LIMIT_SLEEP_SECS: u64 = 30;
 
 pub fn max_download_bytes() -> u64 {
@@ -54,15 +55,45 @@ fn is_github_api(url: &str) -> bool {
     host == "api.github.com" || (host == "github.com" && path.starts_with("/api/"))
 }
 
-/// Replace any known token with a placeholder before a message is logged or
-/// returned as an error.
+/// Replace every known token and token-shaped value with a placeholder before
+/// a message is logged or returned as an error. Both token variables are
+/// independent: preferring one for auth must not hide the other from logs.
 pub fn redact_secrets(text: &str) -> String {
     let mut out = text.to_string();
-    if let Some(token) = github_token() {
-        if !token.is_empty() {
-            out = out.replace(&token, "[redacted]");
+    for key in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        if let Ok(value) = std::env::var(key) {
+            if !value.is_empty() {
+                out = out.replace(&value, "[redacted]");
+            }
         }
     }
+    redact_token_shapes(&out)
+}
+
+fn is_token_shaped(word: &str) -> bool {
+    let prefixes = ["ghp_", "gho_", "ghu_", "ghs_", "ghr_"];
+    word.len() >= 36
+        && prefixes.iter().any(|prefix| word.starts_with(prefix))
+        && word.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn redact_token_shapes(text: &str) -> String {
+    let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(is_word) {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        let len = tail.find(|c: char| !is_word(c)).unwrap_or(tail.len());
+        let word = &tail[..len];
+        if is_token_shaped(word) {
+            out.push_str("[redacted]");
+        } else {
+            out.push_str(word);
+        }
+        rest = &tail[len..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -293,14 +324,7 @@ fn resolve_location(base: &str, location: &str) -> Result<String> {
 /// http URLs are accepted, and redirects are not followed. A non-2xx response
 /// is an unhealthy component rather than a transport error.
 pub fn health_check(url: &str, timeout: Duration) -> Result<bool> {
-    let loopback = url.starts_with("http://127.0.0.1:")
-        || url.starts_with("http://localhost:")
-        || url.starts_with("http://[::1]:");
-    if !url.starts_with("https://") && !loopback {
-        return Err(Error::Http(format!(
-            "health URL must be https or loopback http: {url}"
-        )));
-    }
+    validate_health_url(url)?;
     let agent = ureq::AgentBuilder::new()
         .timeout(timeout)
         .redirects(0)
@@ -314,14 +338,45 @@ pub fn health_check(url: &str, timeout: Duration) -> Result<bool> {
     }
 }
 
+/// Health probes bypass `ensure_allowed_url`, so their URL is parsed and
+/// checked here: https to any host, or cleartext http only to an exact
+/// loopback host. Userinfo is never accepted because it can hide the real
+/// authority from a prefix check.
+pub fn validate_health_url(url: &str) -> Result<(String, u16)> {
+    if has_userinfo(url) {
+        return Err(Error::Http(
+            "health URL must not contain credentials".to_string(),
+        ));
+    }
+    let (scheme, host, port, _) = url_parts(url)?;
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    if scheme == "https" || (scheme == "http" && loopback) {
+        Ok((host, port))
+    } else {
+        Err(Error::Http(format!(
+            "health URL must be https or loopback http, got {scheme} host {host}"
+        )))
+    }
+}
+
+fn has_userinfo(url: &str) -> bool {
+    url.split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+        .map(|authority| authority.contains('@'))
+        .unwrap_or(false)
+}
+
 pub fn ensure_https(url: &str) -> Result<()> {
-    if url.starts_with("https://") {
+    if has_userinfo(url) {
+        return Err(Error::Http("URL must not contain credentials".to_string()));
+    }
+    let (scheme, host, _, _) = url_parts(url)?;
+    if scheme == "https" {
         return Ok(());
     }
     if allow_insecure_http()
-        && (url.starts_with("http://127.0.0.1:")
-            || url.starts_with("http://localhost:")
-            || url.starts_with("http://[::1]:"))
+        && scheme == "http"
+        && matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1")
     {
         return Ok(());
     }
@@ -443,8 +498,10 @@ fn read_body(resp: ureq::Response, max_bytes: u64) -> Result<String> {
 
 fn status_error(method: &str, url: &str, resp: ureq::Response) -> Error {
     let code = resp.status();
-    let body = resp.into_string().unwrap_or_default();
-    status_error_body(method, url, code, body.trim().as_bytes())
+    match read_body(resp, MAX_ERROR_BODY_BYTES) {
+        Ok(body) => status_error_body(method, url, code, body.trim().as_bytes()),
+        Err(err) => err,
+    }
 }
 
 /// Build the same redacted, one-line HTTP error from an already-read body.
@@ -478,6 +535,42 @@ mod tests {
         assert_eq!(retry_after(Some("7")), Some(7));
         assert_eq!(retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")), None);
         assert_eq!(retry_after(Some("999")), Some(MAX_RATE_LIMIT_SLEEP_SECS));
+    }
+
+    #[test]
+    fn health_url_requires_https_or_exact_loopback_without_credentials() {
+        assert!(validate_health_url("http://127.0.0.1:8080/health").is_ok());
+        assert!(validate_health_url("http://localhost:8080/health").is_ok());
+        assert!(validate_health_url("http://[::1]:8080/health").is_ok());
+        assert!(validate_health_url("https://internal.example/health").is_ok());
+        assert!(validate_health_url("http://internal.example/health").is_err());
+        assert!(validate_health_url("http://127.0.0.1:80@internal.example/health").is_err());
+        assert!(validate_health_url("https://user@internal.example/health").is_err());
+        assert!(validate_health_url("http://127.0.0.1.example/health").is_err());
+    }
+
+    #[test]
+    fn redaction_covers_both_token_variables_and_token_shapes() {
+        let _guard = crate::test_env_lock();
+        let old_primary = std::env::var_os("GITHUB_TOKEN");
+        let old_secondary = std::env::var_os("GH_TOKEN");
+        std::env::set_var("GITHUB_TOKEN", "primary-value");
+        std::env::set_var("GH_TOKEN", "secondary-value");
+        let redacted = redact_secrets("primary-value secondary-value");
+        assert!(!redacted.contains("primary-value"), "{redacted}");
+        assert!(!redacted.contains("secondary-value"), "{redacted}");
+
+        let shaped = format!("{}p_{}", "gh", "a".repeat(32));
+        let redacted = redact_secrets(&format!("prefix {shaped} suffix"));
+        assert_eq!(redacted, "prefix [redacted] suffix");
+        match old_primary {
+            Some(value) => std::env::set_var("GITHUB_TOKEN", value),
+            None => std::env::remove_var("GITHUB_TOKEN"),
+        }
+        match old_secondary {
+            Some(value) => std::env::set_var("GH_TOKEN", value),
+            None => std::env::remove_var("GH_TOKEN"),
+        }
     }
 
     #[test]

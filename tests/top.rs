@@ -164,6 +164,21 @@ fn state_dir(name: &str) -> PathBuf {
     dir
 }
 
+fn top_state_path(dir: &Path) -> PathBuf {
+    let state_dir = dir.join("tuishou");
+    let mut candidates = fs::read_dir(&state_dir)
+        .unwrap()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("top-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 1, "expected one scoped top state file");
+    candidates.pop().unwrap()
+}
+
 #[test]
 fn swapping_keeps_children_alive_and_host_restores_terminal() {
     let dir = state_dir("swap");
@@ -192,7 +207,7 @@ fn swapping_keeps_children_alive_and_host_restores_terminal() {
         text.contains("FAKE reiki count=1")
     });
 
-    let state_path = dir.join("tuishou").join("top.json");
+    let state_path = top_state_path(&dir);
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["active"], "reiki");
     assert_eq!(state["children"]["reiki"]["restart_count"], 0);
@@ -259,7 +274,7 @@ exit 2
     host.wait_for("reiki restart", |text| {
         text.contains("FAKE reiki count=0") && text.contains("reiki restarted")
     });
-    let state_path = dir.join("tuishou").join("top.json");
+    let state_path = top_state_path(&dir);
     let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
     assert_eq!(state["children"]["reiki"]["restart_count"], 1);
     host.send(&[0x02, b'q']);

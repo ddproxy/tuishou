@@ -105,8 +105,9 @@ Each \fIARGV\fR is a quoted argument string, not a shell command: quotes group
 arguments and nothing is expanded. \fB[top] reiki_cmd\fR and \fB[top] lu_cmd\fR
 in \fItuishou.toml\fR accept the same argv as arrays. Program defaults come
 from the component registry; tokens should be supplied through the child's own
-environment variables, never on the command line. The active tab, restart
-counts and last arguments are recorded under the state directory.
+environment variables, never on the command line. Children start with a cleared
+environment and a fixed PATH. The active tab and restart counts are recorded
+under a state file scoped to the config; child argv is never saved.
 .TP
 .B adopt <component> --version <tag>
 Record an existing binary in state without replacing it.
@@ -150,8 +151,9 @@ With \fB--prefix\fR this is \fI<prefix>/.tuishou\fR instead.
 Generated completions and man page; not committed to source control.
 .TP
 .I $XDG_STATE_HOME/tuishou/top.json
-Host TUI state: last active tab, per-child restart count and last arguments
-(mode 0600). With \fB--prefix\fR this is \fI<prefix>/.tuishou-top.json\fR.
+Host TUI state: last active tab and per-child restart count (mode 0600),
+scoped to the config file. With \fB--prefix\fR the file stays under
+\fI<prefix>\fR. Child argv is not stored.
 .TP
 .I $XDG_STATE_HOME/tuishou/verify-cache/
 Trusted-root cache (mode 0700); override with \fB[verify].cache_dir\fR.

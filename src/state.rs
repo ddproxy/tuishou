@@ -2,7 +2,7 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,6 +68,67 @@ pub fn top_state_path(prefix: Option<&Path>) -> PathBuf {
         }
     }
     PathBuf::from(".tuishou-top.json")
+}
+
+/// Scope TUI state to the config that produced it as well as the install
+/// prefix. A different config must never inherit argv saved by another one.
+#[cfg(feature = "top")]
+pub fn top_state_path_for_config(prefix: Option<&Path>, config_path: Option<&Path>) -> PathBuf {
+    use sha2::{Digest, Sha256};
+
+    let base = top_state_path(prefix);
+    let key = config_path
+        .map(|path| path.as_os_str().as_encoded_bytes())
+        .unwrap_or(b"default");
+    let digest = Sha256::digest(key);
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let stem = base
+        .file_stem()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "top".to_string());
+    base.with_file_name(format!("{stem}-{suffix}.json"))
+}
+
+const MAX_PRIVATE_STATE_BYTES: u64 = 1024 * 1024;
+
+/// Read a private state file from one checked descriptor: no symlink, no
+/// foreign owner, no group/other write bit and a bounded size. Unsafe or
+/// unreadable state is treated as absent by callers.
+#[cfg(unix)]
+pub fn read_private_string(path: &Path) -> Option<String> {
+    use rustix::fs::{open, Mode, OFlags};
+    use std::os::unix::fs::MetadataExt;
+
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .ok()?;
+    let mut file: File = fd.into();
+    let meta = file.metadata().ok()?;
+    if !meta.file_type().is_file() || meta.len() > MAX_PRIVATE_STATE_BYTES {
+        return None;
+    }
+    if meta.mode() & 0o022 != 0 {
+        return None;
+    }
+    if let Some(uid) = crate::config::current_uid() {
+        if meta.uid() != uid && meta.uid() != 0 {
+            return None;
+        }
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text).ok()?;
+    Some(text)
+}
+
+#[cfg(not(unix))]
+pub fn read_private_string(path: &Path) -> Option<String> {
+    fs::read_to_string(path).ok()
 }
 
 /// Side-by-side record of the checksums of verified-good `.prev` binaries.
@@ -251,6 +312,40 @@ mod tests {
             Some(value) => std::env::set_var("XDG_STATE_HOME", value),
             None => std::env::remove_var("XDG_STATE_HOME"),
         }
+    }
+
+    #[cfg(feature = "top")]
+    #[test]
+    fn top_state_path_is_scoped_to_the_config() {
+        let _g = crate::test_env_lock();
+        let td = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_STATE_HOME");
+        std::env::set_var("XDG_STATE_HOME", td.path());
+        let first = top_state_path_for_config(None, Some(Path::new("/etc/first.toml")));
+        let second = top_state_path_for_config(None, Some(Path::new("/etc/second.toml")));
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), second.parent());
+        match old {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_state_ignores_symlinks_and_writable_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("state.json");
+        fs::write(&path, "trusted").unwrap();
+        assert_eq!(read_private_string(&path).as_deref(), Some("trusted"));
+
+        let link = td.path().join("link.json");
+        symlink(&path, &link).unwrap();
+        assert_eq!(read_private_string(&link), None);
+
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+        assert_eq!(read_private_string(&path), None);
     }
 
     #[cfg(unix)]

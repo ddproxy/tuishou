@@ -23,7 +23,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::DefaultTerminal;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::fs;
+use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -407,12 +407,9 @@ struct ChildState {
 }
 
 fn load_state(path: &Path) -> TopState {
-    if !path.exists() {
-        return TopState::default();
-    }
-    match fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
-        Err(_) => TopState::default(),
+    match state::read_private_string(path) {
+        Some(text) => serde_json::from_str(&text).unwrap_or_default(),
+        None => TopState::default(),
     }
 }
 
@@ -542,10 +539,21 @@ impl Pane {
     }
 
     fn spawn_inner(&mut self, rows: u16, cols: u16, config_path: Option<&Path>) -> Result<()> {
-        let mut command = CommandBuilder::new(&self.argv[0]);
+        let program = crate::process::resolve_program_with_path(
+            &self.argv[0],
+            OsStr::new(crate::process::SAFE_PATH),
+        )?;
+        let mut command = CommandBuilder::new(&program);
         command.args(&self.argv[1..]);
+        command.env_clear();
+        command.env("PATH", crate::process::SAFE_PATH);
         let term = std::env::var_os("TERM").unwrap_or_else(|| "xterm-256color".into());
         command.env("TERM", term);
+        for key in crate::process::ENV_PASSTHROUGH {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
         if let Some(path) = config_path {
             command.env("TUISHOU_CONFIG", path);
         }
@@ -793,7 +801,9 @@ impl Host {
                 tab.label().to_string(),
                 ChildState {
                     restart_count: pane.restart_count,
-                    last_args: pane.argv.clone(),
+                    // Executable argv is never persisted: a state file must
+                    // not become a source of commands on a later run.
+                    last_args: Vec::new(),
                 },
             );
         }
@@ -1050,7 +1060,7 @@ fn command_for(
     tab: Tab,
     loaded: &LoadedConfig,
     cli_override: Option<&str>,
-    saved: &TopState,
+    _saved: &TopState,
 ) -> Result<Vec<String>> {
     let name = tab.label();
     if let Some(raw) = cli_override {
@@ -1059,11 +1069,8 @@ fn command_for(
     if let Some(argv) = loaded.top.command_for(name) {
         return Ok(argv.to_vec());
     }
-    if let Some(child) = saved.children.get(name) {
-        if !child.last_args.is_empty() {
-            return Ok(child.last_args.clone());
-        }
-    }
+    // Saved argv is deliberately ignored, even when it came from a trusted
+    // earlier run. Commands come only from the CLI or the trusted config.
     let component = crate::component::resolve_component(name, &loaded.components)?;
     let binary = component
         .binaries
@@ -1116,7 +1123,10 @@ pub fn run(
     lu_cmd: Option<&str>,
 ) -> Result<ExitCode> {
     let shutdown = register_signals();
-    let state_path = state::top_state_path(loaded.auto_update.prefix.as_deref());
+    let state_path = state::top_state_path_for_config(
+        loaded.auto_update.prefix.as_deref(),
+        Some(&loaded.config_path),
+    );
     let saved = load_state(&state_path);
     let active = saved.active_tab();
     let terminal = ratatui::try_init()
@@ -1231,6 +1241,34 @@ mod tests {
         );
         assert!(split_command("\"unterminated").is_err());
         assert!(split_command("   ").is_err());
+    }
+
+    #[test]
+    fn saved_argv_is_never_used_as_a_child_command() {
+        let td = tempfile::tempdir().unwrap();
+        let config = td.path().join("tuishou.toml");
+        std::fs::write(&config, "").unwrap();
+        let loaded = crate::config::load_config(Some(&config)).unwrap();
+        let saved = TopState {
+            active: None,
+            children: BTreeMap::from([(
+                "lu".to_string(),
+                ChildState {
+                    restart_count: 0,
+                    last_args: vec!["/no/such/payload".to_string()],
+                },
+            )]),
+        };
+        let argv = command_for(Tab::Lu, &loaded, None, &saved).unwrap();
+        assert_eq!(argv[1], "top");
+        assert!(!argv[0].contains("payload"), "{argv:?}");
+    }
+
+    #[test]
+    fn exit_hint_cannot_carry_terminal_controls() {
+        let hint = exit_hint(b"done \x1b]52;c;x\x07 \x9b31mtext", 0);
+        assert!(!hint.chars().any(char::is_control), "{hint}");
+        assert!(!hint.contains('\u{1b}'), "{hint}");
     }
 
     #[test]

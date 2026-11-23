@@ -9,3 +9,4 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/bin/tuishou --config /etc/tuishou.toml auto-update run --once
 EnvironmentFile=-/etc/tuishou/auto-update.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
