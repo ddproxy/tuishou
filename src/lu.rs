@@ -21,6 +21,9 @@ pub struct NodeStatus {
     #[serde(default)]
     /// Lu reports this as a unix timestamp in seconds; older shapes used an RFC 3339 string.
     pub last_seen: Option<serde_json::Value>,
+    /// The node's own view (`ting status --json`) reports heartbeat age instead of a timestamp.
+    #[serde(default)]
+    pub last_heartbeat_age_secs: Option<u64>,
 }
 
 pub fn parse_nodes(json: &str) -> Result<Vec<NodeStatus>, String> {
@@ -68,6 +71,9 @@ fn last_seen_time(status: &NodeStatus) -> Option<OffsetDateTime> {
 /// A status counts as fresh only with a readable heartbeat that is not in the future and not
 /// older than `max_age`; anything else fails closed.
 pub fn status_is_fresh(status: &NodeStatus, max_age: std::time::Duration) -> bool {
+    if let Some(age) = status.last_heartbeat_age_secs {
+        return std::time::Duration::from_secs(age) <= max_age;
+    }
     let Some(seen) = last_seen_time(status) else {
         return false;
     };
@@ -212,5 +218,17 @@ mod tests {
             "v0.5.1",
             std::time::Duration::from_secs(60)
         ));
+    }
+
+    #[test]
+    fn self_view_uses_heartbeat_age_as_reported_by_ting() {
+        let max = std::time::Duration::from_secs(60);
+        let body = |age: u64| {
+            format!(
+                r#"{{"name":"n1","version":"0.5.2","draining":false,"current_job":null,"last_heartbeat_age_secs":{age},"online":true}}"#
+            )
+        };
+        assert!(self_is_healthy(&body(5), "v0.5.2", max));
+        assert!(!self_is_healthy(&body(500), "v0.5.2", max));
     }
 }

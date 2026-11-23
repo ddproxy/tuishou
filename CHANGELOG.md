@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixed
+
+- Agent health reads the heartbeat age that `ting status --json` actually reports (`last_heartbeat_age_secs`); the timestamp form still works. Without this an update would fail its health check and roll back.
+
 ## [0.3.3]
 
 ### Changed
