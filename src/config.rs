@@ -450,13 +450,13 @@ pub struct LoadedConfig {
 /// Effective UID of the running process. `/proc/self` is owned by the process
 /// owner on Linux and avoids adding a libc dependency just for `geteuid()`.
 #[cfg(target_os = "linux")]
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     use std::os::unix::fs::MetadataExt;
     fs::metadata("/proc/self").ok().map(|m| m.uid())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn current_uid() -> Option<u32> {
+pub(crate) fn current_uid() -> Option<u32> {
     None
 }
 

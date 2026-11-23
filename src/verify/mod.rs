@@ -19,6 +19,9 @@ use std::time::Duration;
 
 #[cfg(feature = "test-hooks")]
 pub const FAKE_VERIFIER_ENV: &str = "TUISHOU_FAKE_ATTESTATION";
+/// When set, the fake verifier refuses instead of reporting success.
+#[cfg(feature = "test-hooks")]
+pub const FAKE_VERIFIER_FAIL_ENV: &str = "TUISHOU_FAKE_ATTESTATION_FAIL";
 
 #[derive(Debug, Clone)]
 pub struct AttestationRequest {
@@ -28,8 +31,9 @@ pub struct AttestationRequest {
     /// Expected release tag. `tuishou verify` may omit it, in which case the
     /// tag is read from the certificate SAN and must still be a tag ref.
     pub tag: Option<String>,
-    /// Expected source commit digest from the release metadata, when known.
-    pub source_digest: Option<String>,
+    /// Expected source commit digest from the release metadata. Always checked;
+    /// callers must resolve it before requesting verification.
+    pub source_digest: String,
     pub trust_root: TrustRootKind,
     pub cache_dir: PathBuf,
     pub cache_ttl: Duration,
@@ -76,15 +80,17 @@ pub fn default_verifier() -> Arc<dyn AttestationVerifier> {
 pub fn verify_attestation(request: &AttestationRequest) -> Result<AttestationReport> {
     let digest = hex_encode(&sha256_bytes(&request.path)?);
     let bundles = github::fetch_bundles(&crate::http::agent(), &request.repo, &digest)?;
+    // One read/refresh per run. Each candidate parses a fresh verifier from
+    // the same in-memory bytes because verification consumes the trust root.
+    let trust_bytes = trust::load_bytes(&request.trust_root_config(), &request.cache_dir)?;
+    let artifact_digest = decode_sha256(&digest)?;
     let mut first_error: Option<Error> = None;
     for bundle in bundles {
         match sigstore_backend::verify_bundle(
             request,
-            // The trust root is rebuilt from the same pinned bytes for each
-            // candidate bundle; verification consumes it.
-            trust::reload(&request.trust_root_config(), &request.cache_dir)?,
+            trust::parse_bytes(&trust_bytes)?,
             &bundle,
-            decode_sha256(&digest)?,
+            artifact_digest,
         ) {
             Ok(report) => return Ok(report),
             Err(e) => {
@@ -119,6 +125,11 @@ pub struct FakeAttestationVerifier;
 #[cfg(feature = "test-hooks")]
 impl AttestationVerifier for FakeAttestationVerifier {
     fn verify(&self, request: &AttestationRequest) -> Result<AttestationReport> {
+        if std::env::var_os(FAKE_VERIFIER_FAIL_ENV).is_some() {
+            return Err(Error::AttestationRefused(
+                "fake attestation verification failed".to_string(),
+            ));
+        }
         let digest = hex_encode(&sha256_bytes(&request.path)?);
         let ref_value = request
             .tag

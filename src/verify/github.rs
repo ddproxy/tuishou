@@ -9,6 +9,8 @@ use crate::http;
 
 pub const MAX_ATTESTATION_RESPONSE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_ATTESTATION_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+/// Cap candidate bundles so one response cannot trigger unbounded verification work.
+pub const MAX_ATTESTATION_BUNDLES: usize = 16;
 /// The attestation API uses 404 for both a missing attestation and an
 /// inaccessible repository. Never surface the latter as an authentication hint.
 pub const ATTESTATION_NOT_FOUND_MESSAGE: &str = "no attestation found for this digest";
@@ -78,6 +80,12 @@ pub fn parse_attestation_response(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         return Err(Error::AttestationUnavailable(
             "attestation API returned no bundles for the subject digest".to_string(),
         ));
+    }
+    if attestations.len() > MAX_ATTESTATION_BUNDLES {
+        return Err(Error::AttestationRefused(format!(
+            "attestation API returned {} bundles; limit is {MAX_ATTESTATION_BUNDLES}",
+            attestations.len()
+        )));
     }
     let mut bundles = Vec::with_capacity(attestations.len());
     for (index, entry) in attestations.iter().enumerate() {
@@ -155,6 +163,26 @@ mod tests {
         assert_eq!(bundles.len(), 1);
         let value: serde_json::Value = serde_json::from_slice(&bundles[0]).unwrap();
         assert_eq!(value["mediaType"], "x");
+    }
+
+    #[test]
+    fn rejects_too_many_bundles() {
+        let entry = r#"{"bundle":{"mediaType":"x"}}"#;
+        let body = format!(
+            "{{\"attestations\":[{}]}}",
+            vec![entry; MAX_ATTESTATION_BUNDLES].join(",")
+        );
+        assert_eq!(
+            parse_attestation_response(body.as_bytes()).unwrap().len(),
+            16
+        );
+
+        let body = format!(
+            "{{\"attestations\":[{}]}}",
+            vec![entry; MAX_ATTESTATION_BUNDLES + 1].join(",")
+        );
+        let err = parse_attestation_response(body.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("limit is 16"), "{err}");
     }
 
     #[test]

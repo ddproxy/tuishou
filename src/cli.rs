@@ -139,9 +139,9 @@ pub enum Commands {
         /// Override the expected signer workflow path
         #[arg(long)]
         signer_workflow: Option<String>,
-        /// Expected release tag (otherwise read from the certificate SAN)
+        /// Expected release tag; resolved to a source commit digest
         #[arg(long)]
-        tag: Option<String>,
+        tag: String,
     },
     #[command(
         hide = true,
@@ -267,6 +267,16 @@ fn auto_update_prefix(
     flag: Option<PathBuf>,
 ) -> Option<PathBuf> {
     flag.or_else(|| loaded.auto_update.prefix.clone())
+}
+
+/// Manual mutating commands must not interleave with an auto-update cycle.
+/// Contention fails closed with a clear message instead of queuing an install
+/// whose preflight and health decisions may already be stale.
+fn with_manual_cycle_lock<T>(prefix: Option<&Path>, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match auto_update::state::CycleLock::try_acquire(prefix)? {
+        Some(_guard) => f(),
+        None => Err(Error::msg("another tuishou update cycle is in progress")),
+    }
 }
 
 fn known_component_names(components: &[Component]) -> String {
@@ -447,55 +457,58 @@ pub fn run() -> Result<ExitCode> {
             allow_major,
             smoke_check,
         } => {
-            let targets = resolve_targets(Some(&component), &components)?;
-            let before = report::installed_versions(prefix.as_deref())?;
-            let mut reports = Vec::new();
-            for c in &targets {
-                let tag = match &version {
-                    Some(v) => release::fetch_tagged(&agent, &c.repo, v)?.tag,
-                    None => release::fetch_latest(&agent, &c.repo)?.tag,
-                };
-                let missing = match report::archive_missing_binaries(&agent, c, &tag) {
-                    Ok(m) => m,
-                    Err(e) => {
-                        reports.push(failed_report(c, &e, None, Some(tag)));
+            let lock_prefix = auto_update_prefix(&loaded, prefix.clone());
+            with_manual_cycle_lock(lock_prefix.as_deref(), || {
+                let targets = resolve_targets(Some(&component), &components)?;
+                let before = report::installed_versions(prefix.as_deref())?;
+                let mut reports = Vec::new();
+                for c in &targets {
+                    let tag = match &version {
+                        Some(v) => release::fetch_tagged(&agent, &c.repo, v)?.tag,
+                        None => release::fetch_latest(&agent, &c.repo)?.tag,
+                    };
+                    let missing = match report::archive_missing_binaries(&agent, c, &tag) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            reports.push(failed_report(c, &e, None, Some(tag)));
+                            continue;
+                        }
+                    };
+                    if !missing.is_empty() {
+                        reports.push(ComponentReport::from_parts(
+                            c,
+                            StatusText::NotInRelease {
+                                missing: missing.clone(),
+                            },
+                            None,
+                            Some(tag),
+                            missing,
+                        ));
                         continue;
                     }
-                };
-                if !missing.is_empty() {
-                    reports.push(ComponentReport::from_parts(
-                        c,
-                        StatusText::NotInRelease {
-                            missing: missing.clone(),
-                        },
-                        None,
-                        Some(tag),
-                        missing,
-                    ));
-                    continue;
+                    let previous = before.get(&c.name).map(|i| i.version.clone());
+                    let mut opts = base_install_options(
+                        &loaded,
+                        cli.verbose,
+                        Some(tag.clone()),
+                        prefix.clone(),
+                        allow_unattested,
+                        allow_major,
+                        smoke_check,
+                        true,
+                    );
+                    opts.dry_run = dry_run;
+                    match perform_install(&agent, c, &tag, &opts, &loaded, prefix.as_deref()) {
+                        Ok(()) => reports.push(updated_report(c, previous.as_deref(), &tag)),
+                        Err(e) => reports.push(failed_report(c, &e, previous, Some(tag))),
+                    }
                 }
-                let previous = before.get(&c.name).map(|i| i.version.clone());
-                let mut opts = base_install_options(
-                    &loaded,
-                    cli.verbose,
-                    Some(tag.clone()),
-                    prefix.clone(),
-                    allow_unattested,
-                    allow_major,
-                    smoke_check,
-                    true,
-                );
-                opts.dry_run = dry_run;
-                match perform_install(&agent, c, &tag, &opts, &loaded, prefix.as_deref()) {
-                    Ok(()) => reports.push(updated_report(c, previous.as_deref(), &tag)),
-                    Err(e) => reports.push(failed_report(c, &e, previous, Some(tag))),
-                }
-            }
-            report::print_reports(&reports, cli.json, cli.quiet)?;
-            Ok(if report::has_failed(&reports) {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+                report::print_reports(&reports, cli.json, cli.quiet)?;
+                Ok(if report::has_failed(&reports) {
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                })
             })
         }
         Commands::Update {
@@ -505,89 +518,101 @@ pub fn run() -> Result<ExitCode> {
             allow_unattested,
             prefix,
         } => {
-            let targets = resolve_targets(component.as_deref(), &components)?;
-            let explicit = component.is_some();
-            let installed = report::installed_versions(prefix.as_deref())?;
-            let (hold, bad) = evaluation_context(&loaded, prefix.as_deref())?;
-            let evaluated = report::evaluate_all(
-                &agent,
-                &targets,
-                prefix.as_deref(),
-                &installed,
-                hold.as_deref(),
-                &bad,
-            );
-            if check {
-                report::print_reports(&evaluated, cli.json, cli.quiet)?;
-                return Ok(if report::has_failed(&evaluated) {
+            let lock_prefix = auto_update_prefix(&loaded, prefix.clone());
+            with_manual_cycle_lock(lock_prefix.as_deref(), || {
+                let targets = resolve_targets(component.as_deref(), &components)?;
+                let explicit = component.is_some();
+                let installed = report::installed_versions(prefix.as_deref())?;
+                let (hold, bad) = evaluation_context(&loaded, prefix.as_deref())?;
+                let evaluated = report::evaluate_all(
+                    &agent,
+                    &targets,
+                    prefix.as_deref(),
+                    &installed,
+                    hold.as_deref(),
+                    &bad,
+                );
+                if check {
+                    report::print_reports(&evaluated, cli.json, cli.quiet)?;
+                    return Ok(if report::has_failed(&evaluated) {
+                        ExitCode::FAILURE
+                    } else if report::has_installable_update(&evaluated) {
+                        ExitCode::from(EXIT_UPDATES_AVAILABLE)
+                    } else {
+                        ExitCode::SUCCESS
+                    });
+                }
+
+                let command_timeout =
+                    crate::duration::parse_duration(&loaded.auto_update.command_timeout)
+                        .unwrap_or(std::time::Duration::from_secs(30));
+                if let Some(reason) = fleet::before_cycle(&loaded.update, command_timeout) {
+                    let skipped: Vec<ComponentReport> = targets
+                        .iter()
+                        .map(|c| {
+                            ComponentReport::new(
+                                c,
+                                StatusText::Skipped {
+                                    reason: reason.clone(),
+                                },
+                            )
+                        })
+                        .collect();
+                    report::print_reports(&skipped, cli.json, cli.quiet)?;
+                    return Ok(ExitCode::SUCCESS);
+                }
+
+                let mut reports = Vec::new();
+                for (c, current) in targets.iter().zip(evaluated) {
+                    let previous = current.installed_version.clone();
+                    let latest = current.latest_version.clone();
+                    match current.status_text() {
+                        StatusText::UpdateAvailable { .. } | StatusText::NotInstalled { .. } => {
+                            // An explicit `update <name>` installs a component that
+                            // is not installed yet; a bare `update` does not.
+                            if matches!(current.status_text(), StatusText::NotInstalled { .. })
+                                && !explicit
+                            {
+                                reports.push(current);
+                                continue;
+                            }
+                            let Some(tag) = latest.clone() else {
+                                reports.push(current);
+                                continue;
+                            };
+                            let opts = base_install_options(
+                                &loaded,
+                                cli.verbose,
+                                Some(tag.clone()),
+                                prefix.clone(),
+                                allow_unattested,
+                                allow_major,
+                                false,
+                                true,
+                            );
+                            match perform_install(
+                                &agent,
+                                c,
+                                &tag,
+                                &opts,
+                                &loaded,
+                                prefix.as_deref(),
+                            ) {
+                                Ok(()) => {
+                                    reports.push(updated_report(c, previous.as_deref(), &tag))
+                                }
+                                Err(e) => reports.push(failed_report(c, &e, previous, latest)),
+                            }
+                        }
+                        _ => reports.push(current),
+                    }
+                }
+                report::print_reports(&reports, cli.json, cli.quiet)?;
+                Ok(if report::has_failed(&reports) {
                     ExitCode::FAILURE
-                } else if report::has_installable_update(&evaluated) {
-                    ExitCode::from(EXIT_UPDATES_AVAILABLE)
                 } else {
                     ExitCode::SUCCESS
-                });
-            }
-
-            let command_timeout =
-                crate::duration::parse_duration(&loaded.auto_update.command_timeout)
-                    .unwrap_or(std::time::Duration::from_secs(30));
-            if let Some(reason) = fleet::before_cycle(&loaded.update, command_timeout) {
-                let skipped: Vec<ComponentReport> = targets
-                    .iter()
-                    .map(|c| {
-                        ComponentReport::new(
-                            c,
-                            StatusText::Skipped {
-                                reason: reason.clone(),
-                            },
-                        )
-                    })
-                    .collect();
-                report::print_reports(&skipped, cli.json, cli.quiet)?;
-                return Ok(ExitCode::SUCCESS);
-            }
-
-            let mut reports = Vec::new();
-            for (c, current) in targets.iter().zip(evaluated) {
-                let previous = current.installed_version.clone();
-                let latest = current.latest_version.clone();
-                match current.status_text() {
-                    StatusText::UpdateAvailable { .. } | StatusText::NotInstalled { .. } => {
-                        // An explicit `update <name>` installs a component that
-                        // is not installed yet; a bare `update` does not.
-                        if matches!(current.status_text(), StatusText::NotInstalled { .. })
-                            && !explicit
-                        {
-                            reports.push(current);
-                            continue;
-                        }
-                        let Some(tag) = latest.clone() else {
-                            reports.push(current);
-                            continue;
-                        };
-                        let opts = base_install_options(
-                            &loaded,
-                            cli.verbose,
-                            Some(tag.clone()),
-                            prefix.clone(),
-                            allow_unattested,
-                            allow_major,
-                            false,
-                            true,
-                        );
-                        match perform_install(&agent, c, &tag, &opts, &loaded, prefix.as_deref()) {
-                            Ok(()) => reports.push(updated_report(c, previous.as_deref(), &tag)),
-                            Err(e) => reports.push(failed_report(c, &e, previous, latest)),
-                        }
-                    }
-                    _ => reports.push(current),
-                }
-            }
-            report::print_reports(&reports, cli.json, cli.quiet)?;
-            Ok(if report::has_failed(&reports) {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
+                })
             })
         }
         Commands::Status { prefix } => {
@@ -603,15 +628,18 @@ pub fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Rollback { component, prefix } => {
-            let c = resolve_component(&component, &components)?;
-            rollback::rollback_binaries(&c.name, &c.binaries, prefix.as_deref(), cli.quiet)?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({"component": c.name, "rolled_back": true})
-                );
-            }
-            Ok(ExitCode::SUCCESS)
+            let lock_prefix = auto_update_prefix(&loaded, prefix.clone());
+            with_manual_cycle_lock(lock_prefix.as_deref(), || {
+                let c = resolve_component(&component, &components)?;
+                rollback::rollback_binaries(&c.name, &c.binaries, prefix.as_deref(), cli.quiet)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"component": c.name, "rolled_back": true})
+                    );
+                }
+                Ok(ExitCode::SUCCESS)
+            })
         }
         Commands::SelfUpdate {
             version,
@@ -620,37 +648,40 @@ pub fn run() -> Result<ExitCode> {
             allow_major,
             dry_run,
         } => {
-            let component = self_update::self_component(&components);
-            let bin_dir = self_update::binary_dir(prefix.as_deref())?;
-            let opts = InstallOptions {
-                version,
-                prefix: Some(bin_dir),
-                dry_run,
-                allow_unattested,
-                allow_major,
-                max_download_bytes: http::max_download_bytes(),
-                quiet: cli.quiet,
-                verbose: cli.verbose,
-                smoke_check: true,
-                staged_check: None,
-                verifier: verify::default_verifier(),
-                verify_config: loaded.verify.clone(),
-                commit_state: true,
-            };
-            let outcome = install::install_component(&agent, &component, &opts)?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "component": outcome.component,
-                        "version": outcome.version,
-                        "binaries": outcome.binaries,
-                        "dry_run": outcome.dry_run,
-                        "self": true,
-                    })
-                );
-            }
-            Ok(ExitCode::SUCCESS)
+            let lock_prefix = auto_update_prefix(&loaded, prefix.clone());
+            with_manual_cycle_lock(lock_prefix.as_deref(), || {
+                let component = self_update::self_component(&components);
+                let bin_dir = self_update::binary_dir(prefix.as_deref())?;
+                let opts = InstallOptions {
+                    version,
+                    prefix: Some(bin_dir),
+                    dry_run,
+                    allow_unattested,
+                    allow_major,
+                    max_download_bytes: http::max_download_bytes(),
+                    quiet: cli.quiet,
+                    verbose: cli.verbose,
+                    smoke_check: true,
+                    staged_check: None,
+                    verifier: verify::default_verifier(),
+                    verify_config: loaded.verify.clone(),
+                    commit_state: true,
+                };
+                let outcome = install::install_component(&agent, &component, &opts)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "component": outcome.component,
+                            "version": outcome.version,
+                            "binaries": outcome.binaries,
+                            "dry_run": outcome.dry_run,
+                            "self": true,
+                        })
+                    );
+                }
+                Ok(ExitCode::SUCCESS)
+            })
         }
         Commands::Completions { shell } => {
             let file = format!("tuishou.{}", shell.as_str());
@@ -679,17 +710,18 @@ pub fn run() -> Result<ExitCode> {
             let workflow = signer_workflow.unwrap_or_else(|| loaded.verify.signer_workflow.clone());
             verify::validate_signer_workflow(&workflow, "--signer-workflow")
                 .map_err(|e| Error::Usage(e.to_string()))?;
-            if let Some(value) = &tag {
-                verify::validate_tag(value, "--tag").map_err(|e| Error::Usage(e.to_string()))?;
-            }
+            verify::validate_tag(&tag, "--tag").map_err(|e| Error::Usage(e.to_string()))?;
+            let agent = http::agent();
+            let release = release::fetch_tagged(&agent, &repo, &tag)?;
+            let source_digest = release::fetch_source_digest(&agent, &repo, &release)?;
             let mut verify_config = loaded.verify.clone();
             verify_config.signer_workflow = workflow.clone();
             let request = AttestationRequest {
                 path: file,
                 repo,
                 signer_workflow: workflow,
-                tag,
-                source_digest: None,
+                tag: Some(tag),
+                source_digest,
                 trust_root: verify_config.trust_root.clone(),
                 cache_dir: verify_config.cache_dir(None),
                 cache_ttl: verify_config.cache_ttl()?,
@@ -739,53 +771,56 @@ pub fn run() -> Result<ExitCode> {
             version,
             prefix,
         } => {
-            let c = resolve_component(&component, &components)?;
-            let tag = release::normalize_tag(&version);
             let prefix = auto_update_prefix(&loaded, prefix);
-            let bin_dir = install::install_dir(prefix.as_deref());
-            let present: Vec<String> = c
-                .binaries
-                .iter()
-                .filter(|name| bin_dir.join(name).is_file())
-                .cloned()
-                .collect();
-            if present.is_empty() {
-                return Err(Error::msg(format!(
+            let lock_prefix = prefix.clone();
+            with_manual_cycle_lock(lock_prefix.as_deref(), || {
+                let c = resolve_component(&component, &components)?;
+                let tag = release::normalize_tag(&version);
+                let bin_dir = install::install_dir(prefix.as_deref());
+                let present: Vec<String> = c
+                    .binaries
+                    .iter()
+                    .filter(|name| bin_dir.join(name).is_file())
+                    .cloned()
+                    .collect();
+                if present.is_empty() {
+                    return Err(Error::msg(format!(
                     "adopt {}: none of the component binaries ({}) exist in {}; nothing to record",
                     c.name,
                     c.binaries.join(", "),
                     bin_dir.display()
                 )));
-            }
-            let checksum = crate::verify::sha256_file(&bin_dir.join(&present[0]))?;
-            let state_path = state::default_state_path(prefix.as_deref());
-            let mut st = state::load(&state_path)?;
-            let previous_version = st.components.get(&c.name).map(|e| e.version.clone());
-            st.components.insert(
-                c.name.clone(),
-                state::InstalledComponent {
-                    version: tag.clone(),
-                    target: crate::target::Target::detect()?.as_str().to_string(),
-                    checksum,
-                    installed_at: state::now_rfc3339()?,
-                    previous_version,
-                },
-            );
-            state::save(&state_path, &st)?;
-            if cli.json {
-                println!(
-                    "{}",
-                    serde_json::json!({
-                        "component": c.name,
-                        "version": tag,
-                        "binaries": present,
-                        "adopted": true,
-                    })
+                }
+                let checksum = crate::verify::sha256_file(&bin_dir.join(&present[0]))?;
+                let state_path = state::default_state_path(prefix.as_deref());
+                let mut st = state::load(&state_path)?;
+                let previous_version = st.components.get(&c.name).map(|e| e.version.clone());
+                st.components.insert(
+                    c.name.clone(),
+                    state::InstalledComponent {
+                        version: tag.clone(),
+                        target: crate::target::Target::detect()?.as_str().to_string(),
+                        checksum,
+                        installed_at: state::now_rfc3339()?,
+                        previous_version,
+                    },
                 );
-            } else if !cli.quiet {
-                println!("adopted {} {} ({})", c.name, tag, present.join(", "));
-            }
-            Ok(ExitCode::SUCCESS)
+                state::save(&state_path, &st)?;
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "component": c.name,
+                            "version": tag,
+                            "binaries": present,
+                            "adopted": true,
+                        })
+                    );
+                } else if !cli.quiet {
+                    println!("adopted {} {} ({})", c.name, tag, present.join(", "));
+                }
+                Ok(ExitCode::SUCCESS)
+            })
         }
         Commands::AutoUpdate(action) => match action {
             AutoUpdateAction::Run {
@@ -837,5 +872,29 @@ pub fn run() -> Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manual_commands_refuse_to_run_during_a_cycle() {
+        let td = tempfile::tempdir().unwrap();
+        let _cycle = auto_update::state::CycleLock::acquire(Some(td.path())).unwrap();
+        let err = with_manual_cycle_lock(Some(td.path()), || Ok(())).unwrap_err();
+        assert!(
+            err.to_string().contains("update cycle is in progress"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn manual_commands_release_the_cycle_lock() {
+        let td = tempfile::tempdir().unwrap();
+        with_manual_cycle_lock(Some(td.path()), || Ok(())).unwrap();
+        let guard = auto_update::state::CycleLock::try_acquire(Some(td.path())).unwrap();
+        assert!(guard.is_some());
     }
 }

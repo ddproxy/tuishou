@@ -70,6 +70,36 @@ pub fn top_state_path(prefix: Option<&Path>) -> PathBuf {
     PathBuf::from(".tuishou-top.json")
 }
 
+/// Side-by-side record of the checksums of verified-good `.prev` binaries.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct KnownGood {
+    #[serde(default)]
+    pub checksums: BTreeMap<String, String>,
+}
+
+pub fn known_good_path(state_path: &Path) -> PathBuf {
+    state_path.with_extension("known-good.json")
+}
+
+pub fn load_known_good(state_path: &Path) -> Result<KnownGood> {
+    let path = known_good_path(state_path);
+    if !path.exists() {
+        return Ok(KnownGood::default());
+    }
+    let text = fs::read_to_string(&path).map_err(|source| Error::Read {
+        path: path.clone(),
+        source,
+    })?;
+    serde_json::from_str(&text)
+        .map_err(|e| Error::msg(format!("invalid known-good record {}: {e}", path.display())))
+}
+
+pub fn save_known_good(state_path: &Path, record: &KnownGood) -> Result<()> {
+    let text = serde_json::to_string_pretty(record)
+        .map_err(|e| Error::msg(format!("failed to serialize known-good record: {e}")))?;
+    atomic_write(&known_good_path(state_path), format!("{text}\n").as_bytes())
+}
+
 pub fn load(path: &Path) -> Result<State> {
     if !path.exists() {
         return Ok(State::default());

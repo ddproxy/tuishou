@@ -38,7 +38,7 @@ serde_json_canonicalizer = "=0.4.1"
 sigstore = { version = "=0.15.0", default-features = false, features = ["verify", "sigstore-trust-root", "rustls-tls"] }
 sigstore_protobuf_specs = "=0.5.2"
 tokio = { version = "=1.54.1", default-features = false, features = ["net", "rt", "time"] }
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 sha2 = "0.11"
 tar = "0.4"
 thiserror = "2"

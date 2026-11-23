@@ -89,9 +89,9 @@ tuishou verify artifact.tar.gz \
   --tag v1.2.3
 ```
 
-`--tag` is optional; without it the tag is read from the certificate SAN, which must
-still be a `refs/tags/...` ref. Exit status is 0 when verified, 1 when refused, and 2
-for usage errors.
+`--tag` is required: it is resolved to a release commit and checked against the
+certificate source digest as well as the SAN, which must be a `refs/tags/...` ref.
+Exit status is 0 when verified, 1 when refused, and 2 for usage errors.
 
 As an **optional cross-check only**, the GitHub CLI can be used separately if it is
 installed and authenticated; this is never invoked by `tuishou` and is not required:

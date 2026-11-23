@@ -910,6 +910,55 @@ fn absolute_config_path(config_path: Option<&Path>) -> Result<PathBuf> {
     absolute_path(config_path, "config path")
 }
 
+/// Reject values that systemd would split, expand or reinterpret. The unit is
+/// printed for an operator to install, so it must not contain surprises.
+fn validate_unit_value(value: &str, label: &str) -> Result<()> {
+    let unsafe_char = value
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '%' | '$' | '"' | '\'' | '\\'));
+    if value.is_empty() || unsafe_char {
+        return Err(Error::msg(format!(
+            "{label} contains characters that cannot be safely embedded in a systemd unit"
+        )));
+    }
+    Ok(())
+}
+
+fn timer_executable() -> Result<String> {
+    let exe =
+        std::env::var("TUISHOU_TIMER_EXE").unwrap_or_else(|_| "/usr/local/bin/tuishou".to_string());
+    validate_unit_value(&exe, "TUISHOU_TIMER_EXE")?;
+    let path = Path::new(&exe);
+    if !path.is_absolute() {
+        return Err(Error::msg(
+            "TUISHOU_TIMER_EXE must be an absolute path in a trusted directory",
+        ));
+    }
+    let trusted = ["/usr/local/bin", "/usr/bin", "/bin", "/opt/tuishou/bin"];
+    if !trusted.iter().any(|dir| path.starts_with(dir)) {
+        return Err(Error::msg(
+            "TUISHOU_TIMER_EXE must be under /usr/local/bin, /usr/bin, /bin or /opt/tuishou/bin",
+        ));
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() || !meta.is_file() {
+            return Err(Error::msg(
+                "TUISHOU_TIMER_EXE must be a regular file, not a symlink",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if meta.permissions().mode() & 0o022 != 0 {
+                return Err(Error::msg(
+                    "TUISHOU_TIMER_EXE must not be group/other-writable",
+                ));
+            }
+        }
+    }
+    Ok(exe)
+}
+
 fn timer_units(
     interval_override: Option<&str>,
     config_path: Option<&Path>,
@@ -929,14 +978,15 @@ fn timer_units(
     } else {
         jitter
     };
-    let exe =
-        std::env::var("TUISHOU_TIMER_EXE").unwrap_or_else(|_| "/usr/local/bin/tuishou".to_string());
+    let exe = timer_executable()?;
     let config = absolute_config_path(config_path)?;
+    validate_unit_value(&config.to_string_lossy(), "config path")?;
     let prefix_arg = match prefix {
-        Some(p) => format!(
-            " --prefix {}",
-            absolute_path(Some(p), "install prefix")?.display()
-        ),
+        Some(p) => {
+            let path = absolute_path(Some(p), "install prefix")?;
+            validate_unit_value(&path.to_string_lossy(), "install prefix")?;
+            format!(" --prefix {}", path.display())
+        }
         None => String::new(),
     };
     let service = format!(
@@ -948,6 +998,7 @@ fn timer_units(
          \n\
          [Service]\n\
          Type=oneshot\n\
+         Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
          ExecStart={exe} --config {} auto-update run --once{}\n\
          EnvironmentFile=-/etc/tuishou/auto-update.env\n",
         config.display(),
@@ -985,6 +1036,7 @@ mod tests {
 
     #[test]
     fn generated_timer_uses_boot_and_active_timers_and_absolute_config() {
+        let _guard = crate::test_env_lock();
         let (service, timer) =
             timer_units(Some("10m"), Some(Path::new("relative.toml")), None, "10m").unwrap();
         assert!(timer.contains("OnBootSec=10m"));
@@ -1007,7 +1059,42 @@ mod tests {
     }
 
     #[test]
+    fn generated_timer_pins_path_and_rejects_unsafe_values() {
+        let _guard = crate::test_env_lock();
+        let (service, _) = timer_units(None, Some(Path::new("tuishou.toml")), None, "15m").unwrap();
+        assert!(
+            service.contains("Environment=PATH=/usr/local/sbin:/usr/local/bin"),
+            "{service}"
+        );
+
+        let err = timer_units(None, Some(Path::new("bad%i.toml")), None, "15m").unwrap_err();
+        assert!(err.to_string().contains("systemd unit"), "{err}");
+
+        let err = timer_units(
+            None,
+            Some(Path::new("tuishou.toml")),
+            Some(Path::new("bad prefix")),
+            "15m",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("systemd unit"), "{err}");
+    }
+
+    #[test]
+    fn timer_executable_must_be_trusted_and_absolute() {
+        let _guard = crate::test_env_lock();
+        std::env::set_var("TUISHOU_TIMER_EXE", "/tmp/attacker-bin");
+        let err = timer_units(None, Some(Path::new("tuishou.toml")), None, "15m").unwrap_err();
+        assert!(err.to_string().contains("must be under"), "{err}");
+        std::env::set_var("TUISHOU_TIMER_EXE", "tuishou");
+        let err = timer_units(None, Some(Path::new("tuishou.toml")), None, "15m").unwrap_err();
+        assert!(err.to_string().contains("absolute path"), "{err}");
+        std::env::remove_var("TUISHOU_TIMER_EXE");
+    }
+
+    #[test]
     fn generated_timer_carries_an_absolute_prefix() {
+        let _guard = crate::test_env_lock();
         let (service, timer) = timer_units(
             None,
             Some(Path::new("tuishou.toml")),

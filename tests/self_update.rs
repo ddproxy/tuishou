@@ -116,7 +116,7 @@ fn release_routes(base: &str, archive: &[u8], checksum: &str, tag: &str) -> Vec<
     let asset = format!("tuishou-{tag}-{}.tar.gz", target());
     let checksum_name = format!("{asset}.sha256");
     let json = serde_json::json!({
-        "tag_name": tag,
+        "target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name": tag,
         "body": format!("## {tag}\n- self update\n"),
         "assets": [
             {"name": asset, "browser_download_url": format!("{base}/dl/{asset}")},
@@ -255,6 +255,48 @@ fn self_update_smoke_failure_leaves_binary_in_place() {
     assert_eq!(fs::read(&binary).unwrap(), original);
     assert!(!install_dir.join("tuishou.prev").exists());
     assert!(!install_dir.join(".tuishou.json").exists());
+}
+
+#[test]
+fn unattested_archive_never_executes_release_code() {
+    let td = tempfile::tempdir().unwrap();
+    let home = td.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let install_dir = td.path().join("prefix");
+    let binary = copy_binary_to(&install_dir);
+    let marker = td.path().join("release-code-executed");
+    let replacement = format!(
+        "#!/bin/sh\ntouch {}\necho 'tuishou 9.9.9'\n",
+        marker.display()
+    );
+    let archive = tar_gz(&[("tuishou", replacement.as_bytes())]);
+    let checksum = format!(
+        "{}  tuishou-v0.2.0-{}.tar.gz\n",
+        sha256_hex(&archive),
+        target()
+    );
+    let server = FakeServer::start_with(|base| release_routes(base, &archive, &checksum, "v0.2.0"));
+
+    let mut cmd = Command::new(&binary);
+    env_for(&mut cmd, &server, &home);
+    cmd.env("TUISHOU_FAKE_ATTESTATION_FAIL", "1");
+    cmd.args(["self-update", "--version", "v0.2.0", "--prefix"])
+        .arg(&install_dir)
+        .arg("--allow-unattested");
+    let out = cmd.output().unwrap();
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("staged checks are skipped"),
+        "stderr={stderr}"
+    );
+    assert!(!marker.exists(), "unverified release code was executed");
+    assert_eq!(fs::read(&binary).unwrap(), replacement.as_bytes());
 }
 
 #[test]

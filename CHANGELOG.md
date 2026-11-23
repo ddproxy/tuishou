@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- Added `install.sh --expect-sha256 <digest>` to verify the bootstrap archive before extraction. The digest must come from an independent trusted record; the same-release `.sha256` is only a consistency check.
+- Installs now record a `.known-good.json` sidecar beside state. Rollback refuses a `.prev` file without a matching recorded checksum.
+
+### Changed
+
+- `tuishou verify` now requires `--tag`; the tag is resolved to a source commit and checked against the certificate source digest.
+- Manual `install`, `update`, `rollback`, `self-update` and `adopt` take the auto-update cycle lock. Contention fails with `another tuishou update cycle is in progress` instead of interleaving with a cycle.
+- `--allow-unattested` no longer executes release-provided code: staged checks and smoke checks are skipped when attestation failed.
+- Generated systemd units pin `PATH` and restrict `TUISHOU_TIMER_EXE` to an absolute regular file under `/usr/local/bin`, `/usr/bin`, `/bin` or `/opt/tuishou/bin`. Config and prefix values containing whitespace, `%`, quotes, `$` or backslashes are refused.
+- Configured trust-root and cache paths are ownership- and symlink-checked; missing release `target_commitish` is now a refusal, and release `tag_name` must match the requested tag.
+
+### Fixed
+
+- Install temps use random `O_EXCL` files with private modes; symlinked or group/other-writable prefixes and backup targets are refused, and failed commits leave no orphaned temp files.
+- Attestation responses accept at most 16 bundles and load trust material once per verification run.
+- Skipped archive entries are bounded by one total decompressed-byte counter.
+- Reiki recovery stays drained when restore, restart or restored-health checks fail; controller idleness is rechecked before backup/restart and state-commit failures trigger recovery.
+- Child processes use a fixed minimal environment, vetted absolute executables, bounded output and deadline coverage that includes descendants holding output pipes.
+- Deferred installs preserve the current binary as `.prev` and record its checksum before health checks, so a failed first update can roll back to a verified known-good backup.
+
 ### Removed
 
 - Removed `tuishou roll`, the remote SSH runner and the inventory file format, together with their docs, examples, man page entries, completions and tests. Config sections belonging to them are now unknown keys. `tuishou update` and `auto-update` are the only update paths; each node updates itself.

@@ -277,12 +277,18 @@ fn check_certificate_policy(
             "source digest extension is not a hex digest: {digest}"
         )));
     }
-    if let Some(expected) = &request.source_digest {
-        if !digest.eq_ignore_ascii_case(expected) {
-            return Err(Error::AttestationRefused(format!(
-                "source digest mismatch: expected {expected}, got {digest}"
-            )));
-        }
+    let expected = &request.source_digest;
+    if !(expected.len() == 40 || expected.len() == 64)
+        || !expected.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(Error::AttestationRefused(
+            "expected source digest is not a hex digest".into(),
+        ));
+    }
+    if !digest.eq_ignore_ascii_case(expected) {
+        return Err(Error::AttestationRefused(format!(
+            "source digest mismatch: expected {expected}, got {digest}"
+        )));
     }
     Ok(())
 }
@@ -479,7 +485,7 @@ mod tests {
             repo: "ddproxy/tuishou".to_string(),
             signer_workflow: ".github/workflows/release.yml".to_string(),
             tag: Some("v0.1.0".to_string()),
-            source_digest: None,
+            source_digest: fixture_source_digest(),
             trust_root: TrustRootKind::Embedded,
             cache_dir: PathBuf::from("/tmp/unused"),
             cache_ttl: std::time::Duration::from_secs(3600),
@@ -507,6 +513,16 @@ mod tests {
         out
     }
 
+    fn fixture_source_digest() -> String {
+        let bundle: Bundle = serde_json::from_slice(TUISHOU_V010_BUNDLE).unwrap();
+        let materials = parse_materials(&bundle).unwrap();
+        first_extension(
+            &materials.certificate,
+            &[OID_SOURCE_DIGEST_NEW, OID_SOURCE_DIGEST_LEGACY],
+        )
+        .unwrap()
+    }
+
     #[test]
     fn a_real_release_attestation_verifies() {
         let report = verify_bundle(
@@ -518,6 +534,22 @@ mod tests {
         .unwrap();
         assert_eq!(report.digest, TUISHOU_V010_DIGEST);
         assert_eq!(report.ref_value, "refs/tags/v0.1.0");
+    }
+
+    #[test]
+    fn mismatched_source_digest_is_refused() {
+        let mut wrong = request();
+        let mut digest = wrong.source_digest.into_bytes();
+        digest[0] = if digest[0] == b'a' { b'b' } else { b'a' };
+        wrong.source_digest = String::from_utf8(digest).unwrap();
+        let err = verify_bundle(
+            &wrong,
+            trust_root(),
+            TUISHOU_V010_BUNDLE,
+            digest_bytes(TUISHOU_V010_DIGEST),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("source digest mismatch"), "{err}");
     }
 
     #[test]

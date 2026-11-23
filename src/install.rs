@@ -8,8 +8,13 @@ use crate::state::{self, InstalledComponent};
 use crate::target::Target;
 use crate::verify::{self, AttestationRequest, AttestationVerifier};
 use std::fs;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tempfile::NamedTempFile;
+
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 /// A check run against a staged release binary before any installed file is
 /// replaced. Only the verified, extracted binary is executed.
@@ -174,15 +179,23 @@ pub fn install_component(
         cache_dir: opts.verify_config.cache_dir(opts.prefix.as_deref()),
         cache_ttl: opts.verify_config.cache_ttl()?,
     };
-    if let Err(e) = opts.verifier.verify(&request) {
-        if opts.allow_unattested {
+    let verified = match opts.verifier.verify(&request) {
+        Ok(_) => true,
+        Err(e) => {
+            if !opts.allow_unattested {
+                return Err(e);
+            }
             eprintln!(
                 "tuishou: attestation verification failed; continuing because --allow-unattested was set: {}",
                 crate::http::redact_secrets(&e.to_string())
             );
-        } else {
-            return Err(e);
+            false
         }
+    };
+    if !verified && (opts.smoke_check || opts.staged_check.is_some()) {
+        eprintln!(
+            "tuishou: refusing to execute release code from an unverified archive; staged checks are skipped"
+        );
     }
 
     let extract_dir = tmp.path().join("extract");
@@ -207,34 +220,39 @@ pub fn install_component(
         path: bin_dir.clone(),
         source,
     })?;
+    check_bin_dir(&bin_dir)?;
 
-    if let Some(check) = &opts.staged_check {
-        let staged = extract_dir.join(&check.binary);
-        let args: Vec<&str> = check.args.iter().map(String::as_str).collect();
-        let out = crate::process::checked(
-            &staged.to_string_lossy(),
-            &args,
-            std::time::Duration::from_secs(30),
-        )
-        .map_err(|e| Error::StagedCheckFailed {
-            binary: check.binary.clone(),
-            detail: e.to_string(),
-        })?;
-        if out.status != 0 {
-            return Err(Error::StagedCheckFailed {
+    // A verified archive may run staged checks. An explicitly accepted
+    // unattested archive is installed, but its code is never executed.
+    if verified {
+        if let Some(check) = &opts.staged_check {
+            let staged = extract_dir.join(&check.binary);
+            let args: Vec<&str> = check.args.iter().map(String::as_str).collect();
+            let out = crate::process::checked(
+                &staged.to_string_lossy(),
+                &args,
+                std::time::Duration::from_secs(30),
+            )
+            .map_err(|e| Error::StagedCheckFailed {
                 binary: check.binary.clone(),
-                detail: format!("exit status {}", out.status),
-            });
+                detail: e.to_string(),
+            })?;
+            if out.status != 0 {
+                return Err(Error::StagedCheckFailed {
+                    binary: check.binary.clone(),
+                    detail: format!("exit status {}", out.status),
+                });
+            }
+            crate::logging::journal(
+                "staged_check_ok",
+                &[("component", &component.name), ("binary", &check.binary)],
+            );
         }
-        crate::logging::journal(
-            "staged_check_ok",
-            &[("component", &component.name), ("binary", &check.binary)],
-        );
-    }
-    if opts.smoke_check {
-        // Validate the staged binaries in place: a failed smoke check must
-        // leave the installed binaries and their `.prev` files untouched.
-        smoke_check(&extract_dir, &installed_names)?;
+        if opts.smoke_check {
+            // Validate the staged binaries in place: a failed smoke check must
+            // leave the installed binaries and their `.prev` files untouched.
+            smoke_check(&extract_dir, &installed_names)?;
+        }
     }
 
     let receipt = InstallReceipt {
@@ -242,7 +260,15 @@ pub fn install_component(
         target: target.as_str().to_string(),
         installed_at: state::now_rfc3339()?,
     };
-    commit_binaries(&extracted, &bin_dir)?;
+    // Deferred callers confirm health before recording state. Keep `.prev`
+    // intact for them so it still names the last confirmed-good version.
+    commit_binaries(&extracted, &bin_dir, !opts.commit_state)?;
+    // Bind `.prev` before any deferred health check: a failed check must be
+    // able to restore a recorded known-good backup even on the first update
+    // of an install made before this record existed.
+    if !opts.commit_state {
+        record_known_good(component, &tag, opts.prefix.as_deref())?;
+    }
     if opts.commit_state {
         record_installed(component, &tag, &receipt, opts.prefix.as_deref())?;
     }
@@ -257,6 +283,29 @@ pub fn install_component(
         dry_run: false,
         receipt: Some(receipt),
     })
+}
+
+/// Record checksums for the preserved `.prev` binaries.
+///
+/// Deferred callers leave `.prev` untouched until health succeeds, so this
+/// record names the last confirmed-good bytes rather than the last bytes
+/// merely installed. It must be written before any rollback can be attempted.
+pub fn record_known_good(
+    component: &Component,
+    version: &str,
+    prefix: Option<&Path>,
+) -> Result<()> {
+    let state_path = state::default_state_path(prefix);
+    let bin_dir = install_dir(prefix);
+    let mut good = state::load_known_good(&state_path)?;
+    for name in component.expected_binaries(version) {
+        let prev = bin_dir.join(format!("{name}.prev"));
+        if is_safe_regular_file(&prev) {
+            good.checksums
+                .insert(name, crate::verify::sha256_file(&prev)?);
+        }
+    }
+    state::save_known_good(&state_path, &good)
 }
 
 /// Record an install after a deferred health check has confirmed it.
@@ -282,24 +331,33 @@ pub fn record_installed(
             previous_version,
         },
     );
-    state::save(&state_path, &st)
+    state::save(&state_path, &st)?;
+    record_known_good(component, version, prefix)
 }
 
 /// Commit every staged binary, restoring destinations and the last good
 /// `.prev` if any step fails. `.prev` is only replaced after all new binaries
-/// are in place.
-fn commit_binaries(extracted: &[archive::ExtractedBinary], bin_dir: &Path) -> Result<()> {
+/// are in place. All temporary files use random `O_EXCL` names and are kept as
+/// RAII guards so a failed step cannot leave orphaned backups behind.
+fn commit_binaries(
+    extracted: &[archive::ExtractedBinary],
+    bin_dir: &Path,
+    keep_prev: bool,
+) -> Result<()> {
     fs::create_dir_all(bin_dir).map_err(|source| Error::Write {
         path: bin_dir.to_path_buf(),
         source,
     })?;
+    check_bin_dir(bin_dir)?;
 
     struct Pending {
         dest: PathBuf,
-        staged: PathBuf,
-        dest_backup: Option<PathBuf>,
+        staged: Option<NamedTempFile>,
+        dest_backup: Option<NamedTempFile>,
         prev: PathBuf,
-        prev_backup: Option<PathBuf>,
+        prev_backup: Option<NamedTempFile>,
+        dest_committed: bool,
+        prev_committed: bool,
     }
 
     let mut pending: Vec<Pending> = Vec::new();
@@ -307,145 +365,252 @@ fn commit_binaries(extracted: &[archive::ExtractedBinary], bin_dir: &Path) -> Re
         for bin in extracted {
             let dest = bin_dir.join(&bin.name);
             let prev = bin_dir.join(format!("{}.prev", bin.name));
-            let dest_backup = if dest.exists() {
-                let path = unique_temp(bin_dir, &format!(".{}.backup-", bin.name));
-                fs::copy(&dest, &path).map_err(|source| Error::Write {
-                    path: path.clone(),
-                    source,
-                })?;
-                Some(path)
-            } else {
-                None
-            };
-            let prev_backup = if prev.exists() {
-                let path = unique_temp(bin_dir, &format!(".{}.prevkeep-", bin.name));
-                fs::copy(&prev, &path).map_err(|source| Error::Write {
-                    path: path.clone(),
-                    source,
-                })?;
-                Some(path)
-            } else {
-                None
-            };
-            let staged = unique_temp(bin_dir, &format!(".{}.commit-", bin.name));
-            fs::copy(&bin.path, &staged).map_err(|source| Error::Write {
-                path: staged.clone(),
-                source,
-            })?;
-            make_executable(&staged)?;
+            let staged = copy_into_temp(&bin.path, bin_dir, &format!(".{}.commit-", bin.name))?;
+            set_executable(&staged)?;
+            let dest_backup = backup_if_present(&dest, bin_dir, &format!(".{}.backup-", bin.name))?;
+            let prev_backup =
+                backup_if_present(&prev, bin_dir, &format!(".{}.prevkeep-", bin.name))?;
             pending.push(Pending {
                 dest,
-                staged,
+                staged: Some(staged),
                 dest_backup,
                 prev,
                 prev_backup,
+                dest_committed: false,
+                prev_committed: false,
             });
         }
-        for item in &pending {
-            fs::rename(&item.staged, &item.dest).map_err(|source| Error::Write {
-                path: item.dest.clone(),
-                source,
-            })?;
+        for item in &mut pending {
+            let staged = item
+                .staged
+                .take()
+                .ok_or_else(|| Error::msg("internal error: staged binary was already committed"))?;
+            persist_temp(staged, &item.dest)?;
+            item.dest_committed = true;
         }
-        for item in &pending {
-            if let Some(backup) = &item.dest_backup {
-                fs::rename(backup, &item.prev).map_err(|source| Error::Write {
-                    path: item.prev.clone(),
-                    source,
-                })?;
+        if keep_prev {
+            // Deferred callers confirm health before committing state. If no
+            // `.prev` exists yet, the current binary is the last known good
+            // one and must be preserved as the rollback target now.
+            for item in &mut pending {
+                if is_safe_regular_file(&item.prev) {
+                    continue;
+                }
+                if fs::symlink_metadata(&item.prev).is_ok() {
+                    return Err(Error::msg(format!(
+                        "refusing unsafe backup target {}",
+                        item.prev.display()
+                    )));
+                }
+                if let Some(backup) = &item.dest_backup {
+                    let name = item.dest.file_name().unwrap_or_default().to_string_lossy();
+                    let staged =
+                        copy_into_temp(backup.path(), bin_dir, &format!(".{name}.previnit-"))?;
+                    set_executable(&staged)?;
+                    persist_temp(staged, &item.prev)?;
+                    item.prev_committed = true;
+                }
+            }
+        } else {
+            for item in &mut pending {
+                if let Some(backup) = item.dest_backup.take() {
+                    persist_temp(backup, &item.prev)?;
+                    item.prev_committed = true;
+                }
             }
         }
         Ok(())
     })();
 
     if let Err(e) = result {
-        // Restore the last good `.prev` first, then the installed binaries.
-        for item in pending.iter().rev() {
-            match &item.prev_backup {
-                Some(backup) => {
-                    let _ = fs::rename(backup, &item.prev);
-                }
-                None => {
-                    let _ = fs::remove_file(&item.prev);
-                }
+        // Restore `.prev` first, then the installed binaries. NamedTempFile
+        // drops clean up any staging files that were never committed.
+        for item in pending.iter_mut().rev() {
+            if let Some(backup) = item.prev_backup.take() {
+                let _ = persist_temp(backup, &item.prev);
+            } else if item.prev_committed {
+                let _ = fs::remove_file(&item.prev);
             }
-        }
-        for item in pending.iter().rev() {
-            match &item.dest_backup {
-                Some(backup) => {
-                    let _ = fs::rename(backup, &item.dest);
-                }
-                None => {
-                    let _ = fs::remove_file(&item.dest);
-                }
+            if let Some(backup) = item.dest_backup.take() {
+                let _ = persist_temp(backup, &item.dest);
+            } else if item.dest_committed {
+                let _ = fs::remove_file(&item.dest);
             }
-        }
-        for item in &pending {
-            let _ = fs::remove_file(&item.staged);
         }
         return Err(e);
     }
+    Ok(())
+}
 
-    for item in &pending {
-        if let Some(backup) = &item.prev_backup {
-            let _ = fs::remove_file(backup);
+/// Restore `<name>.prev` over the installed binary. The `.prev` file itself is
+/// left untouched so it remains the recorded last-known-good snapshot.
+pub fn restore_previous_binary(bin_dir: &Path, name: &str) -> Result<()> {
+    check_bin_dir(bin_dir)?;
+    let dest = bin_dir.join(name);
+    let prev = bin_dir.join(format!("{name}.prev"));
+    if !is_safe_regular_file(&prev) {
+        return Err(Error::NoPrevious(name.to_string()));
+    }
+    let restored = copy_into_temp(&prev, bin_dir, &format!(".{name}.restore-"))?;
+    set_executable(&restored)?;
+    persist_temp(restored, &dest)
+}
+
+/// Reject a prefix that is a symlink, has a symlinked parent, is not a
+/// directory, is group/other-writable, or is owned by another user. A
+/// privileged install into a writable prefix must fail closed.
+fn check_bin_dir(bin_dir: &Path) -> Result<()> {
+    if bin_dir.as_os_str().is_empty() {
+        return Err(Error::msg("install prefix must not be empty"));
+    }
+    let components: Vec<_> = bin_dir.components().collect();
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component.as_os_str());
+        let meta = fs::symlink_metadata(&current).map_err(|source| Error::Read {
+            path: current.clone(),
+            source,
+        })?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::msg(format!(
+                "refusing symlink in install prefix: {}",
+                current.display()
+            )));
+        }
+        if index + 1 < components.len() && !meta.is_dir() {
+            return Err(Error::msg(format!(
+                "install prefix component is not a directory: {}",
+                current.display()
+            )));
+        }
+    }
+    let meta = fs::symlink_metadata(bin_dir).map_err(|source| Error::Read {
+        path: bin_dir.to_path_buf(),
+        source,
+    })?;
+    if !meta.is_dir() {
+        return Err(Error::msg(format!(
+            "install prefix is not a directory: {}",
+            bin_dir.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        if meta.permissions().mode() & 0o022 != 0 {
+            return Err(Error::msg(format!(
+                "refusing group/other-writable install prefix: {}",
+                bin_dir.display()
+            )));
+        }
+        let euid = rustix::process::geteuid().as_raw();
+        if meta.uid() != euid {
+            return Err(Error::msg(format!(
+                "refusing install prefix owned by uid {} ({})",
+                meta.uid(),
+                bin_dir.display()
+            )));
         }
     }
     Ok(())
 }
 
-/// Restore `<name>.prev` over the installed binary, keeping the last known
-/// good `.prev` in place so a later retry cannot overwrite it with a bad build.
-pub fn restore_previous_binary(bin_dir: &Path, name: &str) -> Result<()> {
-    let dest = bin_dir.join(name);
-    let prev = bin_dir.join(format!("{name}.prev"));
-    if !prev.exists() {
-        return Err(Error::NoPrevious(name.to_string()));
+fn is_safe_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_file())
+        .unwrap_or(false)
+}
+
+/// Make a private, unpredictable temporary file inside `dir`. `tempfile`
+/// creates it with `O_EXCL` and mode 0600, so an attacker cannot substitute it
+/// after the name is chosen.
+fn private_temp(dir: &Path, prefix: &str) -> Result<NamedTempFile> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(prefix).rand_bytes(16);
+    builder.tempfile_in(dir).map_err(|source| {
+        Error::msg(format!(
+            "failed to create temporary file in {}: {source}",
+            dir.display()
+        ))
+    })
+}
+
+#[cfg(unix)]
+fn open_regular_no_follow(path: &Path) -> Result<fs::File> {
+    use rustix::fs::{open, Mode, OFlags};
+    let fd = open(
+        path,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|e| Error::msg(format!("refusing unsafe source {}: {e}", path.display())))?;
+    let file: fs::File = fd.into();
+    let meta = file.metadata().map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !meta.file_type().is_file() {
+        return Err(Error::msg(format!(
+            "refusing unsafe source {}: not a regular file",
+            path.display()
+        )));
     }
-    let tmp = unique_temp(bin_dir, &format!(".{name}.restore-"));
-    fs::copy(&prev, &tmp).map_err(|source| Error::Write {
-        path: tmp.clone(),
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_regular_no_follow(path: &Path) -> Result<fs::File> {
+    if !is_safe_regular_file(path) {
+        return Err(Error::msg(format!(
+            "refusing unsafe source {}",
+            path.display()
+        )));
+    }
+    fs::File::open(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn copy_into_temp(src: &Path, dir: &Path, prefix: &str) -> Result<NamedTempFile> {
+    let mut input = open_regular_no_follow(src)?;
+    let mut tmp = private_temp(dir, prefix)?;
+    std::io::copy(&mut input, tmp.as_file_mut()).map_err(|source| Error::Write {
+        path: tmp.path().to_path_buf(),
         source,
     })?;
-    make_executable(&tmp)?;
-    fs::rename(&tmp, &dest).map_err(|source| Error::Write {
-        path: dest.clone(),
-        source,
-    })?;
-    // Refresh `.prev` from the restored good binary (same bytes).
-    let keep = unique_temp(bin_dir, &format!(".{name}.keep-"));
-    fs::copy(&dest, &keep).map_err(|source| Error::Write {
-        path: keep.clone(),
-        source,
-    })?;
-    fs::rename(&keep, &prev).map_err(|source| Error::Write { path: prev, source })?;
+    Ok(tmp)
+}
+
+fn backup_if_present(path: &Path, dir: &Path, prefix: &str) -> Result<Option<NamedTempFile>> {
+    if !is_safe_regular_file(path) {
+        if fs::symlink_metadata(path).is_ok() {
+            return Err(Error::msg(format!(
+                "refusing unsafe install target {}",
+                path.display()
+            )));
+        }
+        return Ok(None);
+    }
+    copy_into_temp(path, dir, prefix).map(Some)
+}
+
+fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<()> {
+    temp.persist(dest)
+        .map_err(|e| Error::msg(format!("failed to commit {}: {}", dest.display(), e.error)))?;
     Ok(())
 }
 
-fn make_executable(path: &Path) -> Result<()> {
+fn set_executable(file: &NamedTempFile) -> Result<()> {
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(path)
-            .map_err(|source| Error::Write {
-                path: path.to_path_buf(),
-                source,
-            })?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(path, perms).map_err(|source| Error::Write {
-            path: path.to_path_buf(),
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o755))
+        .map_err(|source| Error::Write {
+            path: file.path().to_path_buf(),
             source,
         })?;
-    }
     #[cfg(not(unix))]
-    let _ = path;
+    let _ = file;
     Ok(())
-}
-
-fn unique_temp(dir: &Path, prefix: &str) -> PathBuf {
-    let nanos = now_nanos();
-    dir.join(format!("{prefix}{}-{nanos}", std::process::id()))
 }
 
 pub fn install_dir(prefix: Option<&Path>) -> PathBuf {
@@ -494,13 +659,6 @@ fn tempfile_dir() -> Result<tempfile::TempDir> {
         .map_err(|source| Error::msg(format!("failed to create temporary directory: {source}")))
 }
 
-fn now_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-}
-
 pub fn major_version(tag: &str) -> Option<u64> {
     let v = tag.strip_prefix('v').unwrap_or(tag);
     let major = v.split('.').next()?;
@@ -532,5 +690,119 @@ mod tests {
         let path = a.path().to_path_buf();
         drop(a);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn temp_files_are_private_and_random() {
+        let td = tempfile::tempdir().unwrap();
+        let a = private_temp(td.path(), ".lu.commit-").unwrap();
+        let b = private_temp(td.path(), ".lu.commit-").unwrap();
+        assert_ne!(a.path(), b.path());
+        assert!(a
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".lu.commit-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(a.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn commit_rejects_symlinked_backup_target() {
+        #[cfg(unix)]
+        {
+            let td = tempfile::tempdir().unwrap();
+            let bin_dir = td.path().join("bin");
+            fs::create_dir_all(&bin_dir).unwrap();
+            let outside = td.path().join("outside");
+            fs::write(&outside, b"do-not-touch").unwrap();
+            std::os::unix::fs::symlink(&outside, bin_dir.join("lu.prev")).unwrap();
+            let staged = td.path().join("staged-lu");
+            fs::write(&staged, b"new").unwrap();
+            let extracted = vec![archive::ExtractedBinary {
+                name: "lu".to_string(),
+                path: staged,
+            }];
+
+            let err = commit_binaries(&extracted, &bin_dir, false).unwrap_err();
+            assert!(
+                err.to_string().contains("refusing unsafe install target"),
+                "{err}"
+            );
+            assert_eq!(fs::read(&outside).unwrap(), b"do-not-touch");
+        }
+    }
+
+    #[test]
+    fn commit_leaves_no_temp_files() {
+        let td = tempfile::tempdir().unwrap();
+        let bin_dir = td.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("lu"), b"old").unwrap();
+        let staged = td.path().join("staged-lu");
+        fs::write(&staged, b"new").unwrap();
+        let extracted = vec![archive::ExtractedBinary {
+            name: "lu".to_string(),
+            path: staged,
+        }];
+
+        commit_binaries(&extracted, &bin_dir, false).unwrap();
+        assert_eq!(fs::read(bin_dir.join("lu")).unwrap(), b"new");
+        assert_eq!(fs::read(bin_dir.join("lu.prev")).unwrap(), b"old");
+        let hidden: Vec<String> = fs::read_dir(&bin_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "orphaned temp files: {hidden:?}");
+    }
+
+    #[test]
+    fn deferred_commit_preserves_current_binary_as_prev() {
+        let td = tempfile::tempdir().unwrap();
+        let bin_dir = td.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("lu"), b"known good").unwrap();
+        let staged = td.path().join("staged-lu");
+        fs::write(&staged, b"candidate").unwrap();
+        let extracted = vec![archive::ExtractedBinary {
+            name: "lu".to_string(),
+            path: staged,
+        }];
+
+        commit_binaries(&extracted, &bin_dir, true).unwrap();
+        assert_eq!(fs::read(bin_dir.join("lu")).unwrap(), b"candidate");
+        assert_eq!(fs::read(bin_dir.join("lu.prev")).unwrap(), b"known good");
+        let hidden: Vec<String> = fs::read_dir(&bin_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with('.'))
+            .collect();
+        assert!(hidden.is_empty(), "orphaned temp files: {hidden:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_bin_dir_rejects_symlink_and_writable_prefix() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let td = tempfile::tempdir().unwrap();
+        let real = td.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        let link = td.path().join("link");
+        symlink(&real, &link).unwrap();
+        let err = check_bin_dir(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink"), "{err}");
+
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).unwrap();
+        let err = check_bin_dir(&real).unwrap_err();
+        assert!(err.to_string().contains("group/other-writable"), "{err}");
     }
 }

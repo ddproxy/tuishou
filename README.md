@@ -12,14 +12,24 @@ Tuishou installs and updates release artifacts for the Lu stack: `tuishou` itsel
 
 ## Install
 
+One line, without a pinned digest:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu
 ```
 
-Expected first lines:
+Recommended: read the archive digest from an independent trusted channel and pin it. A checksum downloaded from the same release is not a trust bootstrap.
+
+```sh
+BOOTSTRAP_SHA256=$(awk '{ print $1; exit }' /etc/tuishou/bootstrap.sha256)
+curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu --expect-sha256 "$BOOTSTRAP_SHA256"
+```
+
+Expected first lines when pinned:
 
 ```text
 PASS: checksum: PASS (tuishou-<tag>-x86_64-unknown-linux-musl.tar.gz)
+PASS: pinned SHA-256: PASS (tuishou-<tag>-x86_64-unknown-linux-musl.tar.gz)
 PASS: attestation: PASS (tuishou verify tuishou-<tag>-x86_64-unknown-linux-musl.tar.gz)
 ## Commands
 
@@ -67,7 +77,11 @@ tuishou completions bash
 tuishou man
 ```
 
-The installer verifies the checksum before it has a verifier, then runs the binary it just installed to verify its own archive. It removes the new binary and exits 4 if that attestation check fails. It never calls `sudo`; if the prefix is not writable it prints the exact command to rerun as root. See [install](docs/install.md).
+The installer checks a pinned digest before extracting anything, then checks the release `.sha256` as a secondary consistency check. Attestation runs only after the binary is installed, using that binary as the verifier, so in-process attestation cannot verify the verifier itself. A pinned digest that does not match exits 4 before extraction. The installer never calls `sudo`; if the prefix is not writable it prints the exact command to rerun as root. See [install](docs/install.md) and [security](docs/security.md).
+
+### Bootstrap trust
+
+Before `tuishou` exists, the only trustworthy digest is one obtained out of band: your release records, a signed note, or a configuration-management record. Put that record outside the GitHub release and its assets. Pass it as `--expect-sha256` (64 hex characters, case-insensitive). Mandatory pinned digests and signed packages are a residual design decision, not implemented in this build; the one-line install still works without `--expect-sha256`.
 
 To inspect before running:
 `--allow-unattested` is an explicit local opt-in that warns and continues when verification fails. Auto-update refuses it.
@@ -96,14 +110,34 @@ bash install.sh --help
 bash install.sh --components reiki,lu
 ```
 
-Manual alternative: download the release archive and its `.sha256` file, run `sha256sum -c` on the checksum file, extract `tuishou`, then run `tuishou verify <archive> --repo ddproxy/tuishou --tag <tag>` before putting the binary on `PATH`. The manual path executes no release code until after the checksum passes; it does not check the attestation until `tuishou verify` runs.
+Manual alternative: read the digest from an independent trusted record, download the release archive, write a local checksum file from the pinned digest, and run `sha256sum -c` **before** extraction. Do not rely on the `.sha256` asset from the same release as a trust bootstrap.
+
+```sh
+TAG=<tag>
+TARGET=x86_64-unknown-linux-musl
+ARCHIVE="tuishou-${TAG}-${TARGET}.tar.gz"
+BOOTSTRAP_SHA256=$(awk '{ print $1; exit }' /etc/tuishou/bootstrap.sha256)
+printf '%s  %s\n' "$BOOTSTRAP_SHA256" "$ARCHIVE" > bootstrap.sha256
+curl -fsSLO "https://github.com/ddproxy/tuishou/releases/download/${TAG}/${ARCHIVE}"
+sha256sum -c bootstrap.sha256
+tar -xzf "$ARCHIVE" tuishou
+./tuishou verify "$ARCHIVE" --repo ddproxy/tuishou --tag "$TAG"
+install -m 0755 tuishou "$HOME/.local/bin/tuishou"
+```
+
+The manual path executes no release code until after the pinned digest passes; it does not check the attestation until `tuishou verify` runs.
 
 ## Quickstart (10 minutes)
 
-1. Install and verify the stack. Runs as a normal user install into `~/.local`; root installs into `/usr/local`, which is already on `PATH`.
+1. Install and verify the stack. Runs as a normal user install into `~/.local`; root installs into `/usr/local`, which is already on `PATH`. Obtain the archive digest from your independent trusted records first; a digest from the release itself is not a trust bootstrap.
 
    ```sh
-   curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu
+   if [[ -n ${BOOTSTRAP_SHA256:-} ]]; then
+     curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu --expect-sha256 "$BOOTSTRAP_SHA256"
+   else
+     printf 'WARN: no pinned bootstrap digest; set BOOTSTRAP_SHA256 from trusted records\n'
+     curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu
+   fi
    # expect: PASS: attestation: PASS (tuishou verify
    ```
 
@@ -132,15 +166,16 @@ Manual alternative: download the release archive and its `.sha256` file, run `sh
 
 ```mermaid
 flowchart LR
+  P[pinned digest from trusted records] --> C[shell installer checks SHA-256]
   A[GitHub release API] --> B[archive + .sha256]
-  B --> C[shell installer checks SHA-256]
+  B --> C
   C --> D[staged tuishou binary]
   D --> E[tuishou verify checks its own archive]
   E --> F[tuishou install reiki, lu]
   F --> G[state: installed versions and rollback copies]
 ```
 
-The installer resolves the latest stable tag (or `--version`), downloads the archive and checksum into a private temporary directory under the prefix, verifies the digest, extracts only `tuishou`, stages it with a rename, keeps `<name>.prev` for rollback, then calls `tuishou verify` and `tuishou install`. Components are verified again inside `tuishou install`. Details: [architecture](docs/architecture.md).
+The installer resolves the latest stable tag (or `--version`), downloads the archive into a private temporary directory under the prefix, checks the out-of-band pinned digest when supplied, then checks the release `.sha256` as a consistency check. Only after those checks does it extract `tuishou`, stage it with a rename, keep `<name>.prev` for rollback, and call `tuishou verify` and `tuishou install`. Components are verified again inside `tuishou install`. Details: [architecture](docs/architecture.md).
 
 ## Configuration
 
@@ -221,9 +256,9 @@ To enable auto-update: set `[auto_update] enabled = true` in `tuishou.toml`, pri
 
 ## Security model
 
-What verification covers: the SHA-256 checksum ties the downloaded archive to the checksum asset; `tuishou verify` checks the GitHub Actions issuer, signer workflow path, tag ref, Rekor inclusion and (on install) the release source repository, ref and commit digest. Component installs fail closed on attestation unless `--allow-unattested` is explicitly passed, which never affects checksums. Auto-update refuses that flag.
+What verification covers: a pinned digest obtained out of band ties the downloaded archive to independent trusted records; the release `.sha256` is a secondary consistency check; `tuishou verify` checks the GitHub Actions issuer, signer workflow path, tag ref, Rekor inclusion and (on install) the release source repository, ref and commit digest. Component installs fail closed on attestation unless `--allow-unattested` is explicitly passed, which never affects checksums. Auto-update refuses that flag.
 
-What it does not cover: the shell bootstrap can only check the checksum before a verifier exists, so it runs the downloaded binary's `verify` command before the attestation result is known. Verification does not make a compromised GitHub account, workflow or dependency safe, and it is not a sandbox. No token is printed; `GITHUB_TOKEN` and `GH_TOKEN` are sent only to GitHub API hosts and redacted from errors. See [security](docs/security.md) and [SECURITY.md](SECURITY.md).
+What it does not cover: the shell bootstrap runs the downloaded binary's `verify` command before the attestation result is known, so in-process attestation cannot verify the verifier. A `.sha256` asset downloaded with the release is not a trust bootstrap. Pinning is optional in this build; mandatory pinned digests and signed packages remain a residual design decision. Verification does not make a compromised GitHub account, workflow or dependency safe, and it is not a sandbox. No token is printed; `GITHUB_TOKEN` and `GH_TOKEN` are sent only to GitHub API hosts and redacted from errors. See [security](docs/security.md) and [SECURITY.md](SECURITY.md).
 
 ## Compatibility matrix
 
@@ -250,7 +285,7 @@ What it does not cover: the shell bootstrap can only check the checksum before a
 ## FAQ
 
 Q: Why does the installer print `bootstrap: only the checksum can be checked before tuishou exists`?
-A: A SHA-256 digest is self-contained. Attestation verification needs the verifier binary, so it runs immediately after installation; failure removes the binary.
+A: Attestation verification needs the verifier binary, so it runs immediately after installation; failure removes the binary. Supply `--expect-sha256` with a digest from an independent trusted channel to make the pre-extraction check meaningful. A checksum downloaded with the release proves consistency, not trust.
 
 Q: Can I install without components?
 A: Yes: `bash install.sh --no-components`. `tuishou` is always installed.
