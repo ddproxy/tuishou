@@ -1,6 +1,6 @@
 //! Parsers for the real Lu 0.4 JSON shapes.
 //!
-//! `lu nodes --json` is the only source for node version and drain state.
+//! A node's own view (`ting status --json`) is the source for its version and drain state.
 //! Reported versions have no leading `v`; release tags do. Matching is exact
 //! after stripping a single leading `v`.
 
@@ -10,8 +10,6 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeStatus {
-    #[allow(dead_code)]
-    pub name: String,
     #[serde(default)]
     pub version: Option<String>,
     #[serde(default)]
@@ -29,27 +27,11 @@ pub fn parse_nodes(json: &str) -> Result<Vec<NodeStatus>, String> {
     serde_json::from_str::<Vec<NodeStatus>>(json).map_err(|e| e.to_string())
 }
 
-#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
-pub fn find_node(json: &str, node: &str) -> Result<NodeStatus, String> {
-    let nodes = parse_nodes(json)?;
-    nodes
-        .into_iter()
-        .find(|n| n.name == node)
-        .ok_or_else(|| format!("node {node} was not reported by lu nodes --json"))
-}
-
 /// A node is drained only when Lu explicitly reports `draining: true` and no
 /// current job. An idle node that is not drained has not been confirmed safe
 /// by the drain command, so unknown or partial shapes fail closed.
 pub fn node_is_drained(node: &NodeStatus) -> bool {
     node.draining == Some(true) && node.current_job.is_none()
-}
-
-#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
-pub fn nodes_report_drained(json: &str, node: &str) -> bool {
-    find_node(json, node)
-        .map(|n| node_is_drained(&n))
-        .unwrap_or(false)
 }
 
 /// A node counts against the fleet limit while it is draining or reported
@@ -69,29 +51,6 @@ pub fn count_unavailable_nodes(json: &str) -> Result<usize, String> {
 
 pub fn normalize_version(value: &str) -> &str {
     value.trim().strip_prefix('v').unwrap_or(value.trim())
-}
-
-/// Compare the exact `version` field of the named node with a release tag.
-#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
-pub fn node_reports_version(json: &str, node: &str, tag: &str) -> bool {
-    find_node(json, node)
-        .ok()
-        .and_then(|n| n.version)
-        .map(|reported| normalize_version(&reported) == normalize_version(tag))
-        .unwrap_or(false)
-}
-
-/// A node must report both the exact version and a recent heartbeat. Missing
-/// or unparseable timestamps fail closed so an offline node cannot pass health.
-#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
-pub fn node_healthy(json: &str, node: &str, tag: &str, max_age: std::time::Duration) -> bool {
-    if !node_reports_version(json, node, tag) {
-        return false;
-    }
-    let Ok(status) = find_node(json, node) else {
-        return false;
-    };
-    status_is_fresh(&status, max_age)
 }
 
 /// The heartbeat time of a node, from either a unix timestamp or an RFC 3339 string.
@@ -154,20 +113,6 @@ pub fn status_reports_version(json: &str, tag: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// A minimal reachability signal: the controller answered with a status
-/// document that includes its version. Idleness is checked separately.
-#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
-pub fn status_available(json: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(json)
-        .ok()
-        .and_then(|v| {
-            v.get("version")
-                .and_then(|s| s.as_str())
-                .map(str::to_string)
-        })
-        .is_some()
-}
-
 /// Controller idleness requires all four busy counters to be present,
 /// non-negative integers and zero. Every other shape fails closed.
 pub fn controller_idle(json: &str) -> bool {
@@ -205,17 +150,6 @@ mod tests {
     ]"#;
 
     #[test]
-    fn drain_state_uses_real_nodes_shape() {
-        assert!(nodes_report_drained(NODES, "n1"));
-        assert!(!nodes_report_drained(NODES, "n2"));
-        // `draining` must be explicitly reported by Lu; an idle node is not
-        // proof that the drain command succeeded.
-        assert!(!nodes_report_drained(NODES, "n5"));
-        assert!(!nodes_report_drained(NODES, "missing"));
-        assert!(!nodes_report_drained("{}", "n1"));
-    }
-
-    #[test]
     fn unavailable_count_includes_draining_and_offline_nodes() {
         assert_eq!(count_unavailable_nodes(NODES).unwrap(), 1);
         let json = r#"[
@@ -226,16 +160,6 @@ mod tests {
         ]"#;
         assert_eq!(count_unavailable_nodes(json).unwrap(), 2);
         assert!(count_unavailable_nodes("not json").is_err());
-    }
-
-    #[test]
-    fn version_match_is_named_exact_and_normalized() {
-        assert!(node_reports_version(NODES, "n1", "v0.4.0"));
-        assert!(node_reports_version(NODES, "n1", "0.4.0"));
-        assert!(!node_reports_version(NODES, "n3", "v0.4.1"));
-        assert!(!node_reports_version(NODES, "n4", "v0.4.1"));
-        assert!(!node_reports_version(NODES, "n2", "v0.4.0"));
-        assert!(!node_reports_version(NODES, "missing", "v0.4.0"));
     }
 
     #[test]
@@ -256,5 +180,37 @@ mod tests {
         ));
         assert!(!controller_idle(r#"{"running_jobs":0,"jobs":[]}"#));
         assert!(!controller_idle("not json"));
+    }
+
+    #[test]
+    fn self_view_drain_and_health() {
+        let fresh = OffsetDateTime::now_utc().unix_timestamp();
+        let drained = format!(
+            r#"{{"name":"n1","version":"0.5.1","draining":true,"current_job":null,"online":true,"last_seen":{fresh}}}"#
+        );
+        assert!(self_is_drained(&drained));
+        assert!(self_is_healthy(
+            &drained,
+            "v0.5.1",
+            std::time::Duration::from_secs(60)
+        ));
+        assert!(!self_is_healthy(
+            &drained,
+            "v0.5.2",
+            std::time::Duration::from_secs(60)
+        ));
+        let busy = drained.replace("null", r#"{"id":"j1"}"#);
+        assert!(!self_is_drained(&busy));
+        let stale = drained.replace(&fresh.to_string(), "1000");
+        assert!(!self_is_healthy(
+            &stale,
+            "v0.5.1",
+            std::time::Duration::from_secs(60)
+        ));
+        assert!(!self_is_healthy(
+            "not json",
+            "v0.5.1",
+            std::time::Duration::from_secs(60)
+        ));
     }
 }
