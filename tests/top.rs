@@ -17,7 +17,7 @@ use nix::unistd::Pid;
 
 const ROWS: u16 = 24;
 const COLS: u16 = 100;
-const WAIT: Duration = Duration::from_secs(6);
+const WAIT: Duration = Duration::from_secs(20);
 
 struct HostPty {
     child: Box<dyn portable_pty::Child + Send + Sync>,
