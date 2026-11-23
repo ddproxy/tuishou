@@ -1,7 +1,7 @@
 //! Release listing and policy/age/channel eligibility for auto-update.
 
 use crate::auto_update::state::ReleaseCache;
-use crate::config::AutoUpdateConfig;
+use crate::config::{AutoUpdateConfig, Channel};
 use crate::error::{Error, Result};
 use crate::release::{self, Release};
 use crate::version::{self, Policy, Version};
@@ -63,6 +63,22 @@ pub struct Eligibility {
     pub reason: Option<String>,
 }
 
+/// True for an automatic dev build: flagged prerelease with a `dev.N.g<hash>` pre-release part.
+fn is_dev_build(version: &Version, rel: &Release) -> bool {
+    rel.prerelease
+        && version.prerelease.as_deref().is_some_and(|pre| {
+            let mut parts = pre.split('.');
+            parts.next() == Some("dev")
+                && parts
+                    .next()
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                && parts
+                    .next()
+                    .is_some_and(|h| h.len() > 1 && h.starts_with('g'))
+                && parts.next().is_none()
+        })
+}
+
 /// Choose the newest release that passes channel, age, policy, bad-version and
 /// controller-schema gates. Hold state is handled by the caller so that
 /// `status` can still show the next eligible version while held.
@@ -98,14 +114,25 @@ pub fn choose(
             Ok(v) => v,
             Err(_) => continue,
         };
-        // The only accepted channel is stable. A prerelease is never eligible,
-        // regardless of the `prerelease` flag on the release object, and is
-        // called out in the first reason so `status` can explain the skip.
+        // A prerelease is eligible only on the dev channel, only as an automatic dev build
+        // (flagged prerelease, tag `vX.Y.Z-dev.N.g<hash>`), and never for the controller, whose
+        // schema migrations only move forward. The first reason explains the skip in `status`.
         if version.is_prerelease() || rel.prerelease {
-            if first_reason.is_none() {
-                first_reason = Some(format!("{} is a prerelease; stable channel only", rel.tag));
+            let refusal = if cfg.channel != Channel::Dev {
+                Some("stable channel only")
+            } else if is_controller {
+                Some("the controller takes stable releases only")
+            } else if !is_dev_build(&version, rel) {
+                Some("not a dev build (vX.Y.Z-dev.N.g<hash>)")
+            } else {
+                None
+            };
+            if let Some(why) = refusal {
+                if first_reason.is_none() {
+                    first_reason = Some(format!("{} is a prerelease; {why}", rel.tag));
+                }
+                continue;
             }
-            continue;
         }
         if bad_versions.iter().any(|b| b == &rel.tag) {
             if first_reason.is_none() {
@@ -261,7 +288,7 @@ fn controller_schema_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AutoPolicy, Channel, ControllerPolicy};
+    use crate::config::{AutoPolicy, ControllerPolicy};
 
     fn rel(tag: &str, published: Option<&str>, body: &str, pre: bool) -> Release {
         Release {
@@ -383,6 +410,67 @@ mod tests {
             .tag,
             "v0.4.1"
         );
+    }
+
+    fn dev_cfg() -> AutoUpdateConfig {
+        AutoUpdateConfig {
+            channel: Channel::Dev,
+            policy: AutoPolicy::Patch,
+            ..cfg()
+        }
+    }
+
+    #[test]
+    fn the_dev_channel_takes_the_newest_dev_build_and_orders_by_commit_count() {
+        let l = listing(vec![
+            rel("v0.6.2-dev.9.gaaaaaaa", None, "", true),
+            rel("v0.6.2-dev.10.g0000001", None, "", true),
+            rel("v0.6.2-dev.2.gfffffff", None, "", true),
+        ]);
+        let choice = choose(&l, &dev_cfg(), Some("v0.6.1"), &[], false).unwrap();
+        assert_eq!(choice.candidate.unwrap().tag, "v0.6.2-dev.10.g0000001");
+        // A later dev build supersedes an installed one, and the stable release supersedes both.
+        let choice = choose(&l, &dev_cfg(), Some("v0.6.2-dev.9.gaaaaaaa"), &[], false).unwrap();
+        assert_eq!(choice.candidate.unwrap().tag, "v0.6.2-dev.10.g0000001");
+        let with_stable = listing(vec![
+            rel("v0.6.2-dev.10.g0000001", None, "", true),
+            rel("v0.6.2", None, "", false),
+        ]);
+        let choice = choose(&with_stable, &dev_cfg(), Some("v0.6.1"), &[], false).unwrap();
+        assert_eq!(choice.candidate.unwrap().tag, "v0.6.2");
+        // A dev build of an already installed core is older than the installed stable release.
+        let old = listing(vec![rel("v0.6.2-dev.3.gabcdef0", None, "", true)]);
+        assert!(choose(&old, &dev_cfg(), Some("v0.6.2"), &[], false)
+            .unwrap()
+            .candidate
+            .is_none());
+    }
+
+    #[test]
+    fn the_dev_channel_refuses_other_prereleases_the_controller_and_unflagged_tags() {
+        for tag in [
+            "v0.6.2-rc.1",
+            "v0.6.2-dev.x.gabc1234",
+            "v0.6.2-dev.3",
+            "v0.6.2-dev.3.abc1234",
+        ] {
+            let l = listing(vec![rel(tag, None, "", true)]);
+            let choice = choose(&l, &dev_cfg(), Some("v0.6.1"), &[], false).unwrap();
+            assert!(choice.candidate.is_none(), "{tag}");
+            assert!(choice.reason.unwrap().contains("not a dev build"), "{tag}");
+        }
+        // A dev tag whose release is not flagged as a prerelease is not an automatic build.
+        let unflagged = listing(vec![rel("v0.6.2-dev.3.gabc1234", None, "", false)]);
+        assert!(choose(&unflagged, &dev_cfg(), Some("v0.6.1"), &[], false)
+            .unwrap()
+            .candidate
+            .is_none());
+        let dev = listing(vec![rel("v0.6.2-dev.3.gabc1234", None, "", true)]);
+        let controller = choose(&dev, &dev_cfg(), Some("v0.6.1"), &[], true).unwrap();
+        assert!(controller.candidate.is_none());
+        assert!(controller.reason.unwrap().contains("controller"));
+        let stable = choose(&dev, &cfg(), Some("v0.6.1"), &[], false).unwrap();
+        assert!(stable.candidate.is_none());
     }
 
     #[test]

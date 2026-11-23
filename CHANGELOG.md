@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- `[auto_update] channel = "dev"` accepts automatic dev builds (`vX.Y.Z-dev.N.g<hash>` pre-releases) for agent and Reiki nodes. They order by the commit count N, rank below the stable release of the same core, are never installed on the controller, and other pre-release tags stay refused.
+
 ## [0.3.5]
 
 ### Fixed
