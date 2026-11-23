@@ -95,6 +95,7 @@ To inspect before running:
 - [Quick start](docs/quick-start.md)
 - [Install and update](docs/install-update.md)
 - [Node update procedure](docs/node-update.md)
+- [Fleet rollout](docs/fleet-rollout.md)
 - [Verify a tuishou release](docs/verify-release.md)
 - [Scheduled auto-update (opt-in)](docs/auto-update.md)
 - [Dogfooding / adoption](docs/dogfooding.md)
