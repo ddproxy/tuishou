@@ -2,7 +2,9 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+#[cfg(all(unix, feature = "top"))]
+use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -92,12 +94,13 @@ pub fn top_state_path_for_config(prefix: Option<&Path>, config_path: Option<&Pat
     base.with_file_name(format!("{stem}-{suffix}.json"))
 }
 
+#[cfg(all(unix, feature = "top"))]
 const MAX_PRIVATE_STATE_BYTES: u64 = 1024 * 1024;
 
 /// Read a private state file from one checked descriptor: no symlink, no
 /// foreign owner, no group/other write bit and a bounded size. Unsafe or
 /// unreadable state is treated as absent by callers.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "top"))]
 pub fn read_private_string(path: &Path) -> Option<String> {
     use rustix::fs::{open, Mode, OFlags};
     use std::os::unix::fs::MetadataExt;
@@ -126,7 +129,7 @@ pub fn read_private_string(path: &Path) -> Option<String> {
     Some(text)
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), feature = "top"))]
 pub fn read_private_string(path: &Path) -> Option<String> {
     fs::read_to_string(path).ok()
 }
@@ -331,7 +334,7 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "top"))]
     #[test]
     fn private_state_ignores_symlinks_and_writable_files() {
         use std::os::unix::fs::{symlink, PermissionsExt};
