@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## [0.3.2]
+
+### Fixed
+
+- Attestation verification now considers only SLSA build provenance. A subject that also carries a release attestation or an SBOM no longer fails with "bundle must contain exactly one transparency log entry".
+- The source commit is resolved from the release tag (following annotated tags to the commit), not from the release's `target_commitish` branch name, so a release built from an older commit of a moving branch verifies.
+- A host with neither a Reiki configuration nor an enabled Reiki unit gets a plain binary swap and a recorded install; a missing configuration no longer marks the new release as bad.
+
 ## [0.3.1]
 
 ### Fixed

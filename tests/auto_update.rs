@@ -369,6 +369,7 @@ UNIT=""
 if [ "$1" = "cat" ]; then UNIT=$2; fi
 if [ "$1" = "is-enabled" ] && [ "$2" = "--quiet" ]; then UNIT=$3; fi
 if [ -n "$UNIT" ]; then
+  if [ "$UNIT" = "reiki.service" ]; then exit 0; fi
   if [ "$ROLE" = "agent" ] && [ "$UNIT" = "ting.service" ]; then exit 0; fi
   if [ "$ROLE" = "controller" ] && [ "$UNIT" = "lu-controller.service" ]; then exit 0; fi
   exit 1

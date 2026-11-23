@@ -801,6 +801,24 @@ pub fn apply_reiki_with_options(
         return Ok(Some(reason));
     }
 
+    // A host that has neither a Reiki configuration nor an enabled Reiki unit is not running
+    // Reiki (a workstation with the binary, for example): swap the binary and stop. Checking a
+    // configuration that does not exist would fail and wrongly mark the release as bad.
+    let timeout = command_timeout(ctx)?;
+    let unit = component.service_unit.as_deref().unwrap_or("reiki.service");
+    let config_present = reiki_config_path(component, ctx.cfg).exists();
+    if !config_present && !unit_present_and_enabled(runner, unit, timeout) {
+        journal(
+            "reiki_plain_install",
+            &[("component", &component.name), ("version", version)],
+        );
+        // Nothing else will record this install, so commit the state here.
+        let mut plain = opts.clone();
+        plain.commit_state = true;
+        runner.install(component, &plain)?;
+        return Ok(None);
+    }
+
     let node = node_name(ctx.cfg);
     let drained = node_runs_lu(runner, &node, ctx);
     journal(
@@ -1494,9 +1512,13 @@ mod tests {
                 node: Arc::new(Mutex::new(("0.4.0".to_string(), recent()))),
                 nodes: Arc::new(Mutex::new(VecDeque::new())),
                 status: Arc::new(Mutex::new(VecDeque::from([status_json("0.4.0", 0, 0)]))),
-                enabled: Arc::new(Mutex::new(vec!["ting.service".to_string()])),
+                enabled: Arc::new(Mutex::new(vec![
+                    "ting.service".to_string(),
+                    "reiki.service".to_string(),
+                ])),
                 present: vec![
                     "ting.service".to_string(),
+                    "reiki.service".to_string(),
                     "lu-controller.service".to_string(),
                 ],
                 receipt: crate::install::InstallReceipt {
@@ -2423,6 +2445,35 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not a regular file"));
+    }
+
+    #[test]
+    fn a_host_without_reiki_gets_a_plain_binary_swap_and_no_bad_mark() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let runner = FakeRunner::new();
+        runner.set_enabled(&[]);
+        let calls = runner.calls.clone();
+        let mut state = AutoState::default();
+
+        let outcome =
+            apply_reiki_with_runner(&reiki_component(), "v0.4.1", &context, &mut state, &runner)
+                .unwrap();
+
+        assert!(outcome.is_none());
+        assert!(
+            runner.last_staged.lock().unwrap().is_none(),
+            "no config check"
+        );
+        let cmds = calls.lock().unwrap().commands.clone();
+        assert!(!cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
+        assert!(!cmds
+            .iter()
+            .any(|(p, a)| p == "systemctl" && a.first().map(String::as_str) == Some("restart")));
+        assert!(state.bad_versions.is_empty());
     }
 
     #[test]

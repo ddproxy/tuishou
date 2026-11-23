@@ -92,6 +92,15 @@ pub fn parse_attestation_response(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         let bundle = entry.get("bundle").ok_or_else(|| {
             Error::AttestationRefused(format!("attestation[{index}] has no bundle"))
         })?;
+        // A subject can carry other attestations (a release attestation, an SBOM). Only SLSA
+        // build provenance is verified here; an unrelated predicate neither counts as proof nor
+        // may make verification fail. A bundle whose type cannot be read is kept so that the
+        // verifier refuses it explicitly.
+        if let Some(kind) = bundle_predicate_type(bundle) {
+            if !is_provenance_predicate(&kind) {
+                continue;
+            }
+        }
         let bytes = match bundle {
             serde_json::Value::Object(_) => serde_json::to_vec(bundle)
                 .map_err(|e| Error::Attestation(format!("cannot encode bundle: {e}")))?,
@@ -114,7 +123,33 @@ pub fn parse_attestation_response(body: &[u8]) -> Result<Vec<Vec<u8>>> {
         }
         bundles.push(bytes);
     }
+    if bundles.is_empty() {
+        return Err(Error::AttestationUnavailable(
+            "attestation API returned no SLSA build provenance for the subject digest".to_string(),
+        ));
+    }
     Ok(bundles)
+}
+
+fn is_provenance_predicate(kind: &str) -> bool {
+    matches!(
+        kind,
+        "https://slsa.dev/provenance/v1" | "https://slsa.dev/provenance/v0.2"
+    )
+}
+
+/// The in-toto predicate type of a DSSE bundle, when it can be read without verifying anything.
+fn bundle_predicate_type(bundle: &serde_json::Value) -> Option<String> {
+    use base64::Engine as _;
+    let payload = bundle.get("dsseEnvelope")?.get("payload")?.as_str()?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    let statement: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    statement
+        .get("predicateType")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
 }
 
 /// Validate an `owner/name` repository before using it in a URL or SAN URI.
@@ -146,6 +181,35 @@ fn is_sha256_hex(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unrelated_predicates_are_ignored_and_provenance_is_kept() {
+        use base64::Engine as _;
+        let statement = |kind: &str| {
+            base64::engine::general_purpose::STANDARD
+                .encode(format!(r#"{{"predicateType":"{kind}","subject":[]}}"#))
+        };
+        let body = format!(
+            r#"{{"attestations":[
+              {{"bundle":{{"dsseEnvelope":{{"payload":"{}"}}}}}},
+              {{"bundle":{{"dsseEnvelope":{{"payload":"{}"}}}}}}
+            ]}}"#,
+            statement("https://in-toto.io/attestation/release/v0.2"),
+            statement("https://slsa.dev/provenance/v1"),
+        );
+        assert_eq!(
+            parse_attestation_response(body.as_bytes()).unwrap().len(),
+            1
+        );
+        let only_release = format!(
+            r#"{{"attestations":[{{"bundle":{{"dsseEnvelope":{{"payload":"{}"}}}}}}]}}"#,
+            statement("https://in-toto.io/attestation/release/v0.2")
+        );
+        assert!(matches!(
+            parse_attestation_response(only_release.as_bytes()),
+            Err(Error::AttestationUnavailable(_))
+        ));
+    }
 
     #[test]
     fn rejects_invalid_repo_and_digest() {

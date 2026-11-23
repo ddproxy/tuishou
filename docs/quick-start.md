@@ -55,8 +55,8 @@ never the repository or asset host.
 ## Verify and install
 
 ```sh
-tuishou verify reiki-v0.3.1-x86_64-unknown-linux-musl.tar.gz \
-  --repo ddproxy/reiki --tag v0.3.1
+tuishou verify reiki-v0.3.2-x86_64-unknown-linux-musl.tar.gz \
+  --repo ddproxy/reiki --tag v0.3.2
 tuishou install reiki
 tuishou status
 ```

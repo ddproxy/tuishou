@@ -167,26 +167,18 @@ pub fn find_asset<'a>(release: &'a Release, name: &str) -> Result<&'a ReleaseAss
         .ok_or_else(|| Error::Http(format!("release {} missing asset {name}", release.tag)))
 }
 
-/// Resolve the release's source commit to a SHA so attestation certificates can
-/// be checked against the source digest extension. Handles both the case where
-/// `target_commitish` is already a SHA and the common case where it is a branch
-/// or ref name. Install/update paths require the field; a missing value refuses
-/// the release instead of silently disabling the source binding.
+/// Resolve the release tag to the commit it points at, so attestation certificates can be checked
+/// against the source digest extension. The tag is authoritative: `target_commitish` on a release
+/// usually names a branch (for example `main`), which moves after the release is cut, so using it
+/// would compare the provenance against whatever the branch points at today.
 pub fn fetch_source_digest(agent: &ureq::Agent, repo: &str, release: &Release) -> Result<String> {
-    let Some(commitish) = release.target_commitish.as_deref() else {
-        return Err(Error::msg(format!(
-            "release {} has no target_commitish; refusing to skip source digest binding",
-            release.tag
-        )));
-    };
-    if is_sha1(commitish) {
-        return Ok(commitish.to_ascii_lowercase());
+    // A release created against a full commit SHA is already exact and cannot move.
+    if let Some(commitish) = release.target_commitish.as_deref() {
+        if is_sha1(commitish) {
+            return Ok(commitish.to_ascii_lowercase());
+        }
     }
-    let ref_path = if let Some(rest) = commitish.strip_prefix("refs/") {
-        rest.to_string()
-    } else {
-        format!("heads/{commitish}")
-    };
+    let ref_path = tag_ref_path(&release.tag)?;
     let url = format!("{}/repos/{repo}/git/ref/{ref_path}", github_api_base());
     let value = http::get_json(agent, &url)?;
     let object = value
@@ -197,23 +189,36 @@ pub fn fetch_source_digest(agent: &ureq::Agent, repo: &str, release: &Release) -
         .and_then(|v| v.as_str())
         .ok_or_else(|| Error::Http(format!("git ref {ref_path} response has no object sha")))?
         .to_string();
-    // Annotated tags point at a tag object; follow it to the commit.
+    let mut kind = object
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("commit")
+        .to_string();
+    // Annotated tags point at a tag object; follow it (possibly through nested tags) to the commit.
     for _ in 0..3 {
-        if object.get("type").and_then(|v| v.as_str()) != Some("tag") {
+        if kind != "tag" {
             break;
         }
         let tag_url = format!("{}/repos/{repo}/git/tags/{sha}", github_api_base());
         let tag = http::get_json(agent, &tag_url)?;
-        let next = tag
+        let target = tag
             .get("object")
-            .and_then(|o| o.get("sha"))
+            .ok_or_else(|| Error::Http("tag object has no target".to_string()))?;
+        sha = target
+            .get("sha")
             .and_then(|v| v.as_str())
             .ok_or_else(|| Error::Http("tag object has no target sha".to_string()))?
             .to_string();
-        if next == sha {
-            break;
-        }
-        sha = next;
+        kind = target
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("commit")
+            .to_string();
+    }
+    if kind != "commit" {
+        return Err(Error::Http(format!(
+            "{repo} {ref_path} does not resolve to a commit (found {kind})"
+        )));
     }
     if !is_sha1(&sha) {
         return Err(Error::Http(format!(
@@ -221,6 +226,20 @@ pub fn fetch_source_digest(agent: &ureq::Agent, repo: &str, release: &Release) -
         )));
     }
     Ok(sha.to_ascii_lowercase())
+}
+
+fn tag_ref_path(tag: &str) -> Result<String> {
+    let valid = !tag.is_empty()
+        && tag.len() <= 128
+        && !tag.starts_with('-')
+        && !tag.contains("..")
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+'));
+    if !valid {
+        return Err(Error::msg(format!("refusing to resolve tag {tag:?}")));
+    }
+    Ok(format!("tags/{tag}"))
 }
 
 fn is_sha1(s: &str) -> bool {
@@ -253,24 +272,11 @@ mod tests {
     }
 
     #[test]
-    fn source_digest_requires_release_commitish() {
-        let missing = parse_release(serde_json::json!({
-            "tag_name": "v0.4.0",
-            "assets": []
-        }))
-        .unwrap();
-        let err = fetch_source_digest(&crate::http::agent(), "owner/repo", &missing).unwrap_err();
-        assert!(err.to_string().contains("target_commitish"), "{err}");
-
-        let pinned = parse_release(serde_json::json!({
-            "tag_name": "v0.4.0",
-            "assets": [],
-            "target_commitish": "0123456789abcdef0123456789abcdef01234567"
-        }))
-        .unwrap();
-        assert_eq!(
-            fetch_source_digest(&crate::http::agent(), "owner/repo", &pinned).unwrap(),
-            "0123456789abcdef0123456789abcdef01234567"
-        );
+    fn source_digest_resolves_the_tag_not_the_release_branch() {
+        assert_eq!(tag_ref_path("v0.5.1").unwrap(), "tags/v0.5.1");
+        assert!(tag_ref_path("").is_err());
+        assert!(tag_ref_path("../heads/main").is_err());
+        assert!(tag_ref_path("-v1").is_err());
+        assert!(tag_ref_path("v1 2").is_err());
     }
 }
