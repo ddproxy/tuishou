@@ -12,6 +12,10 @@
 - Added `docs/node-update.md` with the single-node drain/install/restart/health/rollback/undrain procedure, manual invocation, scheduling guidance and an "Updating many nodes" section with an Ansible example. Added tests for the removed command and config keys, jitter bounds, fleet-limit allow/refuse/fail-closed behaviour and the shared local update path.
 - `docs/components.md` documents the built-in Reiki, Lu and Tuishou defaults, their release assets, binaries, service units, signer workflows and health checks. Man page, completions and examples now use Reiki and Lu first.
 - New integration coverage for bare `update`, unknown component usage errors, shared `--check` exit codes, per-component reporting, `install all` with a missing binary, config trust, and rejected repository overrides. Auto-update tests cover Reiki-before-Lu ordering, Reiki drain/config-check/restart/health and rollback with a bad-version mark.
+- Added `install.sh`, a single-script installer for Linux x86_64 (`x86_64-unknown-linux-musl`) with `--components`, `--version`, `--prefix`, `--no-components`, `--dry-run`, `--yes` and `--help`. It fetches release metadata, checks SHA-256, stages the binary, runs `tuishou verify` on its own archive, records it with `tuishou adopt`, installs the requested components, and prints an install summary with next commands. It never invokes `sudo`; an unwritable prefix prints a root rerun command. `NO_COLOR` and non-TTY output suppress color. Exit codes are `0` ok, `2` usage, `3` unsupported platform, `4` verification failed and `5` install failed.
+- Added the bootstrap verification sequence: the shell checks the `.sha256` asset before a verifier exists, then runs the downloaded binary's `verify` command; failure removes the new binary and exits 4. Installs are staged and keep one `tuishou.prev` rollback copy.
+- Added a local fake release server (`tests/fixtures/installer/`) and 11 installer cases in `tests/installer_test.sh`: usage errors, unsupported platforms, dry run, checksum mismatch, attestation failure, unwritable prefixes, component installs, quickstart proof, idempotency, rollback restore and `--no-components`. `make installer-test` runs them; `make test` and CI run the same script.
+- Docs rewrite: README template and docs index, plus quickstart, install, configuration, operations, security, limits, troubleshooting, CLI and architecture pages, `llms.txt` and `AGENTS.md`. `scripts/docs-check.sh` runs quickstart commands, validates config examples and checks links. `tuishou top` is described as planned only; it is not in this build.
 
 ### Changed
 
@@ -20,10 +24,13 @@
 - A bare `tuishou update` means `update all`. Components absent from a release are reported as `not in this release` and never counted as updates. Not-installed components are installed only by an explicit `install <name>` or `update <name>`.
 - Config files are refused unless owned by the running user or root and not group/other writable. Component overrides may change paths and policy but never the repository or asset host.
 - Reiki updates drain a Lu node when present, check the Reiki config before restart, health-check after restart and roll back with a bad-version mark on failure.
+- Installer failures are fail closed: checksum and attestation refusals leave no unverified binary at the destination, and a previous binary is restored from `tuishou.prev` when present. Unsupported platforms exit 3 and list the existing release targets; component installs fail closed unless `--allow-unattested` is passed explicitly (auto-update still refuses it).
 
 ### Fixed
 
 - Rollback skips optional binaries that have no previous copy, so Lu controller-only archives restore cleanly.
+- A failed bootstrap attestation no longer leaves an unverified `tuishou` in the bin directory; the new binary is removed and the previous one restored when present.
+- An unwritable prefix now exits 5 with the exact root rerun command instead of failing later in the install. `--dry-run` resolves and reports a release without touching the prefix.
 
 ## v0.2.1 - 2026-11-22
 

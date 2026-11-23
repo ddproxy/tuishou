@@ -1,0 +1,15 @@
+# tuishou documentation
+
+> Install and update the Tuishou stack from GitHub releases with checksum and attestation verification.
+
+- [README](README.md): install line, quickstart proof, compatibility, security, limits.
+- [Quickstart](docs/quickstart.md): ten-minute path ending in `tuishou status`.
+- [Install](docs/install.md): installer options, manual install, exit codes.
+- [Configuration](docs/configuration.md): every config key, defaults and validating examples.
+- [Operations](docs/operations.md): upgrade, rollback, backup, logs, health checks.
+- [Security](docs/security.md): verification scope, trust boundaries, vulnerability reporting.
+- [Limits](docs/limits.md): supported targets, fail-open and fail-closed behavior, non-goals.
+- [Troubleshooting](docs/troubleshooting.md): exact errors and fixes.
+- [CLI](docs/cli.md): commands, flags, environment, exit codes.
+- [Architecture](docs/architecture.md): release flow and state files.
+- [Changelog](CHANGELOG.md): releases and upgrade requirements.

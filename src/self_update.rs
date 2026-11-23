@@ -19,7 +19,7 @@ pub fn self_component(components: &[Component]) -> Component {
             service_unit: None,
             binary_ranges: Vec::new(),
             config_path: None,
-            optional_binaries: Vec::new(),
+            auto_update: false,
         })
 }
 

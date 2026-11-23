@@ -1,5 +1,30 @@
 # Security model
 
+For reviewers: verification scope, trust boundaries and bootstrap limits.
+
+## Bootstrap trust boundary
+
+Before `tuishou` exists on the host, the shell installer can check only the SHA-256 digest from the `.sha256` asset against the downloaded archive. Both come from the same release; a checksum-only check does not prove who built the archive. The installer does not claim attestation success at this step.
+
+After the checksum passes, the installer extracts and stages the downloaded binary and runs its own `verify` command on the archive:
+
+```sh
+tuishou verify <archive> --repo ddproxy/tuishou --tag <tag>
+```
+
+That command checks the GitHub attestation in process. If it fails, the installer removes the new binary, restores `tuishou.prev` when present, and exits 4. The bootstrap caveat is unavoidable: the verifier is the artifact being installed. There is no offline installer attestation. See [limits.md](limits.md).
+
+## Trust boundaries
+
+| Boundary | What crosses it | Trust rule |
+| --- | --- | --- |
+| GitHub release API and assets | Tag metadata, archives, `.sha256` files and attestation bundles | Metadata comes from the GitHub API; asset downloads carry no token. The digest and attestation decide whether an artifact is accepted. |
+| Shell installer | `install.sh` fetched over https | Resolves a release, checks SHA-256, stages the binary and runs its `verify` command. It never invokes `sudo`; an unwritable prefix prints a root rerun command. |
+| Verifier binary | The installed `tuishou` executable | Its `verify` command checks the archive's attestation in process; no external CLI or login is used. Component installs fail closed unless the operator passes `--allow-unattested` explicitly; auto-update refuses that flag. |
+| Config file | `tuishou.toml` | Refused unless owned by the running user or root and not writable by group or others. Unknown keys are errors. Repositories and asset hosts cannot be overridden. |
+| Host execution | Local install, update and service commands | Runs with the privileges of the invoking account; no privilege elevation and no fleet SSH. Only trusted configs should be used. |
+| State and cache | Install state, auto-update state and the trusted-root cache | Local records of versions and decisions; not a substitute for attestation. The cache directory is `0700` and the cached root file is `0600`. |
+
 ## Release verification
 
 `tuishou` verifies release artifacts against GitHub attestations in process using the

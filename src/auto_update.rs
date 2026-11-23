@@ -9,7 +9,7 @@ pub mod apply;
 pub mod eligibility;
 pub mod state;
 
-use crate::component::{resolve_component, Component, NODE_AGENT_BINARIES};
+use crate::component::{resolve_component, Component};
 use crate::config::{AutoUpdateConfig, LoadedConfig};
 use crate::duration::{format_duration, parse_duration};
 use crate::error::{Error, Result};
@@ -122,6 +122,19 @@ fn cached_next(
     eligibility::choose(&listing, cfg, installed, bad, is_controller)
         .ok()
         .and_then(|c| c.next_eligible_version)
+}
+
+/// Best-effort role lookup for read-only reporting. Apply paths use the
+/// strict detector and fail closed on ambiguity; status simply avoids showing
+/// controller gating for a host where the role cannot be confirmed.
+fn installed_lu_is_controller(
+    ctx: &apply::ApplyContext<'_>,
+    installed: &BTreeMap<String, InstalledComponent>,
+) -> bool {
+    installed.contains_key("lu")
+        && apply::detect_lu_role(ctx)
+            .map(|r| r == apply::LuRole::Controller)
+            .unwrap_or(false)
 }
 
 fn record(
@@ -256,6 +269,14 @@ fn execute_cycle(
         &[("components", &names.join(","))],
     );
 
+    let verifier = crate::verify::default_verifier();
+    let ctx = apply::ApplyContext {
+        cfg,
+        prefix,
+        config_path: Some(loaded.config_path.as_path()),
+        verifier: Some(verifier.clone()),
+        verify_config: Some(&loaded.verify),
+    };
     let command_timeout = parse_duration(&cfg.command_timeout).unwrap_or(Duration::from_secs(30));
     if let Some(reason) = crate::fleet::before_cycle(&loaded.update, command_timeout) {
         journal(
@@ -287,6 +308,7 @@ fn execute_cycle(
             .reason
             .unwrap_or_else(|| "hold file present".to_string());
         journal("auto_update_held", &[("reason", &one_line(&reason))]);
+        let lu_is_controller = installed_lu_is_controller(&ctx, &installed);
         for name in &names {
             if let Ok(component) = resolve_component(name, components) {
                 let bad = st.bad_versions.get(name).cloned().unwrap_or_default();
@@ -295,7 +317,7 @@ fn execute_cycle(
                     cfg,
                     installed.get(name).map(|c| c.version.as_str()),
                     &bad,
-                    name == "lu",
+                    name == "lu" && lu_is_controller,
                     &st,
                 );
                 record(
@@ -317,7 +339,6 @@ fn execute_cycle(
     }
 
     let agent = crate::http::agent();
-    let verifier = crate::verify::default_verifier();
     let mut any_failed = false;
     for name in &names {
         let component = match resolve_component(name, components) {
@@ -342,10 +363,57 @@ fn execute_cycle(
                 continue;
             }
         };
+        if !component.auto_update {
+            let reason =
+                format!("auto_update is disabled for {name}; set [[component]] auto_update = true");
+            journal("component_auto_update_disabled", &[("component", name)]);
+            record(
+                &mut st,
+                name,
+                StatusText::Skipped {
+                    reason: reason.clone(),
+                },
+                installed.get(name).map(|c| c.version.clone()),
+                None,
+                None,
+            );
+            continue;
+        }
+
         let is_reiki = name == "reiki";
         let is_lu = name == "lu";
         let installed_version = installed.get(name).map(|c| c.version.clone());
         let bad = st.bad_versions.get(name).cloned().unwrap_or_default();
+        // Lu's role is a property of the installed host, not of the release.
+        // Detect it once from systemd and use it for both eligibility and
+        // apply. Ambiguous hosts fail closed instead of being guessed at.
+        let role = if is_lu && installed_version.is_some() {
+            match apply::detect_lu_role(&ctx) {
+                Ok(role) => Some(role),
+                Err(e) => {
+                    let reason = one_line(&e.to_string());
+                    journal_err(
+                        "lu_role_failed",
+                        &[("component", name), ("reason", &reason)],
+                    );
+                    record(
+                        &mut st,
+                        name,
+                        StatusText::Failed {
+                            reason: reason.clone(),
+                        },
+                        installed_version.clone(),
+                        None,
+                        None,
+                    );
+                    any_failed = true;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let is_controller = role == Some(apply::LuRole::Controller);
 
         let cache = st.caches.get(&component.repo).cloned();
         let listing = match eligibility::fetch_listing(&agent, &component.repo, cache.as_ref(), 3) {
@@ -384,64 +452,34 @@ fn execute_cycle(
             );
         }
 
-        // Lu is a controller until the selected release actually ships a
-        // dedicated agent binary. Re-check with controller gates disabled in
-        // that case so the agent drain path is used.
-        let controller_choice =
-            match eligibility::choose(&listing, cfg, installed_version.as_deref(), &bad, is_lu) {
-                Ok(c) => c,
-                Err(e) => {
-                    let reason = one_line(&e.to_string());
-                    journal_err(
-                        "eligibility_failed",
-                        &[("component", name), ("reason", &reason)],
-                    );
-                    record(
-                        &mut st,
-                        name,
-                        StatusText::Failed {
-                            reason: reason.clone(),
-                        },
-                        installed_version.clone(),
-                        None,
-                        None,
-                    );
-                    any_failed = true;
-                    continue;
-                }
-            };
-        let agent_in_release = is_lu
-            && controller_choice.candidate.as_ref().is_some_and(|r| {
-                crate::install::archive_binary_names(&agent, &component, &r.tag)
-                    .map(|names| {
-                        names
-                            .iter()
-                            .any(|n| NODE_AGENT_BINARIES.contains(&n.as_str()))
-                    })
-                    .unwrap_or(false)
-            });
-        let choice = if agent_in_release {
-            match eligibility::choose(&listing, cfg, installed_version.as_deref(), &bad, false) {
-                Ok(c) => c,
-                Err(e) => {
-                    let reason = one_line(&e.to_string());
-                    record(
-                        &mut st,
-                        name,
-                        StatusText::Failed { reason },
-                        installed_version.clone(),
-                        None,
-                        controller_choice.next_eligible_version.clone(),
-                    );
-                    any_failed = true;
-                    continue;
-                }
+        let choice = match eligibility::choose(
+            &listing,
+            cfg,
+            installed_version.as_deref(),
+            &bad,
+            is_controller,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                let reason = one_line(&e.to_string());
+                journal_err(
+                    "eligibility_failed",
+                    &[("component", name), ("reason", &reason)],
+                );
+                record(
+                    &mut st,
+                    name,
+                    StatusText::Failed {
+                        reason: reason.clone(),
+                    },
+                    installed_version.clone(),
+                    None,
+                    None,
+                );
+                any_failed = true;
+                continue;
             }
-        } else {
-            controller_choice
         };
-        let is_agent = is_lu && agent_in_release;
-        let is_controller = is_lu && !agent_in_release;
         let next = choice.next_eligible_version.clone();
         let release = match choice.candidate {
             Some(r) => r,
@@ -474,19 +512,16 @@ fn execute_cycle(
                 continue;
             }
         };
-        let ctx = apply::ApplyContext {
-            cfg,
-            prefix,
-            config_path: Some(loaded.config_path.as_path()),
-            verifier: Some(verifier.clone()),
-            verify_config: Some(&loaded.verify),
-        };
         let outcome = if is_reiki {
             apply::apply_reiki(&component, &release.tag, &ctx, &mut st)
-        } else if is_agent {
-            apply::apply_agent(&component, &release.tag, &ctx, &mut st)
-        } else if is_controller {
-            apply::apply_controller(&component, &release.tag, &release.body, &ctx, &mut st)
+        } else if is_lu {
+            // `role` was detected from installed/enabled systemd units above.
+            let Some(role) = role else {
+                return Err(Error::msg(
+                    "internal error: Lu role was not detected for an installed component",
+                ));
+            };
+            apply::apply_lu(&component, &release.tag, &release.body, role, &ctx, &mut st)
         } else {
             apply::plain_install(&component, &release.tag, &ctx).map(|_| None)
         };
@@ -589,6 +624,9 @@ struct StatusRow {
     installed_version: Option<String>,
     last_version: Option<String>,
     next_eligible_version: Option<String>,
+    last_check: Option<String>,
+    bad_versions: Vec<String>,
+    auto_update: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -638,6 +676,14 @@ fn handle_status_locked(
             .clone()
             .unwrap_or_else(|| "hold file present".to_string())
     });
+    let status_ctx = apply::ApplyContext {
+        cfg,
+        prefix,
+        config_path: Some(loaded.config_path.as_path()),
+        verifier: None,
+        verify_config: None,
+    };
+    let lu_is_controller = installed_lu_is_controller(&status_ctx, &installed);
     // The same evaluator backs `status`, `update --check` and auto-update so
     // their per-component lines cannot disagree.
     let reports = report::evaluate_all(
@@ -661,7 +707,7 @@ fn handle_status_locked(
             cfg,
             installed_version.as_deref(),
             &bad,
-            name == "lu",
+            name == "lu" && lu_is_controller,
             &st,
         )
         .or_else(|| current.latest_version.clone());
@@ -679,6 +725,9 @@ fn handle_status_locked(
             installed_version: current.installed_version.clone(),
             last_version: entry.and_then(|e| e.version.clone()),
             next_eligible_version: next,
+            last_check: entry.map(|e| e.at.clone()),
+            bad_versions: bad,
+            auto_update: component.auto_update,
         });
     }
     if json {
@@ -718,7 +767,21 @@ fn handle_status_locked(
             );
         }
         for row in &rows {
-            println!("{}: {}", row.component, row.status);
+            println!(
+                "{}: {} | auto_update={} installed={} latest={} last_check={} last_result={} bad={}",
+                row.component,
+                row.status,
+                row.auto_update,
+                row.installed_version.as_deref().unwrap_or("-"),
+                row.next_eligible_version.as_deref().unwrap_or("-"),
+                row.last_check.as_deref().unwrap_or("never"),
+                row.last_result,
+                if row.bad_versions.is_empty() {
+                    "-".to_string()
+                } else {
+                    row.bad_versions.join(",")
+                }
+            );
         }
     }
     Ok(ExitCode::SUCCESS)

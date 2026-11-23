@@ -289,6 +289,31 @@ fn resolve_location(base: &str, location: &str) -> Result<String> {
     Ok(format!("{prefix}{directory}/{location}"))
 }
 
+/// Check a component's local admin health endpoint. Only https and loopback
+/// http URLs are accepted, and redirects are not followed. A non-2xx response
+/// is an unhealthy component rather than a transport error.
+pub fn health_check(url: &str, timeout: Duration) -> Result<bool> {
+    let loopback = url.starts_with("http://127.0.0.1:")
+        || url.starts_with("http://localhost:")
+        || url.starts_with("http://[::1]:");
+    if !url.starts_with("https://") && !loopback {
+        return Err(Error::Http(format!(
+            "health URL must be https or loopback http: {url}"
+        )));
+    }
+    let agent = ureq::AgentBuilder::new()
+        .timeout(timeout)
+        .redirects(0)
+        .build();
+    match agent.get(url).set("User-Agent", "tuishou").call() {
+        Ok(response) => Ok((200..300).contains(&response.status())),
+        Err(ureq::Error::Status(_, _)) => Ok(false),
+        Err(e) => Err(Error::Http(redact_secrets(&format!(
+            "health check {url} failed: {e}"
+        )))),
+    }
+}
+
 pub fn ensure_https(url: &str) -> Result<()> {
     if url.starts_with("https://") {
         return Ok(());

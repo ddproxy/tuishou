@@ -29,6 +29,18 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked --features test-hooks -- -D warnings
       - name: Test
         run: cargo test --workspace --locked --features test-hooks
+      - name: Installer test
+        run: bash tests/installer_test.sh
+      - name: Docs check
+        run: bash scripts/docs-check.sh
+      - name: ShellCheck
+        run: |
+          set -eu
+          if ! command -v shellcheck >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          fi
+          shellcheck install.sh tests/installer_test.sh tests/fixtures/installer/*.sh scripts/*.sh
       # The runner user is already non-root. This step proves the suite does not depend on a
       # working gh CLI, an external network or a populated HOME; a unit test also checks that the
       # source never spawns gh.

@@ -98,10 +98,13 @@ pub fn choose(
             Ok(v) => v,
             Err(_) => continue,
         };
-        if cfg.channel == crate::config::Channel::Release && version.is_prerelease() {
-            continue;
-        }
-        if rel.prerelease && cfg.channel == crate::config::Channel::Release {
+        // The only accepted channel is stable. A prerelease is never eligible,
+        // regardless of the `prerelease` flag on the release object, and is
+        // called out in the first reason so `status` can explain the skip.
+        if version.is_prerelease() || rel.prerelease {
+            if first_reason.is_none() {
+                first_reason = Some(format!("{} is a prerelease; stable channel only", rel.tag));
+            }
             continue;
         }
         if bad_versions.iter().any(|b| b == &rel.tag) {
@@ -279,7 +282,7 @@ mod tests {
             components: vec!["lu".to_string()],
             policy: AutoPolicy::Patch,
             min_release_age: "0s".to_string(),
-            channel: Channel::Release,
+            channel: Channel::Stable,
             controller_policy: ControllerPolicy::Manual,
             ..AutoUpdateConfig::default()
         }
@@ -383,29 +386,43 @@ mod tests {
     }
 
     #[test]
-    fn candidate_selection_uses_semver_precedence_not_list_order() {
-        let mut c = cfg();
-        c.channel = crate::config::Channel::Prerelease;
+    fn prereleases_are_refused_on_the_stable_channel() {
+        let c = cfg();
+        // Both the release flag and a prerelease tag are refused.
         let l = listing(vec![
-            rel("v1.2.1-rc1", None, "", true),
-            rel("v1.2.1-rc.10", None, "", true),
-            rel("v1.2.1-rc2", None, "", true),
+            rel("v1.2.1-rc1", None, "", false),
+            rel("v1.2.2", None, "", true),
+        ]);
+        let choice = choose(&l, &c, Some("v1.2.0"), &[], false).unwrap();
+        assert!(choice.candidate.is_none());
+        let reason = choice.reason.unwrap();
+        assert!(reason.contains("prerelease"), "{reason}");
+        assert!(reason.contains("stable channel only"), "{reason}");
+    }
+
+    #[test]
+    fn candidate_selection_uses_semver_precedence_not_list_order() {
+        let c = cfg();
+        let l = listing(vec![
+            rel("v1.2.1", None, "notes", false),
+            rel("v1.2.3", None, "notes", false),
+            rel("v1.2.2", None, "notes", false),
         ]);
         for reversed in [false, true] {
             let mut releases = l.releases.clone();
             if reversed {
                 releases.reverse();
             }
-            let choice = choose(&listing(releases), &c, Some("v1.2.1-rc1"), &[], false).unwrap();
-            assert_eq!(choice.candidate.unwrap().tag, "v1.2.1-rc.10");
+            let choice = choose(&listing(releases), &c, Some("v1.2.0"), &[], false).unwrap();
+            assert_eq!(choice.candidate.unwrap().tag, "v1.2.3");
         }
 
-        c.channel = crate::config::Channel::Release;
+        // A prerelease never wins even when it sorts above the stable release.
         let l = listing(vec![
             rel("v1.2.1-rc2", None, "", true),
-            rel("v1.2.1", None, "", false),
+            rel("v1.2.1", None, "notes", false),
         ]);
-        let choice = choose(&l, &c, Some("v1.2.1-rc1"), &[], false).unwrap();
+        let choice = choose(&l, &c, Some("v1.2.0"), &[], false).unwrap();
         assert_eq!(choice.candidate.unwrap().tag, "v1.2.1");
     }
 

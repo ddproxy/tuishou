@@ -5,6 +5,8 @@
 //! after stripping a single leading `v`.
 
 use serde::Deserialize;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeStatus {
@@ -17,6 +19,8 @@ pub struct NodeStatus {
     pub current_job: Option<serde_json::Value>,
     #[serde(default)]
     pub online: Option<bool>,
+    #[serde(default)]
+    pub last_seen: Option<String>,
 }
 
 pub fn parse_nodes(json: &str) -> Result<Vec<NodeStatus>, String> {
@@ -72,6 +76,25 @@ pub fn node_reports_version(json: &str, node: &str, tag: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A node must report both the exact version and a recent heartbeat. Missing
+/// or unparseable timestamps fail closed so an offline node cannot pass health.
+pub fn node_healthy(json: &str, node: &str, tag: &str, max_age: std::time::Duration) -> bool {
+    if !node_reports_version(json, node, tag) {
+        return false;
+    }
+    let Ok(status) = find_node(json, node) else {
+        return false;
+    };
+    let Some(last_seen) = status.last_seen.as_deref() else {
+        return false;
+    };
+    let Ok(seen) = OffsetDateTime::parse(last_seen, &Rfc3339) else {
+        return false;
+    };
+    let now = OffsetDateTime::now_utc();
+    now >= seen && (now - seen) <= max_age
+}
+
 /// `lu status --json` reports a controller version and a `jobs` object.
 pub fn status_reports_version(json: &str, tag: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(json)
@@ -82,6 +105,19 @@ pub fn status_reports_version(json: &str, tag: &str) -> bool {
                 .map(|reported| normalize_version(reported) == normalize_version(tag))
         })
         .unwrap_or(false)
+}
+
+/// A minimal reachability signal: the controller answered with a status
+/// document that includes its version. Idleness is checked separately.
+pub fn status_available(json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| {
+            v.get("version")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .is_some()
 }
 
 /// Controller idleness requires all four busy counters to be present,

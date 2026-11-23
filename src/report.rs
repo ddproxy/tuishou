@@ -403,12 +403,13 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_binaries_are_not_required_for_lu() {
+    fn lu_requires_the_controller_and_agent_binary_pair() {
         let lu = crate::component::resolve_component("lu", &crate::component::builtin_components())
             .unwrap();
-        assert_eq!(lu.required_binaries("v0.4.0"), vec!["lu".to_string()]);
-        assert!(lu
-            .expected_binaries("v0.4.0")
-            .contains(&"lu-agent".to_string()));
+        assert_eq!(
+            lu.required_binaries("v0.4.0"),
+            vec!["lu".to_string(), "ting".to_string()]
+        );
+        assert!(lu.expected_binaries("v0.4.0").contains(&"ting".to_string()));
     }
 }

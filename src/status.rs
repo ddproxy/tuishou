@@ -1,5 +1,5 @@
 use crate::auto_update::state;
-use crate::component::Component;
+use crate::component::{self, Component};
 use crate::error::{Error, Result};
 use crate::report;
 use serde::Serialize;
@@ -31,14 +31,38 @@ fn last_check_for<'a>(component: &str, auto: &'a state::AutoState) -> Option<&'a
         .or(auto.last_check.as_deref())
 }
 
-fn format_status_line(entry: &StatusEntry, last_check: Option<&str>) -> String {
+fn last_result_for<'a>(component: &str, auto: &'a state::AutoState) -> &'a str {
+    auto.results
+        .get(component)
+        .map(|result| result.result.as_str())
+        .unwrap_or("never")
+}
+
+fn auto_update_for(component: &str) -> bool {
+    component::resolve_component(component, &component::builtin_components())
+        .is_ok_and(|c| c.auto_update)
+}
+
+fn format_status_line(
+    entry: &StatusEntry,
+    last_check: Option<&str>,
+    last_result: &str,
+    bad: &[String],
+) -> String {
     format!(
-        "{}: {} | installed={} latest={} last_check={}",
+        "{}: {} | auto_update={} installed={} latest={} last_check={} last_result={} bad={}",
         entry.component,
         entry.status,
+        auto_update_for(&entry.component),
         entry.installed_version.as_deref().unwrap_or("-"),
         entry.latest_version.as_deref().unwrap_or("-"),
-        last_check.unwrap_or("never")
+        last_check.unwrap_or("never"),
+        last_result,
+        if bad.is_empty() {
+            "-".to_string()
+        } else {
+            bad.join(",")
+        }
     )
 }
 
@@ -46,7 +70,10 @@ fn format_status_line(entry: &StatusEntry, last_check: Option<&str>) -> String {
 struct JsonStatus<'a> {
     #[serde(flatten)]
     report: &'a StatusEntry,
+    auto_update: bool,
     last_check: Option<&'a str>,
+    last_result: &'a str,
+    bad_versions: &'a [String],
 }
 
 pub fn print_status(
@@ -62,7 +89,14 @@ pub fn print_status(
             .iter()
             .map(|entry| JsonStatus {
                 report: entry,
+                auto_update: auto_update_for(&entry.component),
                 last_check: last_check_for(&entry.component, &auto),
+                last_result: last_result_for(&entry.component, &auto),
+                bad_versions: auto
+                    .bad_versions
+                    .get(&entry.component)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
             })
             .collect();
         println!(
@@ -77,7 +111,15 @@ pub fn print_status(
     for entry in entries {
         println!(
             "{}",
-            format_status_line(entry, last_check_for(&entry.component, &auto))
+            format_status_line(
+                entry,
+                last_check_for(&entry.component, &auto),
+                last_result_for(&entry.component, &auto),
+                auto.bad_versions
+                    .get(&entry.component)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )
         );
     }
     Ok(())
@@ -90,8 +132,8 @@ mod tests {
     use crate::report::StatusText;
 
     #[test]
-    fn status_line_carries_versions_and_check_time() {
-        let component = resolve_component("lu", &crate::component::builtin_components()).unwrap();
+    fn status_line_carries_versions_check_result_and_bad_marks() {
+        let component = resolve_component("lu", &component::builtin_components()).unwrap();
         let mut entry = StatusEntry::new(
             &component,
             StatusText::UpdateAvailable {
@@ -101,11 +143,16 @@ mod tests {
         );
         entry.installed_version = Some("v0.4.0".to_string());
         entry.latest_version = Some("v0.5.0".to_string());
-        let line = format_status_line(&entry, Some("2026-01-02T03:04:05Z"));
+        let line = format_status_line(
+            &entry,
+            Some("2026-01-02T03:04:05Z"),
+            "up to date",
+            &["v0.4.9".to_string()],
+        );
         assert_eq!(
             line,
-            "lu: update available v0.4.0 -> v0.5.0 | installed=v0.4.0 latest=v0.5.0 last_check=2026-01-02T03:04:05Z"
+            "lu: update available v0.4.0 -> v0.5.0 | auto_update=false installed=v0.4.0 latest=v0.5.0 last_check=2026-01-02T03:04:05Z last_result=up to date bad=v0.4.9"
         );
-        assert!(format_status_line(&entry, None).contains("last_check=never"));
+        assert!(format_status_line(&entry, None, "never", &[]).contains("last_check=never"));
     }
 }

@@ -5,32 +5,51 @@ remote roll command: each node pulls, verifies, drains, installs, restarts,
 checks health and rolls back on its own. `tuishou update` and the opt-in
 `tuishou auto-update run` are the only update paths.
 
+A Lu release contains both `lu` (the controller) and `ting` (the node agent).
+They are installed, backed up as `.prev`, and rolled back as a pair. The role is
+never guessed from archive contents: `tuishou` restarts the unit that is both
+installed (`systemctl cat`) and enabled (`systemctl is-enabled --quiet`). The
+defaults are `ting.service` for the agent and `lu-controller.service` for the
+controller; both or neither qualifying fails closed.
+
 ## What one cycle does
 
-For the Lu agent and Reiki, a component update follows this order:
+For the agent and Reiki on a node running Lu:
 
-1. **Drain.** `lu drain <node>` marks the node draining. `tuishou` then polls
-   `lu nodes --json` until the node reports `draining: true` with no active job,
-   subject to `[auto_update].drain_timeout` (default `5m`). A timeout aborts
-   before any binary is replaced.
-2. **Install.** The release archive is verified in process (SHA-256 plus the
-   GitHub attestation) and the new binary is installed atomically; the previous
-   version is kept as a backup.
-3. **Restart.** The relevant systemd unit is restarted:
-   `lu-agent.service` for the Lu agent, the configured Reiki unit for Reiki.
-   Reiki is always applied **before** the Lu agent when both are due, even if
-   `[auto_update].components` lists them the other way around.
-4. **Health check.** `tuishou` polls `lu nodes --json` for the exact new version
-   and `lu status --json` for controller health, subject to
-   `[auto_update].health_timeout` (default `5m`). Reiki additionally runs
-   `reiki check --config <path>` before and after its restart.
-5. **Rollback on failure.** A failed install, check, restart or health check
-   restores the previous binary, restarts the unit, verifies the old version is
-   healthy, and undrains the node. The bad version is marked so later cycles
-   skip it. If health cannot be restored, the node stays drained so no new
-   work is accepted.
+1. **Drain.** `lu drain <node>` is issued only when the controller is reachable.
+   `tuishou` then polls `lu nodes --json` until the node reports `draining: true`
+   with no active job, subject to `[auto_update].drain_timeout` (default `30m`).
+   A timeout aborts before any binary is replaced and undrains the node.
+2. **Stage and install.** The release archive is verified in process (SHA-256
+   plus the GitHub attestation). Reiki's new binary is checked with
+   `reiki check --config <path>` **before** any swap; a failure keeps the old
+   binary and marks the candidate bad. The new pair is installed atomically and
+   the previous pair is kept as `.prev`.
+3. **Restart.** The detected systemd unit is restarted: `ting.service` for the
+   agent, `lu-controller.service` for the controller, the configured Reiki unit
+   for Reiki. Reiki is always applied **before** the Lu agent when both are due,
+   even if `[auto_update].components` lists them the other way around.
+4. **Health check.** The agent must appear in `lu nodes --json` at the exact new
+   version with a heartbeat no older than `heartbeat_max_age` (default `5m`).
+   The controller must report the new version in `lu status --json`. Reiki
+   additionally requires an active unit, `reiki check` after restart, and a
+   healthy `reiki_health_url` admin endpoint (default
+   `http://127.0.0.1:8080/health`). Polls are bounded by `health_timeout`
+   (default `5m`).
+5. **Rollback on failure.** A failed check, restart or health check restores
+   the previous pair, restarts the unit, verifies the old version is healthy,
+   marks the new version bad and records the result in status. Undrain is
+   attempted on every failure path, including a failed recovery.
 6. **Undrain.** On success, `lu undrain <node>` returns the node to service. A
    failed undrain is reported as a failure rather than hidden.
+
+For the controller, `[auto_update].controller_policy` defaults to `manual`, so
+controller updates are skipped until set to `when_idle` or `window`. Before any
+swap, `lu backup --out <file>` must produce a non-empty backup under
+`backup_dir`; a failed backup refuses the update. `lu status --json` is then
+polled until no jobs are leased, running, recovering or needing input, up to
+`controller_wait_timeout` (default `30m`). A release whose notes signal a new
+database schema also skips the controller for manual migration.
 
 Every `lu` and `systemctl` child runs with an argument vector and a hard
 deadline (`[auto_update].command_timeout`, default `30s`); a hung child is
@@ -45,13 +64,15 @@ invocation (or pass `--config`), then run:
 tuishou update --check          # optional: show what would be updated
 tuishou update                  # update all installed components
 tuishou update reiki            # or one component at a time
-tuishou status --json           # inspect the result and state
+tuishou status --json           # installed_version/latest_version/last_check/last_result/bad_versions
 ```
 
 `--prefix` selects an install prefix; its `.tuishou.json` state lives under the
-prefix. A manual `update` honours the `[update]` settings below. A failing
-health check exits non-zero and writes a receipt under the state directory;
-use `tuishou rollback <component>` if you need to restore a version yourself.
+prefix. A manual `update` honours the `[update]` settings below. A failing health
+check exits non-zero and writes a receipt under the state directory; use
+`tuishou rollback <component>` if you need to restore a version yourself.
+Manual `--allow-unattested` is available for direct installs but is never used
+by auto-update, which always verifies attestations.
 
 ## Local controls
 
@@ -78,17 +99,26 @@ too. With `max_unavailable` unset, the controller is not consulted.
 ## Scheduling auto-update
 
 Auto-update is opt-in and **not recommended for production**: it installs new
-releases without human review. To enable it on a single node, set
-`[auto_update] enabled = true` in `tuishou.toml`, then inspect the timer unit
-it would use:
+releases without human review. Two switches are required: `[auto_update]
+enabled = true` and `auto_update = true` in each `[[component]]` block you want
+scheduled. `[auto_update].components` does not opt components in. Only the
+`stable` channel is accepted; prereleases are refused.
+
+The shipped `contrib/tuishou-update.service` and `contrib/tuishou-update.timer`
+run one cycle with a randomized delay and `Persistent=true`. Set the config path
+in `ExecStart` and the interval in the timer, install both units, then enable
+the timer:
 
 ```sh
-tuishou auto-update install-timer --interval 10m
+systemctl enable --now tuishou-update.timer
 ```
 
-The command prints the systemd service and timer; it never installs them.
-Schedule them with your configuration management if you accept unattended
-updates. See [auto-update.md](auto-update.md) for the full configuration.
+`tuishou auto-update install-timer --interval 10m` prints an equivalent unit
+pair (it never installs them). To enable only the agent on a node, set
+`auto_update = true` on `[[component]] name = "lu"` and leave the other
+components off; the controller stays manual until `controller_policy` is
+relaxed and a backup directory is configured. See [auto-update.md](auto-update.md)
+for the full configuration.
 
 ## Updating many nodes
 
@@ -104,7 +134,8 @@ available:
   next cycle. Combine it with a short scheduler interval so retries happen
   promptly. Failure to read the controller state also skips the cycle.
 
-An example Ansible task installs `tuishou` on every node and runs the update
+The timer's `RandomizedDelaySec` provides a second layer of fleet jitter. An
+example Ansible task installs `tuishou` on every node and runs the update
 locally, with no SSH orchestration from tuishou itself:
 
 ```yaml

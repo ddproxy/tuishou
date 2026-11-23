@@ -105,6 +105,14 @@ fn make_tar_gz(files: &[(&str, &[u8], Option<u32>)]) -> Vec<u8> {
     gz
 }
 
+// A Lu release always carries both binaries; stage helpers keep fixtures honest.
+fn make_lu_tar_gz(lu: &[u8]) -> Vec<u8> {
+    make_tar_gz(&[
+        ("lu", lu, Some(0o755)),
+        ("ting", b"#!/bin/sh\necho ting\n", Some(0o755)),
+    ])
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -185,7 +193,7 @@ fn install_success_and_state_round_trip() {
     fs::create_dir_all(&home).unwrap();
     let prefix = td.path().join("prefix");
     let target = current_target();
-    let archive = make_tar_gz(&[("lu", b"#!/bin/sh\necho lu\n", Some(0o755))]);
+    let archive = make_lu_tar_gz(b"#!/bin/sh\necho lu\n");
     let asset = format!("lu-v0.4.0-{target}.tar.gz");
     let server = FakeServer::start_with(|base| {
         setup_release(base, "ddproxy/tuishou-lu", "v0.4.0", &asset, &archive)
@@ -240,7 +248,7 @@ fn wrong_checksum_fails() {
     fs::create_dir_all(&home).unwrap();
     let prefix = td.path().join("prefix");
     let target = current_target();
-    let archive = make_tar_gz(&[("lu", b"good", Some(0o755))]);
+    let archive = make_lu_tar_gz(b"good");
     let asset = format!("lu-v0.4.0-{target}.tar.gz");
     let checksum_name = format!("{asset}.sha256");
     let server = FakeServer::start_with(|base| {
@@ -301,7 +309,7 @@ fn truncated_download_fails_closed() {
     fs::create_dir_all(&home).unwrap();
     let prefix = td.path().join("prefix");
     let target = current_target();
-    let archive = make_tar_gz(&[("lu", b"good", Some(0o755))]);
+    let archive = make_lu_tar_gz(b"good");
     let truncated = archive[..archive.len() / 2].to_vec();
     let asset = format!("lu-v0.4.0-{target}.tar.gz");
     let checksum_name = format!("{asset}.sha256");
@@ -355,7 +363,7 @@ fn oversize_download_fails() {
     fs::create_dir_all(&home).unwrap();
     let prefix = td.path().join("prefix");
     let target = current_target();
-    let archive = make_tar_gz(&[("lu", &vec![b'a'; 2048], Some(0o755))]);
+    let archive = make_lu_tar_gz(&vec![b'a'; 2048]);
     let asset = format!("lu-v0.4.0-{target}.tar.gz");
     let checksum_name = format!("{asset}.sha256");
     let server = FakeServer::start_with(|base| {
@@ -611,8 +619,8 @@ fn prev_retention_and_rollback() {
     fs::create_dir_all(&home).unwrap();
     let prefix = td.path().join("prefix");
     let target = current_target();
-    let a1 = make_tar_gz(&[("lu", b"v1", Some(0o755))]);
-    let a2 = make_tar_gz(&[("lu", b"v2", Some(0o755))]);
+    let a1 = make_lu_tar_gz(b"v1");
+    let a2 = make_lu_tar_gz(b"v2");
     let asset1 = format!("lu-v0.4.0-{target}.tar.gz");
     let asset2 = format!("lu-v0.5.0-{target}.tar.gz");
     let server = FakeServer::start_with(|base| {
@@ -718,8 +726,8 @@ fn update_check_exit_codes() {
     fs::create_dir_all(&home).unwrap();
     let prefix = td.path().join("prefix");
     let target = current_target();
-    let a1 = make_tar_gz(&[("lu", b"v1", Some(0o755))]);
-    let a2 = make_tar_gz(&[("lu", b"v2", Some(0o755))]);
+    let a1 = make_lu_tar_gz(b"v1");
+    let a2 = make_lu_tar_gz(b"v2");
     let asset1 = format!("lu-v0.4.0-{target}.tar.gz");
     let asset2 = format!("lu-v0.5.0-{target}.tar.gz");
     let server = FakeServer::start_with(|base| {
@@ -822,8 +830,8 @@ fn major_version_refusal() {
     fs::create_dir_all(&home).unwrap();
     let prefix = td.path().join("prefix");
     let target = current_target();
-    let a1 = make_tar_gz(&[("lu", b"v1", Some(0o755))]);
-    let a2 = make_tar_gz(&[("lu", b"v2", Some(0o755))]);
+    let a1 = make_lu_tar_gz(b"v1");
+    let a2 = make_lu_tar_gz(b"v2");
     let asset1 = format!("lu-v0.4.0-{target}.tar.gz");
     let asset2 = format!("lu-v1.0.0-{target}.tar.gz");
     let server = FakeServer::start_with(|base| {
@@ -953,7 +961,7 @@ fn bare_update_check_reports_every_default_in_table_order() {
         (
             "ddproxy/tuishou-lu",
             format!("lu-{tag}-{target}.tar.gz"),
-            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
+            make_lu_tar_gz(b"lu"),
         ),
         (
             "ddproxy/tuishou",
@@ -1026,7 +1034,7 @@ fn check_reports_all_components_when_one_evaluation_fails() {
         (
             "ddproxy/tuishou-lu",
             format!("lu-{tag}-{target}.tar.gz"),
-            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
+            make_lu_tar_gz(b"lu"),
         ),
         (
             "ddproxy/tuishou",
@@ -1073,7 +1081,7 @@ fn explicit_update_installs_a_not_installed_component() {
     let target = current_target();
     let tag = "v0.5.0";
     let asset = format!("lu-{tag}-{target}.tar.gz");
-    let archive = make_tar_gz(&[("lu", b"new lu", Some(0o755))]);
+    let archive = make_lu_tar_gz(b"new lu");
     let server = FakeServer::start_with(|base| {
         setup_release(base, "ddproxy/tuishou-lu", tag, &asset, &archive)
     });
@@ -1110,7 +1118,7 @@ fn install_all_reports_missing_binaries_without_failing() {
         (
             "ddproxy/tuishou-lu",
             format!("lu-{tag}-{target}.tar.gz"),
-            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
+            make_lu_tar_gz(b"lu"),
         ),
         (
             "ddproxy/tuishou",
@@ -1283,7 +1291,7 @@ fn status_line_shows_versions_and_last_check() {
         (
             "ddproxy/tuishou-lu",
             format!("lu-{tag}-{target}.tar.gz"),
-            make_tar_gz(&[("lu", b"lu", Some(0o755))]),
+            make_lu_tar_gz(b"lu"),
         ),
         (
             "ddproxy/tuishou",

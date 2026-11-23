@@ -1,0 +1,11 @@
+[Unit]
+Description=Run tuishou auto-update on a schedule
+
+[Timer]
+OnBootSec=10m
+OnActiveSec=10m
+RandomizedDelaySec=1m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
