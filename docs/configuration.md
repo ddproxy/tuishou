@@ -17,7 +17,7 @@ The default path is `./tuishou.toml`. `--config <path>` or `TUISHOU_CONFIG` over
 | `components` | `reiki`, `lu`, `tuishou` | Components auto-update considers. |
 | `policy` | `patch` | `patch`, `minor` or `any`. |
 | `min_release_age` | `10m` | Delay before a release is eligible. |
-| `channel` | `stable` | Only stable releases; `release` is a legacy alias. |
+| `channel` | `stable` | `stable` (only stable releases; `release` is a legacy alias) or `dev` (also automatic dev builds `vX.Y.Z-dev.N.g<hash>`, never for the controller). |
 | `max_version` | unset | Upper version bound. |
 | `require_attestation` | `true` | Always true; `false` is a config error. |
 | `controller_policy` | `manual` | `manual`, `when_idle` or `window`; non-manual needs `backup_dir`. |

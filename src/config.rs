@@ -212,14 +212,16 @@ impl From<AutoPolicy> for version::Policy {
     }
 }
 
-/// Auto-update only accepts stable releases. `release` is accepted as a legacy
-/// alias for `stable`; `prerelease` is rejected by deserialization.
+/// Which releases auto-update may take. `stable` takes stable releases only (`release` is a legacy
+/// alias). `dev` also takes automatic dev builds (pre-releases whose tag carries a `-dev.N.g<hash>`
+/// part) on non-controller components; `prerelease` is rejected by deserialization.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     #[default]
     #[serde(alias = "release")]
     Stable,
+    Dev,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]

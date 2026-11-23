@@ -45,8 +45,12 @@ its own `[[component]]` block sets `auto_update = true`. Listing a name in
 `[auto_update].components` filters or orders a cycle but does **not** opt it in.
 Defaults are off for all three built-ins. See [components.md](components.md).
 
-`channel` accepts only `stable` (`release` remains a legacy alias); prereleases
-are refused. `require_attestation = false` is a configuration error, and
+`channel` is `stable` (the default; `release` remains a legacy alias) or `dev`. `stable` refuses
+every prerelease. `dev` also takes automatic dev builds, which are GitHub prereleases tagged
+`vX.Y.Z-dev.<N>.g<hash>` (N is the number of commits since the last stable tag, so builds order
+by N, and a later stable `vX.Y.Z` supersedes all of its dev builds); other prereleases such as
+`-rc.1` stay refused, and the controller never takes a dev build, because schema migrations only
+move forward. Use `dev` on a canary node, not fleet-wide. `require_attestation = false` is a configuration error, and
 `--allow-unattested` is rejected by auto-update: there is no unverified fallback.
 Auto-update honours `min_release_age`, `start_delay_max`, `max_unavailable`
 (fleet limit) and bad-version marks on every cycle.
