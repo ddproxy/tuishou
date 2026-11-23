@@ -20,6 +20,7 @@ bin_dir=""
 dest=""
 tag=""
 prefix=""
+prefix_explicit=0
 release_json=""
 archive_name=""
 checksum_name=""
@@ -190,7 +191,7 @@ parse_components() {
 print_next() {
   printf '\nNext commands:\n'
   printf '  tuishou status\n'
-  printf '  tuishou top                         (planned; not in this build)\n'
+  printf '  tuishou top                         (host reiki top and lu top)\n'
   printf '  tuishou auto-update install-timer --interval 10m\n'
   printf '      Enable first with [auto_update] enabled = true in tuishou.toml.\n'
 }
@@ -229,10 +230,12 @@ while (($# > 0)); do
     --prefix)
       (($# >= 2)) || die_usage "--prefix needs a directory"
       prefix="$2"
+      prefix_explicit=1
       shift 2
       ;;
     --prefix=*)
       prefix="${1#*=}"
+      prefix_explicit=1
       shift
       ;;
     --no-components)
@@ -297,6 +300,10 @@ while [[ ${#prefix} -gt 1 && $prefix == */ ]]; do
   prefix="${prefix%/}"
 done
 bin_dir="$prefix/bin"
+# Without --prefix, tuishou itself picks its default bin directory and state file; passing the
+# directory would put state beside the binaries where a later plain `tuishou status` does not look.
+prefix_args=()
+if [[ $prefix_explicit -eq 1 ]]; then prefix_args=(--prefix "$bin_dir"); fi
 dest="$bin_dir/tuishou"
 
 if [[ -n $version_raw ]]; then
@@ -413,7 +420,9 @@ fi
 info "bootstrap: only the checksum can be checked before tuishou exists; in-process attestation cannot verify the verifier"
 
 mkdir -p "$stage_dir/extract"
-if ! tar -tzf "$stage_dir/$archive_name" | grep -qx 'tuishou'; then
+# Capture the listing first: with pipefail, grep -q exiting early makes tar die of SIGPIPE.
+archive_listing=$(tar -tzf "$stage_dir/$archive_name" 2>/dev/null) || die_install "could not list $archive_name"
+if ! grep -qx 'tuishou' <<<"$archive_listing"; then
   die_install "archive $archive_name does not contain a top-level tuishou binary"
 fi
 if ! tar -xzf "$stage_dir/$archive_name" -C "$stage_dir/extract" tuishou; then
@@ -453,7 +462,7 @@ fi
 pass "attestation: PASS (tuishou verify $archive_name)"
 printf '%s\n' "$verify_out"
 
-if ! "$dest" adopt tuishou --version "$tag" --prefix "$bin_dir" >/dev/null; then
+if ! "$dest" adopt tuishou --version "$tag" "${prefix_args[@]}" >/dev/null; then
   die_install "could not record tuishou $tag in state"
 fi
 
@@ -466,7 +475,7 @@ RESULTS+=("tuishou: $tuishou_state | $bin_dir | checksum PASS, attestation PASS 
 
 if [[ ${#COMPONENTS[@]} -gt 0 ]]; then
   for component in "${COMPONENTS[@]}"; do
-    if ! component_out=$("$dest" install "$component" --prefix "$bin_dir" 2>&1); then
+    if ! component_out=$("$dest" install "$component" "${prefix_args[@]}" 2>&1); then
       printf '%s\n' "$component_out" >&2
       die_install "tuishou install $component failed"
     fi
