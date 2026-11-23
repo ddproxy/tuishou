@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/ddproxy/tuishou)](https://github.com/ddproxy/tuishou/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Status: stable for the shell installer on Linux x86_64; this text describes tuishou v0.2.1. Scheduled auto-update is opt-in and off by default.
+Status: stable for the shell installer on Linux x86_64; this text describes tuishou v0.3.0. Scheduled auto-update is opt-in and off by default.
 
 ## What and why
 
@@ -51,8 +51,8 @@ tuishou update --check
 tuishou update
 
 # Inspect an artifact's attestation
-tuishou verify reiki-v0.2.1-x86_64-unknown-linux-musl.tar.gz \
-  --repo ddproxy/reiki --tag v0.2.1
+tuishou verify reiki-v0.3.0-x86_64-unknown-linux-musl.tar.gz \
+  --repo ddproxy/reiki --tag v0.3.0
 
 # Show one fixed-vocabulary status line per component (stable JSON with --json)
 tuishou status
@@ -264,9 +264,9 @@ What it does not cover: the shell bootstrap runs the downloaded binary's `verify
 
 | Layer | Target or client | Last checked |
 | --- | --- | --- |
-| Shell installer | Linux x86_64, `x86_64-unknown-linux-musl` | v0.2.1, 2026-11-22 |
+| Shell installer | Linux x86_64, `x86_64-unknown-linux-musl` | v0.3.0, 2026-11-22 |
 | Shell installer | Linux aarch64, macOS, other platforms | unsupported; manual install only |
-| tuishou binary | `x86_64-unknown-linux-musl` (verified target) | v0.2.1, 2026-11-22 |
+| tuishou binary | `x86_64-unknown-linux-musl` (verified target) | v0.3.0, 2026-11-22 |
 | tuishou binary | `aarch64-unknown-linux-musl` (verified target, built only with a cross-linker) | code path, 2026-11-22 |
 | tuishou binary | `x86_64-apple-darwin`, `aarch64-apple-darwin` (listed, unverified, not built by the release workflow) | code path, 2026-11-22 |
 | Components | `reiki` from `ddproxy/reiki`, `lu` from `ddproxy/tuishou-lu` | asset naming checked against source, 2026-11-22 |

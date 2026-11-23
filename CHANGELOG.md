@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.3.0]
+
 ### Added
 
 - Added `install.sh --expect-sha256 <digest>` to verify the bootstrap archive before extraction. The digest must come from an independent trusted record; the same-release `.sha256` is only a consistency check.
