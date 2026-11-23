@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## [0.3.3]
+
 ### Changed
 
 - Agent nodes drain, wait, check health and undrain through `ting drain`, `ting wait-idle`, `ting status --json` and `ting undrain`, so no operator credential is needed on a node. An older `ting` without these commands fails closed with guidance and leaves the node untouched. Requires a Lu release that includes the agent self-drain commands.
