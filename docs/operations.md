@@ -25,7 +25,7 @@ Structured lines are written to stderr as `tuishou: event=... key=value` and cap
 | Verify cache | `<prefix>/verify-cache`, else state parent plus `verify-cache` |
 | Health endpoint | `auto_update.reiki_health_url`, default `http://127.0.0.1:8080/health` |
 
-Health checks use https or loopback http only. `tuishou status --json` gives machine-readable versions and statuses.
+Health checks use https, or http to loopback or an IP literal assigned to this machine (a Reiki admin listener bound to the node's own address qualifies; hostnames never do). `tuishou status --json` gives machine-readable versions and statuses.
 
 ## Auto-update
 

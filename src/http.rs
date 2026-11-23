@@ -340,7 +340,7 @@ pub fn health_check(url: &str, timeout: Duration) -> Result<bool> {
 
 /// Health probes bypass `ensure_allowed_url`, so their URL is parsed and
 /// checked here: https to any host, or cleartext http only to an exact
-/// loopback host. Userinfo is never accepted because it can hide the real
+/// loopback host or an IP literal assigned to this machine. Userinfo is never accepted because it can hide the real
 /// authority from a prefix check.
 pub fn validate_health_url(url: &str) -> Result<(String, u16)> {
     if has_userinfo(url) {
@@ -349,14 +349,25 @@ pub fn validate_health_url(url: &str) -> Result<(String, u16)> {
         ));
     }
     let (scheme, host, port, _) = url_parts(url)?;
-    let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1");
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1")
+        || is_local_interface_address(&host);
     if scheme == "https" || (scheme == "http" && loopback) {
         Ok((host, port))
     } else {
         Err(Error::Http(format!(
-            "health URL must be https or loopback http, got {scheme} host {host}"
+            "health URL must be https, or http to loopback or an address of this machine, got {scheme} host {host}"
         )))
     }
+}
+
+/// True when `host` is an IP literal that one of this machine's interfaces owns: binding a
+/// listener to a foreign address fails, so the probe never leaves the host. Names are never
+/// accepted because resolution could point anywhere.
+fn is_local_interface_address(host: &str) -> bool {
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    std::net::TcpListener::bind((ip, 0)).is_ok()
 }
 
 fn has_userinfo(url: &str) -> bool {
@@ -721,5 +732,13 @@ mod tests {
         assert!(ensure_allowed_url("http://127.0.0.1:8080/x").is_err());
         std::env::remove_var("TUISHOU_ALLOWED_HOSTS");
         std::env::remove_var("TUISHOU_ALLOW_INSECURE_HTTP");
+    }
+
+    #[test]
+    fn health_url_accepts_only_ip_literals_owned_by_this_machine() {
+        assert!(validate_health_url("http://127.0.0.2:4097/healthz").is_ok());
+        assert!(validate_health_url("http://192.0.2.1:4097/healthz").is_err());
+        assert!(validate_health_url("http://example.invalid:4097/healthz").is_err());
+        assert!(validate_health_url("https://192.0.2.1/healthz").is_ok());
     }
 }
