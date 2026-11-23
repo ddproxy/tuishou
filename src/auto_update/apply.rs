@@ -131,13 +131,68 @@ pub fn plain_install(component: &Component, version: &str, ctx: &ApplyContext<'_
     Ok(())
 }
 
-fn node_name(cfg: &AutoUpdateConfig) -> String {
-    cfg.node_name
+/// The name this node is registered under in Lu. Order: `[auto_update] node_name`, the
+/// TUISHOU_NODE_NAME variable, the `[agent] name` of the ting configuration, then the system
+/// hostname. systemd does not set HOSTNAME for units, so it is never consulted, and `localhost`
+/// or an empty name is refused: a wrong name would drain the wrong node or none.
+fn node_name(cfg: &AutoUpdateConfig) -> Result<String> {
+    let candidate = cfg
+        .node_name
         .clone()
         .or_else(|| std::env::var("TUISHOU_NODE_NAME").ok())
-        .or_else(|| std::env::var("HOSTNAME").ok())
+        .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "localhost".to_string())
+        .or_else(|| ting_agent_name(cfg))
+        .or_else(system_hostname);
+    match candidate {
+        Some(name) if name != "localhost" && valid_node_name(&name) => Ok(name),
+        Some(name) => Err(Error::msg(format!(
+            "refusing node name {name:?}: set [auto_update] node_name or the ting [agent] name"
+        ))),
+        None => Err(Error::msg(
+            "cannot determine this node's name: set [auto_update] node_name or the ting [agent] name",
+        )),
+    }
+}
+
+fn valid_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 253
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+fn ting_agent_name(cfg: &AutoUpdateConfig) -> Option<String> {
+    let path = cfg
+        .ting_config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("/etc/ting/ting.toml"));
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > 64 * 1024 {
+        return None;
+    }
+    let text = fs::read_to_string(&path).ok()?;
+    let table: toml::Table = toml::from_str(&text).ok()?;
+    let name = table
+        .get("agent")?
+        .get("name")?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+fn system_hostname() -> Option<String> {
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(text) = fs::read_to_string(path) {
+            let name = text.trim().to_string();
+            if !name.is_empty() {
+                return Some(name);
+            }
+        }
+    }
+    None
 }
 
 fn tool(
@@ -249,22 +304,40 @@ pub fn apply_lu(
     }
 }
 
-/// The controller is reachable when `lu status --json` returns a complete
-/// status document. An unreachable controller means there is no drain to do.
+/// A node can coordinate a drain when its own agent reports a parsable self view, which means the
+/// controller answered it. An unreachable controller means there is no drain to do.
 fn controller_reachable(runner: &dyn ApplyRunner, ctx: &ApplyContext<'_>) -> bool {
     match checked(
         runner,
-        "lu",
+        "ting",
         &["status", "--json"],
         command_timeout(ctx).unwrap_or(Duration::from_secs(30)),
     ) {
-        Ok(out) => lu::status_available(&out.stdout),
+        Ok(out) => lu::parse_self(&out.stdout).is_ok(),
         Err(_) => false,
     }
 }
 
+/// Wrap a failed ting node command. An agent without the self-drain subcommands (Lu before the
+/// release that added them) must fail closed with a message that says what to do.
+fn ting_failure(action: &str, err: &Error) -> Error {
+    let text = err.to_string();
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("unrecognized subcommand")
+        || lower.contains("unexpected argument")
+        || lower.contains("invalid subcommand")
+        || lower.contains("not found in path")
+    {
+        return Error::msg(format!(
+            "ting cannot {action}: it lacks the agent self-drain commands; install a Lu release that includes `ting drain`, `ting undrain`, `ting status` and `ting wait-idle`"
+        ));
+    }
+    Error::msg(format!("ting {action} failed: {}", one_line(&text)))
+}
+
 fn undrain(runner: &dyn ApplyRunner, node: &str, ctx: &ApplyContext<'_>) -> Result<()> {
-    checked(runner, "lu", &["undrain", node], command_timeout(ctx)?)?;
+    checked(runner, "ting", &["undrain"], command_timeout(ctx)?)
+        .map_err(|e| ting_failure("undrain this node", &e))?;
     journal("agent_undrain", &[("node", node)]);
     Ok(())
 }
@@ -282,41 +355,30 @@ fn restart(runner: &dyn ApplyRunner, unit: &str, ctx: &ApplyContext<'_>) -> Resu
 
 fn drain_and_wait(runner: &dyn ApplyRunner, node: &str, ctx: &ApplyContext<'_>) -> Result<()> {
     let cmd_timeout = command_timeout(ctx)?;
-    if let Err(e) = checked(runner, "lu", &["drain", node], cmd_timeout) {
+    if let Err(e) = checked(runner, "ting", &["drain"], cmd_timeout) {
         let _ = undrain(runner, node, ctx);
         return Err(Error::msg(format!(
             "failed to drain node {node}: {}",
-            one_line(&e.to_string())
+            one_line(&ting_failure("drain this node", &e).to_string())
         )));
     }
     journal("agent_drain", &[("node", node)]);
 
+    // ting waits for the node to report drained with no current job, exiting nonzero on timeout.
     let drain_timeout = parse_duration(&ctx.cfg.drain_timeout)?;
-    let (drained, drain_error) = poll_until(drain_timeout, || {
-        match checked(runner, "lu", &["nodes", "--json"], cmd_timeout) {
-            Ok(out) => {
-                if lu::nodes_report_drained(&out.stdout, node) {
-                    Ok(true)
-                } else {
-                    journal("agent_drain_pending", &[("node", node)]);
-                    Ok(false)
-                }
-            }
-            Err(e) => {
-                journal(
-                    "agent_drain_poll_failed",
-                    &[("reason", &one_line(&e.to_string()))],
-                );
-                Err(e.to_string())
-            }
-        }
-    });
-    if !drained {
+    let wait_arg = format!("{}s", drain_timeout.as_secs().max(1));
+    let outer = drain_timeout + Duration::from_secs(30);
+    if let Err(e) = checked(
+        runner,
+        "ting",
+        &["wait-idle", "--timeout", &wait_arg],
+        outer,
+    ) {
         let _ = undrain(runner, node, ctx);
         return Err(Error::msg(format!(
-            "timed out after {} waiting for node {node} to drain{}",
+            "timed out after {} waiting for node {node} to drain: {}",
             ctx.cfg.drain_timeout,
-            detail_suffix(drain_error)
+            one_line(&e.to_string())
         )));
     }
     journal("agent_drained", &[("node", node)]);
@@ -427,15 +489,11 @@ fn node_healthy(
     if !active {
         return Ok(false);
     }
-    let out = checked(runner, "lu", &["nodes", "--json"], timeout).map_err(|e| e.to_string())?;
+    let _ = node;
+    let out = checked(runner, "ting", &["status", "--json"], timeout).map_err(|e| e.to_string())?;
     let heartbeat_max_age =
         parse_duration(&ctx.cfg.heartbeat_max_age).map_err(|e| e.to_string())?;
-    Ok(lu::node_healthy(
-        &out.stdout,
-        node,
-        version,
-        heartbeat_max_age,
-    ))
+    Ok(lu::self_is_healthy(&out.stdout, version, heartbeat_max_age))
 }
 
 fn controller_healthy(
@@ -530,8 +588,7 @@ pub fn apply_agent_on_lu_node(
     ctx: &ApplyContext<'_>,
     state: &mut AutoState,
 ) -> Result<bool> {
-    let node = node_name(ctx.cfg);
-    if !node_runs_lu(&SystemRunner, &node, ctx) {
+    if !node_runs_lu(&SystemRunner, "", ctx) {
         return Ok(false);
     }
     Ok(apply_agent_with_runner(component, version, ctx, state, &SystemRunner)?.is_none())
@@ -555,7 +612,7 @@ pub fn apply_agent_with_runner(
         );
         return Ok(Some(reason));
     }
-    let node = node_name(ctx.cfg);
+    let node = node_name(ctx.cfg)?;
     let unit = ctx.cfg.agent_unit.clone();
     // Drain only when the controller can confirm the drain. An unreachable
     // controller is not a reason to restart an agent without coordination.
@@ -606,8 +663,8 @@ pub fn apply_agent_with_runner(
         if drained {
             // The drain is part of the apply transaction: re-check it before
             // recording the new version or releasing the node.
-            match checked(runner, "lu", &["nodes", "--json"], command_timeout(ctx)?) {
-                Ok(out) if lu::nodes_report_drained(&out.stdout, &node) => {}
+            match checked(runner, "ting", &["status", "--json"], command_timeout(ctx)?) {
+                Ok(out) if lu::self_is_drained(&out.stdout) => {}
                 Ok(_) => {
                     commit_error = Some(format!(
                         "node {node} no longer reports drained with no active job before state commit"
@@ -819,7 +876,7 @@ pub fn apply_reiki_with_options(
         return Ok(None);
     }
 
-    let node = node_name(ctx.cfg);
+    let node = node_name(ctx.cfg)?;
     let drained = node_runs_lu(runner, &node, ctx);
     journal(
         "reiki_update_start",
@@ -1625,6 +1682,41 @@ mod tests {
                     }
                 },
                 ("lu", Some("status"), Some("--json")) => self.next_status(),
+                ("ting", Some("status"), Some("--json")) => {
+                    // Only the reachability probe (the first call) sees the outage.
+                    let first = self
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .commands
+                        .iter()
+                        .filter(|(p, a)| {
+                            p == "ting" && a.first().map(String::as_str) == Some("status")
+                        })
+                        .count()
+                        == 1;
+                    if first
+                        && self.status.lock().unwrap().front().map(String::as_str)
+                            == Some("not json")
+                    {
+                        return Err(Error::msg("controller unreachable"));
+                    }
+                    let body = match self.next_nodes() {
+                        Some(body) => body,
+                        None => {
+                            let (version, seen) = self.node.lock().unwrap().clone();
+                            node_json(&version, &seen)
+                        }
+                    };
+                    // The node's own view is the single object of the fleet array.
+                    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    value
+                        .as_array()
+                        .and_then(|a| a.first().cloned())
+                        .unwrap_or(value)
+                        .to_string()
+                }
+                ("ting", Some("drain" | "undrain" | "wait-idle"), _) => String::new(),
                 ("lu", Some("backup"), _) => {
                     if let Some(pos) = args.iter().position(|a| *a == "--out") {
                         if let Some(path) = args.get(pos + 1) {
@@ -1917,16 +2009,14 @@ mod tests {
         .unwrap();
 
         let cmds = calls.lock().unwrap().commands.clone();
-        assert!(cmds.iter().any(|(p, a)| p == "lu" && a == &["drain", "n1"]));
+        assert!(cmds.iter().any(|(p, a)| p == "ting" && a == &["drain"]));
         assert!(cmds
             .iter()
-            .any(|(p, a)| p == "lu" && a == &["nodes", "--json"]));
+            .any(|(p, a)| p == "ting" && a == &["status", "--json"]));
         assert!(cmds
             .iter()
             .any(|(p, a)| p == "systemctl" && a == &["restart", "ting.service"]));
-        assert!(cmds
-            .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+        assert!(cmds.iter().any(|(p, a)| p == "ting" && a == &["undrain"]));
         assert!(!cmds
             .iter()
             .any(|(p, a)| p == "lu" && a.iter().any(|x| x == "node")));
@@ -1955,10 +2045,10 @@ mod tests {
         let cmds = calls.lock().unwrap().commands.clone();
         assert!(!cmds
             .iter()
-            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
+            .any(|(p, a)| p == "ting" && a.first().map(String::as_str) == Some("drain")));
         assert!(!cmds
             .iter()
-            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("undrain")));
+            .any(|(p, a)| p == "ting" && a.first().map(String::as_str) == Some("undrain")));
         assert!(cmds
             .iter()
             .any(|(p, a)| p == "systemctl" && a == &["restart", "ting.service"]));
@@ -1989,7 +2079,7 @@ mod tests {
             .unwrap()
             .commands
             .iter()
-            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
+            .any(|(p, a)| p == "ting" && a.first().map(String::as_str) == Some("drain")));
     }
 
     #[test]
@@ -2025,9 +2115,7 @@ mod tests {
             2,
             "new and restored binaries must each be started"
         );
-        assert!(cmds
-            .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+        assert!(cmds.iter().any(|(p, a)| p == "ting" && a == &["undrain"]));
     }
 
     #[test]
@@ -2050,9 +2138,7 @@ mod tests {
         assert!(err.to_string().contains("recovery failed"));
         assert!(st.bad_versions["lu"].contains(&"v0.4.1".to_string()));
         let cmds = calls.lock().unwrap().commands.clone();
-        assert!(cmds
-            .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+        assert!(cmds.iter().any(|(p, a)| p == "ting" && a == &["undrain"]));
     }
 
     #[test]
@@ -2064,7 +2150,7 @@ mod tests {
         runner.set_node("0.4.1", &recent());
         runner
             .fail
-            .insert("lu undrain n1".to_string(), "permission denied".to_string());
+            .insert("ting undrain".to_string(), "permission denied".to_string());
 
         let err = apply_agent_with_runner(
             &lu_component(),
@@ -2109,9 +2195,7 @@ mod tests {
             2,
             "new and restored binaries must each be started"
         );
-        assert!(cmds
-            .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+        assert!(cmds.iter().any(|(p, a)| p == "ting" && a == &["undrain"]));
     }
 
     #[test]
@@ -2142,9 +2226,7 @@ mod tests {
                 .count(),
             2
         );
-        assert!(cmds
-            .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+        assert!(cmds.iter().any(|(p, a)| p == "ting" && a == &["undrain"]));
     }
 
     #[test]
@@ -2194,7 +2276,7 @@ mod tests {
         assert!(wait < restart);
         assert!(!cmds
             .iter()
-            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
+            .any(|(p, a)| p == "ting" && a.first().map(String::as_str) == Some("drain")));
     }
 
     #[test]
@@ -2469,7 +2551,7 @@ mod tests {
         let cmds = calls.lock().unwrap().commands.clone();
         assert!(!cmds
             .iter()
-            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
+            .any(|(p, a)| p == "ting" && a.first().map(String::as_str) == Some("drain")));
         assert!(!cmds
             .iter()
             .any(|(p, a)| p == "systemctl" && a.first().map(String::as_str) == Some("restart")));
@@ -2502,7 +2584,7 @@ mod tests {
         let cmds = calls.lock().unwrap().commands.clone();
         let drain = cmds
             .iter()
-            .position(|(p, a)| p == "lu" && a == &["drain", "n1"])
+            .position(|(p, a)| p == "ting" && a == &["drain"])
             .unwrap();
         let restart = cmds
             .iter()
@@ -2515,7 +2597,7 @@ mod tests {
         let health = calls.lock().unwrap().health_checks;
         let undrain = cmds
             .iter()
-            .position(|(p, a)| p == "lu" && a == &["undrain", "n1"])
+            .position(|(p, a)| p == "ting" && a == &["undrain"])
             .unwrap();
         assert!(drain < restart && restart < check && check < undrain);
         assert_eq!(health, 1, "admin health endpoint must be checked");
@@ -2554,7 +2636,7 @@ mod tests {
             .unwrap()
             .commands
             .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+            .any(|(p, a)| p == "ting" && a == &["undrain"]));
     }
 
     #[test]
@@ -2600,7 +2682,7 @@ mod tests {
             .unwrap()
             .commands
             .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+            .any(|(p, a)| p == "ting" && a == &["undrain"]));
     }
 
     #[test]
@@ -2629,6 +2711,43 @@ mod tests {
             .unwrap()
             .commands
             .iter()
-            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+            .any(|(p, a)| p == "ting" && a == &["undrain"]));
+    }
+
+    #[test]
+    fn node_name_prefers_config_then_ting_then_refuses_localhost() {
+        let td = tempfile::tempdir().unwrap();
+        let ting = td.path().join("ting.toml");
+        fs::write(&ting, "[agent]\nname = \"dev-ct-9\"\n").unwrap();
+        let mut c = AutoUpdateConfig {
+            ting_config: Some(ting.clone()),
+            ..AutoUpdateConfig::default()
+        };
+        c.node_name = Some("explicit".to_string());
+        assert_eq!(node_name(&c).unwrap(), "explicit");
+        c.node_name = None;
+        if std::env::var("TUISHOU_NODE_NAME").is_err() {
+            assert_eq!(node_name(&c).unwrap(), "dev-ct-9");
+        }
+        c.node_name = Some("localhost".to_string());
+        assert!(node_name(&c).is_err());
+        c.node_name = Some("bad name; rm".to_string());
+        assert!(node_name(&c).is_err());
+    }
+
+    #[test]
+    fn old_ting_without_self_drain_fails_closed_with_guidance() {
+        let td = tempfile::tempdir().unwrap();
+        let mut runner = FakeRunner::new();
+        runner.fail.insert(
+            "ting drain".to_string(),
+            "error: unrecognized subcommand 'drain'".to_string(),
+        );
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let err = drain_and_wait(&runner, "n1", &context)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("lacks the agent self-drain commands"), "{err}");
     }
 }

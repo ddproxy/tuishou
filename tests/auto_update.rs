@@ -361,6 +361,35 @@ exit 0
         );
         write_fake_tool(&bin, "lu", &lu);
 
+        let ting = format!(
+            r#"#!/bin/sh
+echo "ting $@" >> {log}
+if [ "$1" = "drain" ]; then touch {drained}; exit 0; fi
+if [ "$1" = "undrain" ]; then rm -f {drained}; exit 0; fi
+if [ "$1" = "wait-idle" ]; then exit 0; fi
+if [ "$1" = "status" ] && [ "$2" = "--json" ]; then
+  if [ -f {unreachable} ]; then exit 1; fi
+  SEEN=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [ ! -f {drained} ]; then
+    VER=0.4.0; DRAIN=false; JOB='{{"id":"j1"}}'
+  elif [ -f {restarted} ] && [ ! -f {stale} ]; then
+    VER=0.4.1; DRAIN=true; JOB=null
+  else
+    VER=0.4.0; DRAIN=true; JOB=null
+  fi
+  printf '{{"name":"n1","version":"%s","draining":%s,"current_job":%s,"online":true,"last_seen":"%s"}}\n' "$VER" "$DRAIN" "$JOB" "$SEEN"
+  exit 0
+fi
+exit 2
+"#,
+            log = shims.log.display(),
+            drained = shims.drained.display(),
+            restarted = shims.restarted.display(),
+            stale = shims.stale.display(),
+            unreachable = shims.unreachable.display(),
+        );
+        write_fake_tool(&bin, "ting", &ting);
+
         let systemctl = format!(
             r#"#!/bin/sh
 echo "systemctl $@" >> {log}
@@ -581,13 +610,13 @@ fn agent_drains_checks_health_and_undrains_in_order() {
     );
     let log = fx.shims.log();
     assert_no_legacy_lu_commands(&log);
-    let drain = log.find("lu drain n1").expect(&log);
-    let poll = log.find("lu nodes --json").expect(&log);
+    let drain = log.find("ting drain").expect(&log);
+    let poll = log.find("ting wait-idle --timeout 2s").expect(&log);
     let restart = log.find("systemctl restart ting.service").expect(&log);
     let active = log
         .find("systemctl is-active --quiet ting.service")
         .expect(&log);
-    let undrain = log.find("lu undrain n1").expect(&log);
+    let undrain = log.find("ting undrain").expect(&log);
     assert!(
         drain < poll && poll < restart && restart < active && active < undrain,
         "{log}"
@@ -627,7 +656,7 @@ fn unhealthy_agent_rolls_back_marks_bad_and_undrains() {
         2,
         "{log}"
     );
-    assert!(log.contains("lu undrain n1"), "{log}");
+    assert!(log.contains("ting undrain"), "{log}");
     assert_eq!(
         fs::read(fx.bin.join("lu")).unwrap(),
         b"#!/bin/sh\necho old lu\n"
@@ -662,7 +691,7 @@ fn controller_waits_for_idle_backs_up_and_uses_detected_unit() {
         log.contains("systemctl restart lu-controller.service"),
         "{log}"
     );
-    assert!(!log.contains("lu drain"), "{log}");
+    assert!(!log.contains("ting drain"), "{log}");
     assert!(fs::read_dir(fx.td.join("backups")).unwrap().any(|e| e
         .unwrap()
         .metadata()
@@ -725,7 +754,7 @@ fn reiki_staged_config_failure_keeps_old_binary_and_marks_bad() {
     );
     let log = fx.shims.log();
     assert!(!log.contains("systemctl restart reiki.service"), "{log}");
-    assert!(log.contains("lu undrain n1"), "{log}");
+    assert!(log.contains("ting undrain"), "{log}");
     assert_eq!(
         fs::read(fx.bin.join("reiki")).unwrap(),
         b"#!/bin/sh\necho old reiki\n"
@@ -761,7 +790,7 @@ fn failed_reiki_health_endpoint_rolls_back_and_marks_bad() {
         String::from_utf8_lossy(&out.stderr)
     );
     // The node stays drained when restored health cannot be verified.
-    assert!(!log.contains("lu undrain n1"), "{log}");
+    assert!(!log.contains("ting undrain"), "{log}");
     assert!(fx.shims.drained.exists());
     assert_eq!(
         fs::read(fx.bin.join("reiki")).unwrap(),

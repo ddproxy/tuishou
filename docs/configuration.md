@@ -28,7 +28,8 @@ The default path is `./tuishou.toml`. `--config <path>` or `TUISHOU_CONFIG` over
 | `health_timeout` | `5m` | Maximum health-check wait. |
 | `heartbeat_max_age` | `5m` | Node heartbeat freshness. |
 | `command_timeout` | `30s` | Deadline for `lu` and `systemctl` children. |
-| `node_name` | unset | Node identity; falls back to `TUISHOU_NODE_NAME` then `HOSTNAME`. |
+| `node_name` | unset | Node identity. Order: this key, `TUISHOU_NODE_NAME`, `[agent] name` in the ting config, system hostname. `localhost`, empty or invalid names are refused. |
+| `ting_config` | `/etc/ting/ting.toml` | ting configuration read for `[agent] name`. |
 | `agent_unit`, `controller_unit` | `ting.service`, `lu-controller.service` | Units used by apply and health paths. |
 | `reiki_config_path` | unset | Overrides the Reiki config file checked around a restart. |
 | `reiki_health_url` | `http://127.0.0.1:8080/health` | Reiki health endpoint. |

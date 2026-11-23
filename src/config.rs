@@ -269,6 +269,9 @@ pub struct AutoUpdateConfig {
     pub controller_wait_timeout: String,
     pub health_timeout: String,
     pub node_name: Option<String>,
+    /// Path of the ting configuration; its `[agent] name` identifies this node when `node_name` is
+    /// not set. Defaults to /etc/ting/ting.toml.
+    pub ting_config: Option<PathBuf>,
     pub agent_unit: String,
     /// Controller systemd unit restarted after a verified controller update.
     pub controller_unit: String,
@@ -307,6 +310,7 @@ impl Default for AutoUpdateConfig {
             controller_wait_timeout: "30m".to_string(),
             health_timeout: "5m".to_string(),
             node_name: None,
+            ting_config: None,
             agent_unit: "ting.service".to_string(),
             controller_unit: "lu-controller.service".to_string(),
             reiki_config_path: None,
