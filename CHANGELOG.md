@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [0.3.5]
+
+### Fixed
+
+- Reiki health URLs on an IP address owned by the node (for example a listener bound to the node's LAN address) are accepted for cleartext http; 0.3.4 only allowed loopback and refused the config of nodes whose Reiki admin listener is not on loopback. Hostnames and foreign addresses are still refused.
+
 ## [0.3.4]
 
 ### Fixed
