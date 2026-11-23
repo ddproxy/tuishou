@@ -6,6 +6,7 @@ One topic per page. Every page starts with who it is for. Commands in the quicks
 - [install.md](install.md) - for operators installing or upgrading the shell installer by hand.
 - [configuration.md](configuration.md) - reference for every `tuishou.toml` key, default and example.
 - [operations.md](operations.md) - for operators running updates, rollbacks and health checks.
+- [fleet-rollout.md](fleet-rollout.md) - for operators enabling unattended updates on a fleet: canary, holds, drain and journal events.
 - [security.md](security.md) - for reviewers: verification scope, trust boundaries and reporting.
 - [limits.md](limits.md) - for planners: supported platforms and non-goals.
 - [troubleshooting.md](troubleshooting.md) - for on-call users: exact messages and fixes.
