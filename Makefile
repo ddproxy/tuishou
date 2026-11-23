@@ -28,7 +28,7 @@ lint:
 	cargo fmt --all -- --check
 	cargo clippy --workspace --all-targets --locked -- -D warnings
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck install.sh tests/installer_test.sh tests/fixtures/installer/*.sh scripts/*.sh; \
+		shellcheck -x install.sh tests/installer_test.sh tests/fixtures/installer/*.sh scripts/*.sh; \
 	else \
 		echo "shellcheck not installed; skipping"; \
 	fi

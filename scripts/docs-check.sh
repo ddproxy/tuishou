@@ -6,7 +6,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 work=$(mktemp -d)
 real_curl=$(command -v curl)
 
-# shellcheck source=../tests/fixtures/installer/fake_release_server.sh
+# shellcheck source-path=SCRIPTDIR source=../tests/fixtures/installer/fake_release_server.sh
 source "$root/tests/fixtures/installer/fake_release_server.sh"
 
 cleanup() {

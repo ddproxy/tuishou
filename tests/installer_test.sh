@@ -6,7 +6,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 installer="$root/install.sh"
 work=$(mktemp -d)
 
-# shellcheck source=fixtures/installer/fake_release_server.sh
+# shellcheck source-path=SCRIPTDIR source=fixtures/installer/fake_release_server.sh
 source "$root/tests/fixtures/installer/fake_release_server.sh"
 trap 'fixture_stop_server; rm -rf "$work"' EXIT
 fixture_init "$work"
@@ -71,6 +71,7 @@ assert_contains "$out" "checksum mismatch"
 assert_absent "$work/bad-checksum/bin/tuishou"
 
 section "attestation failure removes the new binary"
+# shellcheck disable=SC2030
 out=$(export TUISHOU_TEST_ATTESTATION=fail; expect_exit 4 fixture_installer_env bash "$installer" --prefix "$work/bad-attestation" --yes)
 assert_contains "$out" "attestation: FAIL"
 assert_contains "$out" "attestation verification failed"
@@ -110,6 +111,7 @@ assert_contains "$out" "lu: already up to date ($FIX_COMPONENT_TAG)"
 [[ -f $prefix/bin/tuishou.prev ]]
 
 section "attestation failure restores the previous binary"
+# shellcheck disable=SC2031
 out=$(export TUISHOU_TEST_ATTESTATION=fail; expect_exit 4 fixture_installer_env bash "$installer" --prefix "$prefix" --yes --version "$FIX_GOOD_TAG")
 assert_contains "$out" "attestation verification failed"
 version_out=$(fake_env "$prefix/bin/tuishou" --version)

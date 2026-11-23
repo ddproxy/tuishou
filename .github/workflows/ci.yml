@@ -40,7 +40,7 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y shellcheck
           fi
-          shellcheck install.sh tests/installer_test.sh tests/fixtures/installer/*.sh scripts/*.sh
+          shellcheck -x install.sh tests/installer_test.sh tests/fixtures/installer/*.sh scripts/*.sh
       # The runner user is already non-root. This step proves the suite does not depend on a
       # working gh CLI, an external network or a populated HOME; a unit test also checks that the
       # source never spawns gh.
