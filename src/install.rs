@@ -11,6 +11,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// A check run against a staged release binary before any installed file is
+/// replaced. Only the verified, extracted binary is executed.
+#[derive(Debug, Clone)]
+pub struct StagedCheck {
+    pub binary: String,
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub version: Option<String>,
@@ -25,6 +33,8 @@ pub struct InstallOptions {
     /// Run `<binary> --version` on the staged file before commit. This is the
     /// only code from a release archive that tuishou ever executes.
     pub smoke_check: bool,
+    /// Optional check of a staged binary before commit (Reiki config check).
+    pub staged_check: Option<StagedCheck>,
     /// Write the new version to state. Deferred callers (agent/controller
     /// auto-update) only record it after their health check succeeds.
     pub commit_state: bool,
@@ -178,11 +188,17 @@ pub fn install_component(
     let extract_dir = tmp.path().join("extract");
     let extracted =
         archive::extract_binaries(&downloaded.archive_path, &expected_binaries, &extract_dir)?;
-    if extracted.is_empty() {
+    let installed_names: Vec<String> = extracted.iter().map(|b| b.name.clone()).collect();
+    let missing: Vec<String> = component
+        .required_binaries(&tag)
+        .into_iter()
+        .filter(|name| !installed_names.contains(name))
+        .collect();
+    if !missing.is_empty() {
         return Err(Error::Archive(format!(
-            "archive {} contained no expected binaries ({})",
+            "archive {} is missing required binaries ({})",
             asset_name,
-            expected_binaries.join(", ")
+            missing.join(", ")
         )));
     }
 
@@ -192,7 +208,29 @@ pub fn install_component(
         source,
     })?;
 
-    let installed_names: Vec<String> = extracted.iter().map(|b| b.name.clone()).collect();
+    if let Some(check) = &opts.staged_check {
+        let staged = extract_dir.join(&check.binary);
+        let args: Vec<&str> = check.args.iter().map(String::as_str).collect();
+        let out = crate::process::checked(
+            &staged.to_string_lossy(),
+            &args,
+            std::time::Duration::from_secs(30),
+        )
+        .map_err(|e| Error::StagedCheckFailed {
+            binary: check.binary.clone(),
+            detail: e.to_string(),
+        })?;
+        if out.status != 0 {
+            return Err(Error::StagedCheckFailed {
+                binary: check.binary.clone(),
+                detail: format!("exit status {}", out.status),
+            });
+        }
+        crate::logging::journal(
+            "staged_check_ok",
+            &[("component", &component.name), ("binary", &check.binary)],
+        );
+    }
     if opts.smoke_check {
         // Validate the staged binaries in place: a failed smoke check must
         // leave the installed binaries and their `.prev` files untouched.

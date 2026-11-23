@@ -148,6 +148,8 @@ pub struct ComponentConfig {
     /// Config file inspected by components that own one (currently Reiki).
     pub config_path: Option<PathBuf>,
     pub binary_ranges: Option<Vec<BinaryRange>>,
+    /// Opt this component into scheduled auto-update. Defaults to false.
+    pub auto_update: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -169,12 +171,14 @@ impl From<AutoPolicy> for version::Policy {
     }
 }
 
+/// Auto-update only accepts stable releases. `release` is accepted as a legacy
+/// alias for `stable`; `prerelease` is rejected by deserialization.
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Channel {
     #[default]
-    Release,
-    Prerelease,
+    #[serde(alias = "release")]
+    Stable,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -221,6 +225,8 @@ pub struct AutoUpdateConfig {
     pub window_start: Option<String>,
     pub window_end: Option<String>,
     pub drain_timeout: String,
+    /// Maximum time to wait for a controller to have no leased or running jobs.
+    pub controller_wait_timeout: String,
     pub health_timeout: String,
     pub node_name: Option<String>,
     pub agent_unit: String,
@@ -229,6 +235,10 @@ pub struct AutoUpdateConfig {
     /// Overrides the Reiki config file checked before and after a restart.
     /// The value on the `reiki` component wins when both are set.
     pub reiki_config_path: Option<PathBuf>,
+    /// Reiki admin health endpoint checked after a restart.
+    pub reiki_health_url: String,
+    /// Maximum accepted age of a node heartbeat during agent health checks.
+    pub heartbeat_max_age: String,
     /// Deadline for each individual `lu`/`systemctl` child process.
     pub command_timeout: String,
     /// Argument vector (never a shell string). The JSON summary is appended.
@@ -245,7 +255,7 @@ impl Default for AutoUpdateConfig {
             components: vec!["reiki".to_string(), "lu".to_string(), "tuishou".to_string()],
             policy: AutoPolicy::Patch,
             min_release_age: "10m".to_string(),
-            channel: Channel::Release,
+            channel: Channel::Stable,
             max_version: None,
             require_attestation: true,
             controller_policy: ControllerPolicy::Manual,
@@ -253,12 +263,15 @@ impl Default for AutoUpdateConfig {
             backup_keep: 5,
             window_start: None,
             window_end: None,
-            drain_timeout: "5m".to_string(),
+            drain_timeout: "30m".to_string(),
+            controller_wait_timeout: "30m".to_string(),
             health_timeout: "5m".to_string(),
             node_name: None,
-            agent_unit: "lu-agent.service".to_string(),
-            controller_unit: "lu.service".to_string(),
+            agent_unit: "ting.service".to_string(),
+            controller_unit: "lu-controller.service".to_string(),
             reiki_config_path: None,
+            reiki_health_url: "http://127.0.0.1:8080/health".to_string(),
+            heartbeat_max_age: "5m".to_string(),
             command_timeout: "30s".to_string(),
             notify_command: Vec::new(),
             notify_after_failures: 3,
@@ -277,7 +290,17 @@ impl AutoUpdateConfig {
         }
         parse_duration(&self.min_release_age)?;
         parse_duration(&self.drain_timeout)?;
+        parse_duration(&self.controller_wait_timeout)?;
         parse_duration(&self.health_timeout)?;
+        parse_duration(&self.heartbeat_max_age)?;
+        if self.reiki_health_url.trim().is_empty()
+            || !self.reiki_health_url.starts_with("http://")
+                && !self.reiki_health_url.starts_with("https://")
+        {
+            return Err(Error::msg(
+                "auto_update.reiki_health_url must be an http(s) URL",
+            ));
+        }
         if parse_duration(&self.command_timeout)?.is_zero() {
             return Err(Error::msg(
                 "auto_update.command_timeout must be greater than zero",
@@ -502,6 +525,19 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
         if o.config_path.is_some() {
             existing.config_path = o.config_path;
         }
+        if let Some(auto_update) = o.auto_update {
+            existing.auto_update = auto_update;
+        }
+    }
+    for name in &cfg.auto_update.components {
+        if !components.iter().any(|c| c.name == *name) {
+            return Err(Error::Config {
+                path: path.clone(),
+                source: Box::new(Error::msg(format!(
+                    "auto_update.components refers to unknown component '{name}'"
+                ))),
+            });
+        }
     }
     cfg.verify
         .validate(&components)
@@ -567,6 +603,27 @@ mod tests {
     #[test]
     fn unknown_key_in_auto_update_section_is_rejected() {
         assert!(cfg("[auto_update]\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn only_stable_channels_are_accepted() {
+        assert_eq!(
+            cfg("[auto_update]\nchannel = \"stable\"\n")
+                .unwrap()
+                .auto_update
+                .channel,
+            Channel::Stable
+        );
+        // `release` remains a legacy alias, but a prerelease channel cannot be
+        // selected at all.
+        assert_eq!(
+            cfg("[auto_update]\nchannel = \"release\"\n")
+                .unwrap()
+                .auto_update
+                .channel,
+            Channel::Stable
+        );
+        assert!(cfg("[auto_update]\nchannel = \"prerelease\"\n").is_err());
     }
 
     #[test]

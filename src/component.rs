@@ -4,12 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 
-/// The node agent is shipped inside the `lu` binary until a release provides a
-/// dedicated executable. Either name is accepted when it appears in an archive.
-/// Keeping this as one constant means promoting the agent to a default again is
-/// a one-line change in `builtin_components`.
-pub const NODE_AGENT_BINARIES: [&str; 2] = ["lu-agent", "ting"];
-
 /// Binaries a component is expected to contribute to an archive in a given
 /// release range. Bounds are inclusive; an omitted bound is open-ended.
 /// An empty `binaries` list means the component is not shipped in that range.
@@ -58,13 +52,12 @@ pub struct Component {
     /// Configuration file checked by components that own a config (Reiki).
     #[serde(default)]
     pub config_path: Option<PathBuf>,
-    /// Expected binaries that may be absent from a release without making the
-    /// component "not in this release" (the Lu node agent today).
-    #[serde(default)]
-    pub optional_binaries: Vec<String>,
     /// Per-release expected binaries. The first matching range wins.
     #[serde(default)]
     pub binary_ranges: Vec<BinaryRange>,
+    /// Per-component opt-in for scheduled auto-update. Off by default.
+    #[serde(default)]
+    pub auto_update: bool,
 }
 
 impl Component {
@@ -90,14 +83,10 @@ impl Component {
             .unwrap_or_else(|| self.binaries.clone())
     }
 
-    /// Binaries that must be present for a release to count as shipping this
-    /// component. Optional agent binaries are excluded so a controller-only
-    /// Lu archive is still "in this release".
+    /// Every expected binary is required: a Lu release must ship both `lu` and
+    /// `ting` or it is not a complete release for automatic installation.
     pub fn required_binaries(&self, tag: &str) -> Vec<String> {
         self.expected_binaries(tag)
-            .into_iter()
-            .filter(|name| !self.optional_binaries.contains(name))
-            .collect()
     }
 
     /// Configuration path to validate for components that own one.
@@ -108,8 +97,7 @@ impl Component {
 
 pub fn builtin_components() -> Vec<Component> {
     // Table order is the report order for every command. Reiki and Lu are
-    // equal first-class defaults; `ting` is not a separate default until a
-    // release archive actually contains a `ting` binary.
+    // equal first-class defaults; `ting` is part of the Lu release pair.
     vec![
         Component {
             name: "reiki".to_string(),
@@ -118,36 +106,28 @@ pub fn builtin_components() -> Vec<Component> {
             binaries: vec!["reiki".to_string()],
             service_unit: Some("reiki.service".to_string()),
             config_path: Some(PathBuf::from("/var/lib/reiki/reiki.toml")),
-            optional_binaries: Vec::new(),
             binary_ranges: vec![BinaryRange {
                 from: None,
                 until: None,
                 binaries: vec!["reiki".to_string()],
             }],
+            auto_update: false,
         },
         Component {
             name: "lu".to_string(),
             repo: "ddproxy/tuishou-lu".to_string(),
             asset_pattern: "lu-{tag}-{target}.tar.gz".to_string(),
-            // The node agent runs as `lu agent` inside `lu` until a release
-            // ships a separate executable. Either dedicated binary is accepted
-            // when present; the controller binary is always required.
-            binaries: std::iter::once("lu".to_string())
-                .chain(NODE_AGENT_BINARIES.iter().map(|name| (*name).to_string()))
-                .collect(),
-            service_unit: Some("lu-agent.service".to_string()),
+            // One release ships both the controller and the node agent. The
+            // pair is installed and rolled back together.
+            binaries: vec!["lu".to_string(), "ting".to_string()],
+            service_unit: None,
             config_path: None,
-            optional_binaries: NODE_AGENT_BINARIES
-                .iter()
-                .map(|name| (*name).to_string())
-                .collect(),
             binary_ranges: vec![BinaryRange {
                 from: None,
                 until: None,
-                binaries: std::iter::once("lu".to_string())
-                    .chain(NODE_AGENT_BINARIES.iter().map(|name| (*name).to_string()))
-                    .collect(),
+                binaries: vec!["lu".to_string(), "ting".to_string()],
             }],
+            auto_update: false,
         },
         Component {
             name: "tuishou".to_string(),
@@ -156,12 +136,12 @@ pub fn builtin_components() -> Vec<Component> {
             binaries: vec!["tuishou".to_string()],
             service_unit: None,
             config_path: None,
-            optional_binaries: Vec::new(),
             binary_ranges: vec![BinaryRange {
                 from: None,
                 until: None,
                 binaries: vec!["tuishou".to_string()],
             }],
+            auto_update: false,
         },
     ]
 }
@@ -189,6 +169,7 @@ mod tests {
             vec!["reiki", "lu", "tuishou"]
         );
         assert!(resolve_component("ting", &components).is_err());
+        assert!(components.iter().all(|c| !c.auto_update));
     }
 
     #[test]
@@ -213,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn lu_defaults_recognise_optional_agent_binaries() {
+    fn lu_defaults_require_both_controller_and_agent_binaries() {
         let components = builtin_components();
         let lu = resolve_component("lu", &components).unwrap();
         assert_eq!(lu.repo, "ddproxy/tuishou-lu");
@@ -225,13 +206,15 @@ mod tests {
             lu.checksum_asset_name("v0.4.0", "x86_64-unknown-linux-musl"),
             "lu-v0.4.0-x86_64-unknown-linux-musl.tar.gz.sha256"
         );
-        assert_eq!(lu.binaries[0], "lu");
-        assert!(lu.binaries.contains(&"lu-agent".to_string()));
-        assert!(lu.binaries.contains(&"ting".to_string()));
-        assert_eq!(lu.service_unit.as_deref(), Some("lu-agent.service"));
+        assert_eq!(lu.binaries, vec!["lu".to_string(), "ting".to_string()]);
+        assert_eq!(lu.service_unit, None);
         assert_eq!(
             lu.expected_binaries("v0.4.1"),
-            vec!["lu".to_string(), "lu-agent".to_string(), "ting".to_string()]
+            vec!["lu".to_string(), "ting".to_string()]
+        );
+        assert_eq!(
+            lu.required_binaries("v0.4.1"),
+            vec!["lu".to_string(), "ting".to_string()]
         );
     }
 
@@ -244,7 +227,6 @@ mod tests {
             binaries: vec!["app".to_string()],
             service_unit: None,
             config_path: None,
-            optional_binaries: Vec::new(),
             binary_ranges: vec![
                 BinaryRange {
                     from: None,
@@ -257,6 +239,7 @@ mod tests {
                     binaries: vec!["app-agent".to_string()],
                 },
             ],
+            auto_update: false,
         };
         assert!(c.expected_binaries("v0.4.0").is_empty());
         assert_eq!(c.expected_binaries("v0.4.1"), vec!["app-agent"]);

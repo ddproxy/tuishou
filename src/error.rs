@@ -71,6 +71,11 @@ pub enum Error {
     #[error("archive error: {0}")]
     Archive(String),
 
+    /// A staged binary failed its pre-install check. Distinct from a generic
+    /// failure so callers can keep the installed binary untouched.
+    #[error("staged {binary} check failed: {detail}")]
+    StagedCheckFailed { binary: String, detail: String },
+
     #[error("download exceeded size limit of {limit} bytes")]
     DownloadTooLarge { limit: u64 },
 

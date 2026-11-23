@@ -23,9 +23,8 @@ pub fn restore_binaries(
 
     let mut restored_any = false;
     for name in &component.binaries {
-        // Optional binaries (the Lu node agent today) may never have been
-        // installed. Restoring only what has a backup keeps rollback useful
-        // for the binaries that actually shipped.
+        // A binary without a backup was never installed by tuishou. Restoring
+        // only backed-up names keeps rollback safe for partial installs.
         if !bin_dir.join(format!("{name}.prev")).exists() {
             continue;
         }
@@ -63,7 +62,7 @@ pub fn rollback_binaries(
         service_unit: None,
         binary_ranges: Vec::new(),
         config_path: None,
-        optional_binaries: Vec::new(),
+        auto_update: false,
     };
     let _ = quiet;
     restore_binaries(&c, prefix, true)

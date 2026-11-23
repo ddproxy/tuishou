@@ -6,7 +6,7 @@ use crate::component::Component;
 use crate::config::{AutoUpdateConfig, ControllerPolicy, VerifyConfig};
 use crate::duration::{in_window, parse_duration, parse_hhmm};
 use crate::error::{Error, Result};
-use crate::install::{self, InstallOptions, InstallOutcome};
+use crate::install::{self, InstallOptions, InstallOutcome, StagedCheck};
 use crate::logging::{journal, one_line};
 use crate::process::{self, CommandOutput};
 use crate::release::SCHEMA_MARKER;
@@ -20,6 +20,23 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
+
+/// Which Lu unit is installed and enabled on this host. This is detected from
+/// systemd, never inferred from archive contents or configured assumptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LuRole {
+    Agent,
+    Controller,
+}
+
+impl LuRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Controller => "controller",
+        }
+    }
+}
 
 pub struct ApplyContext<'a> {
     pub cfg: &'a AutoUpdateConfig,
@@ -46,6 +63,10 @@ pub trait ApplyRunner {
     /// not extracted. Used to avoid draining a node for a component that this
     /// release does not ship.
     fn archive_binaries(&self, component: &Component, version: &str) -> Result<Vec<String>>;
+
+    /// Check a component's admin health endpoint. A non-2xx response is an
+    /// unhealthy component, not a command failure.
+    fn health_endpoint(&self, url: &str, timeout: Duration) -> std::result::Result<bool, String>;
 }
 
 pub struct SystemRunner;
@@ -61,6 +82,10 @@ impl ApplyRunner for SystemRunner {
 
     fn archive_binaries(&self, component: &Component, version: &str) -> Result<Vec<String>> {
         install::archive_binary_names(&crate::http::agent(), component, version)
+    }
+
+    fn health_endpoint(&self, url: &str, timeout: Duration) -> std::result::Result<bool, String> {
+        crate::http::health_check(url, timeout).map_err(|e| e.to_string())
     }
 }
 
@@ -82,6 +107,7 @@ pub fn install_options(
         verbose: false,
         // The staged file is smoke-checked before any binary is replaced.
         smoke_check: true,
+        staged_check: None,
         commit_state,
         verifier: ctx
             .verifier
@@ -161,6 +187,82 @@ fn command_timeout(ctx: &ApplyContext<'_>) -> Result<Duration> {
     parse_duration(&ctx.cfg.command_timeout)
 }
 
+/// A unit only counts when its file exists (`systemctl cat`) and it is enabled
+/// (`systemctl is-enabled --quiet`). Both checks must succeed; a missing,
+/// disabled or ambiguous pair is never guessed at.
+fn unit_present_and_enabled(runner: &dyn ApplyRunner, unit: &str, timeout: Duration) -> bool {
+    checked(runner, "systemctl", &["cat", unit], timeout).is_ok()
+        && checked(
+            runner,
+            "systemctl",
+            &["is-enabled", "--quiet", unit],
+            timeout,
+        )
+        .is_ok()
+}
+
+pub fn detect_lu_role_with_runner(
+    ctx: &ApplyContext<'_>,
+    runner: &dyn ApplyRunner,
+) -> Result<LuRole> {
+    let timeout = command_timeout(ctx)?;
+    let agent = unit_present_and_enabled(runner, &ctx.cfg.agent_unit, timeout);
+    let controller = unit_present_and_enabled(runner, &ctx.cfg.controller_unit, timeout);
+    let role = match (agent, controller) {
+        (true, false) => LuRole::Agent,
+        (false, true) => LuRole::Controller,
+        (true, true) => {
+            return Err(Error::msg(format!(
+                "both {} and {} are installed and enabled; refusing to guess the Lu role",
+                ctx.cfg.agent_unit, ctx.cfg.controller_unit
+            )))
+        }
+        (false, false) => {
+            return Err(Error::msg(format!(
+                "neither {} nor {} is installed and enabled; refusing to guess the Lu role",
+                ctx.cfg.agent_unit, ctx.cfg.controller_unit
+            )))
+        }
+    };
+    journal("lu_role_detected", &[("role", role.as_str())]);
+    Ok(role)
+}
+
+pub fn detect_lu_role(ctx: &ApplyContext<'_>) -> Result<LuRole> {
+    detect_lu_role_with_runner(ctx, &SystemRunner)
+}
+
+/// Apply a Lu release according to the detected systemd role. The archive is
+/// the same for both; only the installed/enabled unit decides what is
+/// restarted and which safety procedure runs.
+pub fn apply_lu(
+    component: &Component,
+    version: &str,
+    body: &str,
+    role: LuRole,
+    ctx: &ApplyContext<'_>,
+    state: &mut AutoState,
+) -> Result<Option<String>> {
+    match role {
+        LuRole::Agent => apply_agent(component, version, ctx, state),
+        LuRole::Controller => apply_controller(component, version, body, ctx, state),
+    }
+}
+
+/// The controller is reachable when `lu status --json` returns a complete
+/// status document. An unreachable controller means there is no drain to do.
+fn controller_reachable(runner: &dyn ApplyRunner, ctx: &ApplyContext<'_>) -> bool {
+    match checked(
+        runner,
+        "lu",
+        &["status", "--json"],
+        command_timeout(ctx).unwrap_or(Duration::from_secs(30)),
+    ) {
+        Ok(out) => lu::status_available(&out.stdout),
+        Err(_) => false,
+    }
+}
+
 fn undrain(runner: &dyn ApplyRunner, node: &str, ctx: &ApplyContext<'_>) -> Result<()> {
     checked(runner, "lu", &["undrain", node], command_timeout(ctx)?)?;
     journal("agent_undrain", &[("node", node)]);
@@ -229,6 +331,20 @@ fn reiki_config_path(component: &Component, cfg: &AutoUpdateConfig) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/var/lib/reiki/reiki.toml"))
 }
 
+/// The config check is attached to the staged binary so it runs before any
+/// installed file is replaced. A failure leaves the old binary in place.
+fn reiki_staged_check(component: &Component, cfg: &AutoUpdateConfig) -> StagedCheck {
+    let path = reiki_config_path(component, cfg);
+    StagedCheck {
+        binary: "reiki".to_string(),
+        args: vec![
+            "check".to_string(),
+            "--config".to_string(),
+            path.to_string_lossy().into_owned(),
+        ],
+    }
+}
+
 fn reiki_check(
     runner: &dyn ApplyRunner,
     component: &Component,
@@ -265,9 +381,14 @@ fn reiki_healthy(
     if active.status != 0 {
         return Ok(false);
     }
-    reiki_check(runner, component, ctx)
-        .map(|_| true)
-        .map_err(|e| e.to_string())
+    reiki_check(runner, component, ctx).map_err(|e| e.to_string())?;
+    let url = crate::http::redact_secrets(&ctx.cfg.reiki_health_url);
+    let healthy = runner.health_endpoint(&url, timeout)?;
+    journal(
+        "reiki_health_endpoint",
+        &[("url", &one_line(&url)), ("healthy", &healthy.to_string())],
+    );
+    Ok(healthy)
 }
 
 fn node_runs_lu(runner: &dyn ApplyRunner, node: &str, ctx: &ApplyContext<'_>) -> bool {
@@ -312,7 +433,14 @@ fn node_healthy(
         return Ok(false);
     }
     let out = checked(runner, "lu", &["nodes", "--json"], timeout).map_err(|e| e.to_string())?;
-    Ok(lu::node_reports_version(&out.stdout, node, version))
+    let heartbeat_max_age =
+        parse_duration(&ctx.cfg.heartbeat_max_age).map_err(|e| e.to_string())?;
+    Ok(lu::node_healthy(
+        &out.stdout,
+        node,
+        version,
+        heartbeat_max_age,
+    ))
 }
 
 fn controller_healthy(
@@ -431,24 +559,33 @@ pub fn apply_agent_with_runner(
         return Ok(Some(reason));
     }
     let node = node_name(ctx.cfg);
-    let unit = &ctx.cfg.agent_unit;
+    let unit = ctx.cfg.agent_unit.clone();
+    // Drain only when the controller can confirm the drain. An unreachable
+    // controller is not a reason to restart an agent without coordination.
+    let drained = controller_reachable(runner, ctx);
     journal(
         "agent_update_start",
         &[
             ("component", &component.name),
             ("version", version),
             ("node", &node),
-            ("unit", unit),
+            ("unit", &unit),
+            ("drain", &drained.to_string()),
         ],
     );
 
-    drain_and_wait(runner, &node, ctx)?;
+    // `drain_and_wait` undrains itself if the drain or its deadline fails.
+    if drained {
+        drain_and_wait(runner, &node, ctx)?;
+    }
 
     let opts = install_options(ctx, version, false);
     let outcome = match runner.install(component, &opts) {
         Ok(o) => o,
         Err(e) => {
-            let _ = undrain(runner, &node, ctx);
+            if drained {
+                let _ = undrain(runner, &node, ctx);
+            }
             return Err(e);
         }
     };
@@ -459,7 +596,7 @@ pub fn apply_agent_with_runner(
 
     let health_timeout = parse_duration(&ctx.cfg.health_timeout)?;
     let mut startup_error = None;
-    if let Err(e) = restart(runner, unit, ctx) {
+    if let Err(e) = restart(runner, &unit, ctx) {
         startup_error = Some(e.to_string());
     }
     let (healthy, health_error) = if startup_error.is_some() {
@@ -470,7 +607,9 @@ pub fn apply_agent_with_runner(
     if healthy {
         // Only advance state once the new version is confirmed live.
         install::record_installed(component, version, receipt(&outcome)?, ctx.prefix)?;
-        undrain(runner, &node, ctx)?;
+        if drained {
+            undrain(runner, &node, ctx)?;
+        }
         journal(
             "agent_update_ok",
             &[
@@ -484,7 +623,7 @@ pub fn apply_agent_with_runner(
 
     let health_reason = health_error.unwrap_or_else(|| {
         format!(
-            "node {node} did not report version {version} within {}",
+            "node {node} did not report version {version} with a fresh heartbeat within {}",
             ctx.cfg.health_timeout
         )
     });
@@ -492,6 +631,7 @@ pub fn apply_agent_with_runner(
         component,
         version,
         &node,
+        drained,
         ctx,
         state,
         runner,
@@ -501,13 +641,15 @@ pub fn apply_agent_with_runner(
     .map(|()| None)
 }
 
-/// Restore the previous version after a failed start or health check. Returns
-/// an `Err` describing both the original failure and any recovery failure.
+/// Restore the previous version after a failed start or health check. A drain
+/// is always released, including when recovery itself fails; the bad-version
+/// mark is persisted before any recovery work so a later retry cannot miss it.
 #[allow(clippy::too_many_arguments)]
 fn recover_agent(
     component: &Component,
     version: &str,
     node: &str,
+    drained: bool,
     ctx: &ApplyContext<'_>,
     state: &mut AutoState,
     runner: &dyn ApplyRunner,
@@ -547,22 +689,23 @@ fn recover_agent(
             None => recovery_errors.push("no previous version is recorded for verification".into()),
         }
     }
+    if drained {
+        if let Err(e) = undrain(runner, node, ctx) {
+            recovery_errors.push(format!("undrain failed: {e}"));
+        }
+    }
 
     if !recovery_errors.is_empty() {
-        // Intentionally leave the node drained: an unverified node must not
-        // accept jobs. The bad version is already persisted.
         return Err(Error::msg(format!(
-            "health check failed within {} for {} on {node}: {}; recovery failed: {}",
+            "health check failed within {} for {} on {node}: {}; marked {version} bad; recovery failed: {}",
             ctx.cfg.health_timeout,
             component.name,
             failure_reason,
             one_line(&recovery_errors.join("; "))
         )));
     }
-
-    undrain(runner, node, ctx)?;
     Err(Error::msg(format!(
-        "health check failed within {} for {} on {node}: {}; restored .prev, verified restored health and marked {version} bad",
+        "health check failed within {} for {} on {node}: {}; restored .prev, verified restored health, marked {version} bad and undrained",
         ctx.cfg.health_timeout,
         component.name,
         failure_reason
@@ -627,15 +770,45 @@ pub fn apply_reiki_with_options(
             ("drain", &drained.to_string()),
         ],
     );
+    if drained {
+        drain_and_wait(runner, &node, ctx)?;
+    }
 
-    if let Err(e) = (|| -> Result<()> {
-        if drained {
-            drain_and_wait(runner, &node, ctx)?;
+    let mut opts = opts;
+    opts.staged_check = Some(reiki_staged_check(component, ctx.cfg));
+
+    let outcome = match runner.install(component, &opts) {
+        Ok(outcome) => outcome,
+        Err(e) if matches!(e, Error::StagedCheckFailed { .. }) => {
+            // No file was replaced: keep the old binary in place, only record
+            // that this release must not be retried.
+            journal(
+                "reiki_staged_check_failed",
+                &[("component", &component.name), ("version", version)],
+            );
+            mark_bad(state, &component.name, version, ctx.prefix);
+            if drained {
+                let _ = undrain(runner, &node, ctx);
+            }
+            return Err(Error::msg(format!(
+                "{e}; marked {version} bad and old reiki binary kept"
+            )));
         }
-        let outcome = runner.install(component, &opts)?;
-        // The config check happens while the old service is still running; a
-        // broken config must never be loaded by a restart.
-        reiki_check(runner, component, ctx)?;
+        Err(e) => {
+            return recover_reiki(
+                component,
+                version,
+                &node,
+                drained,
+                ctx,
+                state,
+                runner,
+                &e.to_string(),
+            )
+        }
+    };
+
+    let install_result = (|| -> Result<()> {
         restart(
             runner,
             component.service_unit.as_deref().unwrap_or("reiki.service"),
@@ -653,7 +826,8 @@ pub fn apply_reiki_with_options(
         }
         install::record_installed(component, version, receipt(&outcome)?, ctx.prefix)?;
         Ok(())
-    })() {
+    })();
+    if let Err(e) = install_result {
         return recover_reiki(
             component,
             version,
@@ -785,21 +959,31 @@ fn controller_skip_reason(
                 .to_string(),
         ));
     }
-    let out = match checked(runner, "lu", &["status", "--json"], cmd_timeout) {
-        Ok(out) => out,
-        Err(e) => {
-            return Ok(Some(format!(
-                "cannot check controller idleness: {}",
-                one_line(&e.to_string())
-            )))
+    let wait_timeout = parse_duration(&cfg.controller_wait_timeout)?;
+    journal(
+        "controller_wait_start",
+        &[("timeout", &cfg.controller_wait_timeout)],
+    );
+    let (idle, last_error) = poll_until(wait_timeout, || {
+        match checked(runner, "lu", &["status", "--json"], cmd_timeout) {
+            Ok(out) if lu::controller_idle(&out.stdout) => Ok(true),
+            Ok(_) => {
+                journal("controller_wait_busy", &[]);
+                Ok(false)
+            }
+            Err(e) => Err(e.to_string()),
         }
-    };
-    if !lu::controller_idle(&out.stdout) {
-        return Ok(Some(
-            "controller is not idle (jobs leased, running, recovering or needing input)"
-                .to_string(),
-        ));
+    });
+    if !idle {
+        return Ok(Some(match last_error {
+            Some(e) => format!("cannot check controller idleness: {}", one_line(&e)),
+            None => format!(
+                "controller is not idle after {} (jobs leased, running, recovering or needing input)",
+                cfg.controller_wait_timeout
+            ),
+        }));
     }
+    journal("controller_idle", &[]);
     Ok(None)
 }
 
@@ -1104,33 +1288,53 @@ fn recover_controller(
 mod tests {
     use super::*;
     use crate::component;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Arc, Mutex};
+    use time::format_description::well_known::Rfc3339;
 
-    const NODES_OLD: &str =
-        r#"[{"name":"n1","version":"0.4.0","draining":true,"current_job":null}]"#;
-    const NODES_NEW: &str =
-        r#"[{"name":"n1","version":"0.4.1","draining":true,"current_job":null}]"#;
-    const STATUS_IDLE_OLD: &str =
-        r#"{"version":"0.4.0","jobs":{"leased":0,"running":0,"recovering":0,"needs_input":0}}"#;
-    const STATUS_IDLE_NEW: &str =
-        r#"{"version":"0.4.1","jobs":{"leased":0,"running":0,"recovering":0,"needs_input":0}}"#;
+    fn timestamp(value: OffsetDateTime) -> String {
+        value.format(&Rfc3339).unwrap()
+    }
+
+    fn recent() -> String {
+        timestamp(OffsetDateTime::now_utc())
+    }
+
+    fn node_json(version: &str, last_seen: &str) -> String {
+        format!(
+            r#"[{{"name":"n1","version":"{version}","draining":true,"current_job":null,"online":true,"last_seen":"{last_seen}"}}]"#
+        )
+    }
+
+    fn status_json(version: &str, leased: u32, running: u32) -> String {
+        format!(
+            r#"{{"version":"{version}","jobs":{{"leased":{leased},"running":{running},"recovering":0,"needs_input":0}}}}"#
+        )
+    }
 
     #[derive(Default)]
     struct Calls {
         commands: Vec<(String, Vec<String>)>,
         installs: usize,
         archive_checks: usize,
+        health_checks: usize,
     }
 
     struct FakeRunner {
         calls: Arc<Mutex<Calls>>,
         fail: BTreeMap<String, String>,
         fail_once: Arc<Mutex<BTreeMap<String, String>>>,
-        nodes: Arc<Mutex<String>>,
-        status: Arc<Mutex<String>>,
+        node: Arc<Mutex<(String, String)>>,
+        status: Arc<Mutex<VecDeque<String>>>,
+        enabled: Arc<Mutex<Vec<String>>>,
+        present: Vec<String>,
         receipt: crate::install::InstallReceipt,
         archive_names: Option<Vec<String>>,
+        install_version: String,
+        health: Arc<Mutex<VecDeque<bool>>>,
+        reiki_restarts: Arc<Mutex<usize>>,
+        staged_fail: Arc<Mutex<bool>>,
+        last_staged: Arc<Mutex<Option<StagedCheck>>>,
     }
 
     impl FakeRunner {
@@ -1139,14 +1343,61 @@ mod tests {
                 calls: Arc::new(Mutex::new(Calls::default())),
                 fail: BTreeMap::new(),
                 fail_once: Arc::new(Mutex::new(BTreeMap::new())),
-                nodes: Arc::new(Mutex::new(NODES_OLD.to_string())),
-                status: Arc::new(Mutex::new(STATUS_IDLE_OLD.to_string())),
+                node: Arc::new(Mutex::new(("0.4.0".to_string(), recent()))),
+                status: Arc::new(Mutex::new(VecDeque::from([status_json("0.4.0", 0, 0)]))),
+                enabled: Arc::new(Mutex::new(vec!["ting.service".to_string()])),
+                present: vec![
+                    "ting.service".to_string(),
+                    "lu-controller.service".to_string(),
+                ],
                 receipt: crate::install::InstallReceipt {
                     checksum: "abc".to_string(),
                     target: "test".to_string(),
                     installed_at: "now".to_string(),
                 },
                 archive_names: None,
+                install_version: "v0.4.1".to_string(),
+                health: Arc::new(Mutex::new(VecDeque::from([true]))),
+                reiki_restarts: Arc::new(Mutex::new(0)),
+                staged_fail: Arc::new(Mutex::new(false)),
+                last_staged: Arc::new(Mutex::new(None)),
+            }
+        }
+
+        fn set_node(&self, version: &str, last_seen: &str) {
+            *self.node.lock().unwrap() = (version.to_string(), last_seen.to_string());
+        }
+
+        fn set_enabled(&self, units: &[&str]) {
+            *self.enabled.lock().unwrap() = units.iter().map(|s| s.to_string()).collect();
+        }
+
+        fn set_status(&self, body: &str) {
+            let mut status = self.status.lock().unwrap();
+            status.clear();
+            status.push_back(body.to_string());
+        }
+
+        fn set_health(&self, healthy: bool) {
+            let mut health = self.health.lock().unwrap();
+            health.clear();
+            health.push_back(healthy);
+        }
+
+        fn push_health(&self, healthy: bool) {
+            self.health.lock().unwrap().push_back(healthy);
+        }
+
+        fn push_status(&self, body: &str) {
+            self.status.lock().unwrap().push_back(body.to_string());
+        }
+
+        fn next_status(&self) -> String {
+            let mut status = self.status.lock().unwrap();
+            if status.len() > 1 {
+                status.pop_front().unwrap()
+            } else {
+                status.front().cloned().unwrap_or_default()
             }
         }
     }
@@ -1169,9 +1420,19 @@ mod tests {
             if let Some(reason) = self.fail_once.lock().unwrap().remove(&key) {
                 return Err(Error::msg(reason));
             }
+            if program == "systemctl" && args == ["restart", "reiki.service"] {
+                let mut restarts = self.reiki_restarts.lock().unwrap();
+                *restarts += 1;
+                if *restarts == 2 {
+                    self.push_health(true);
+                }
+            }
             let body = match (program, args.first().copied(), args.get(1).copied()) {
-                ("lu", Some("nodes"), Some("--json")) => self.nodes.lock().unwrap().clone(),
-                ("lu", Some("status"), Some("--json")) => self.status.lock().unwrap().clone(),
+                ("lu", Some("nodes"), Some("--json")) => {
+                    let (version, seen) = self.node.lock().unwrap().clone();
+                    node_json(&version, &seen)
+                }
+                ("lu", Some("status"), Some("--json")) => self.next_status(),
                 ("lu", Some("backup"), _) => {
                     if let Some(pos) = args.iter().position(|a| *a == "--out") {
                         if let Some(path) = args.get(pos + 1) {
@@ -1180,6 +1441,22 @@ mod tests {
                     }
                     String::new()
                 }
+                ("systemctl", Some("cat"), Some(unit)) => {
+                    if self.present.iter().any(|u| u == unit) {
+                        String::new()
+                    } else {
+                        return Err(Error::msg(format!("unit {unit} not found")));
+                    }
+                }
+                ("systemctl", Some("is-enabled"), Some("--quiet")) => {
+                    let unit = args.get(2).copied().unwrap_or("");
+                    if self.enabled.lock().unwrap().iter().any(|u| u == unit) {
+                        String::new()
+                    } else {
+                        return Err(Error::msg(format!("unit {unit} is not enabled")));
+                    }
+                }
+                ("reiki", Some("check"), _) => String::new(),
                 _ => String::new(),
             };
             Ok(CommandOutput {
@@ -1189,11 +1466,21 @@ mod tests {
             })
         }
 
-        fn install(&self, c: &Component, _opts: &InstallOptions) -> Result<InstallOutcome> {
-            self.calls.lock().unwrap().installs += 1;
+        fn install(&self, c: &Component, opts: &InstallOptions) -> Result<InstallOutcome> {
+            let mut calls = self.calls.lock().unwrap();
+            calls.installs += 1;
+            if let Some(check) = &opts.staged_check {
+                *self.last_staged.lock().unwrap() = Some(check.clone());
+                if *self.staged_fail.lock().unwrap() {
+                    return Err(Error::StagedCheckFailed {
+                        binary: check.binary.clone(),
+                        detail: "staged config check failed".to_string(),
+                    });
+                }
+            }
             Ok(InstallOutcome {
                 component: c.name.clone(),
-                version: "v0.4.1".to_string(),
+                version: self.install_version.clone(),
                 binaries: c.binaries.clone(),
                 dry_run: false,
                 receipt: Some(self.receipt.clone()),
@@ -1207,6 +1494,20 @@ mod tests {
                 .clone()
                 .unwrap_or_else(|| component.expected_binaries(version)))
         }
+
+        fn health_endpoint(
+            &self,
+            _url: &str,
+            _timeout: Duration,
+        ) -> std::result::Result<bool, String> {
+            self.calls.lock().unwrap().health_checks += 1;
+            let mut health = self.health.lock().unwrap();
+            Ok(if health.len() > 1 {
+                health.pop_front().unwrap()
+            } else {
+                *health.front().unwrap_or(&false)
+            })
+        }
     }
 
     fn cfg(backup_dir: &Path) -> AutoUpdateConfig {
@@ -1214,66 +1515,123 @@ mod tests {
             enabled: true,
             node_name: Some("n1".to_string()),
             drain_timeout: "1s".to_string(),
+            controller_wait_timeout: "1s".to_string(),
             health_timeout: "1s".to_string(),
             command_timeout: "1s".to_string(),
             controller_policy: ControllerPolicy::WhenIdle,
             backup_dir: Some(backup_dir.to_path_buf()),
+            reiki_config_path: Some(PathBuf::from("/var/lib/reiki/reiki.toml")),
+            heartbeat_max_age: "1h".to_string(),
             ..AutoUpdateConfig::default()
         }
     }
 
-    fn component() -> Component {
-        // The node agent is exercised directly here. It is no longer a
-        // built-in default, but the apply path must keep supporting it until a
-        // release ships a dedicated binary and it returns to the table.
-        Component {
-            name: "ting".to_string(),
-            repo: "ddproxy/tuishou-lu".to_string(),
-            asset_pattern: "lu-{tag}-{target}.tar.gz".to_string(),
-            binaries: vec!["ting".to_string(), "lu-agent".to_string()],
-            service_unit: Some("lu-agent.service".to_string()),
-            config_path: None,
-            optional_binaries: Vec::new(),
-            binary_ranges: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn agent_uses_real_commands_and_waits_for_exact_version() {
-        let td = tempfile::tempdir().unwrap();
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix: Some(td.path()),
+    fn ctx<'a>(cfg: &'a AutoUpdateConfig, prefix: &'a Path) -> ApplyContext<'a> {
+        ApplyContext {
+            cfg,
+            prefix: Some(prefix),
             config_path: Some(Path::new("tuishou.toml")),
             verifier: None,
             verify_config: None,
-        };
-        let c = component();
-        let mut st = AutoState::default();
+        }
+    }
+
+    fn lu_component() -> Component {
+        component::builtin_components()
+            .into_iter()
+            .find(|c| c.name == "lu")
+            .unwrap()
+    }
+
+    fn reiki_component() -> Component {
+        component::builtin_components()
+            .into_iter()
+            .find(|c| c.name == "reiki")
+            .unwrap()
+    }
+
+    fn seed_state(prefix: &Path, component: &str, version: &str) {
         let mut existing = state::State::default();
         existing.components.insert(
-            "ting".to_string(),
+            component.to_string(),
             state::InstalledComponent {
-                version: "v0.4.0".to_string(),
+                version: version.to_string(),
                 target: "test".to_string(),
                 checksum: "abc".to_string(),
                 installed_at: "before".to_string(),
                 previous_version: None,
             },
         );
-        state::save(&state::default_state_path(Some(td.path())), &existing).unwrap();
+        state::save(&state::default_state_path(Some(prefix)), &existing).unwrap();
+    }
 
+    #[test]
+    fn role_detection_requires_exactly_one_installed_and_enabled_unit() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
         let runner = FakeRunner::new();
-        let nodes = runner.nodes.clone();
+
+        assert_eq!(
+            detect_lu_role_with_runner(&context, &runner).unwrap(),
+            LuRole::Agent
+        );
+        runner.set_enabled(&["lu-controller.service"]);
+        assert_eq!(
+            detect_lu_role_with_runner(&context, &runner).unwrap(),
+            LuRole::Controller
+        );
+        runner.set_enabled(&[]);
+        assert!(detect_lu_role_with_runner(&context, &runner)
+            .unwrap_err()
+            .to_string()
+            .contains("neither"));
+        runner.set_enabled(&["ting.service", "lu-controller.service"]);
+        assert!(detect_lu_role_with_runner(&context, &runner)
+            .unwrap_err()
+            .to_string()
+            .contains("both"));
+
+        let mut missing = FakeRunner::new();
+        missing.fail.insert(
+            "systemctl cat ting.service".to_string(),
+            "missing".to_string(),
+        );
+        missing.set_enabled(&["ting.service", "lu-controller.service"]);
+        assert_eq!(
+            detect_lu_role_with_runner(&context, &missing).unwrap(),
+            LuRole::Controller,
+            "a missing unit file must not satisfy role detection"
+        );
+    }
+
+    #[test]
+    fn agent_uses_real_commands_and_waits_for_exact_version() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let runner = FakeRunner::new();
+        runner.set_node("0.4.1", &recent());
+        seed_state(td.path(), "lu", "v0.4.0");
         let calls = runner.calls.clone();
-        *nodes.lock().unwrap() = NODES_NEW.to_string();
-        apply_agent_with_runner(&c, "v0.4.1", &ctx, &mut st, &runner).unwrap();
+
+        apply_agent_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap();
 
         let cmds = calls.lock().unwrap().commands.clone();
         assert!(cmds.iter().any(|(p, a)| p == "lu" && a == &["drain", "n1"]));
         assert!(cmds
             .iter()
             .any(|(p, a)| p == "lu" && a == &["nodes", "--json"]));
+        assert!(cmds
+            .iter()
+            .any(|(p, a)| p == "systemctl" && a == &["restart", "ting.service"]));
         assert!(cmds
             .iter()
             .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
@@ -1284,55 +1642,142 @@ mod tests {
     }
 
     #[test]
-    fn agent_absent_from_archive_is_skipped_before_drain() {
+    fn agent_skips_drain_when_controller_is_unreachable() {
         let td = tempfile::tempdir().unwrap();
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix: Some(td.path()),
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
-        let mut runner = FakeRunner::new();
-        runner.archive_names = Some(vec!["lu".to_string()]);
-        let reason = apply_agent_with_runner(
-            &component(),
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let runner = FakeRunner::new();
+        runner.set_node("0.4.1", &recent());
+        runner.set_status("not json");
+        let calls = runner.calls.clone();
+
+        apply_agent_with_runner(
+            &lu_component(),
             "v0.4.1",
-            &ctx,
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap();
+
+        let cmds = calls.lock().unwrap().commands.clone();
+        assert!(!cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
+        assert!(!cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("undrain")));
+        assert!(cmds
+            .iter()
+            .any(|(p, a)| p == "systemctl" && a == &["restart", "ting.service"]));
+    }
+
+    #[test]
+    fn missing_required_binaries_skip_before_drain() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let mut runner = FakeRunner::new();
+        runner.archive_names = Some(vec!["reiki".to_string()]);
+
+        let reason = apply_agent_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            &context,
             &mut AutoState::default(),
             &runner,
         )
         .unwrap()
-        .expect("missing agent must be skipped");
-        assert!(reason.contains("not in this release"), "{reason}");
-        let calls = runner.calls.lock().unwrap();
-        assert_eq!(calls.archive_checks, 1);
-        assert_eq!(calls.installs, 0);
-        assert!(!calls
+        .expect("missing binaries must be skipped");
+        assert!(reason.contains("lu, ting"), "{reason}");
+        assert_eq!(runner.calls.lock().unwrap().installs, 0);
+        assert!(!runner
+            .calls
+            .lock()
+            .unwrap()
             .commands
             .iter()
             .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
     }
 
     #[test]
-    fn failed_undrain_is_propagated() {
+    fn stale_heartbeat_fails_health_and_rolls_back() {
         let td = tempfile::tempdir().unwrap();
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix: Some(td.path()),
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let runner = FakeRunner::new();
+        runner.set_node(
+            "0.4.1",
+            &timestamp(OffsetDateTime::now_utc() - time::Duration::hours(2)),
+        );
+        seed_state(td.path(), "lu", "v0.4.0");
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+
+        let err = apply_agent_with_runner(&lu_component(), "v0.4.1", &context, &mut st, &runner)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("marked v0.4.1 bad"),
+            "unexpected error: {err}"
+        );
+        assert!(st.bad_versions["lu"].contains(&"v0.4.1".to_string()));
+        assert!(crate::auto_update::state::load(Some(td.path()))
+            .unwrap()
+            .bad_versions["lu"]
+            .contains(&"v0.4.1".to_string()));
+        let cmds = calls.lock().unwrap().commands.clone();
+        assert_eq!(
+            cmds.iter()
+                .filter(|(p, a)| p == "systemctl" && a == &["restart", "ting.service"])
+                .count(),
+            2,
+            "new and restored binaries must each be started"
+        );
+        assert!(cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+    }
+
+    #[test]
+    fn recovery_failure_still_undrains_and_persists_bad_mark() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
         let mut runner = FakeRunner::new();
-        *runner.nodes.lock().unwrap() = NODES_NEW.to_string();
+        runner.fail.insert(
+            "systemctl is-active --quiet ting.service".to_string(),
+            "agent unhealthy".to_string(),
+        );
+        seed_state(td.path(), "lu", "v0.4.0");
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+
+        let err = apply_agent_with_runner(&lu_component(), "v0.4.1", &context, &mut st, &runner)
+            .unwrap_err();
+        assert!(err.to_string().contains("agent unhealthy"));
+        assert!(err.to_string().contains("recovery failed"));
+        assert!(st.bad_versions["lu"].contains(&"v0.4.1".to_string()));
+        let cmds = calls.lock().unwrap().commands.clone();
+        assert!(cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+    }
+
+    #[test]
+    fn failed_undrain_is_propagated_after_successful_health() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let mut runner = FakeRunner::new();
+        runner.set_node("0.4.1", &recent());
         runner
             .fail
             .insert("lu undrain n1".to_string(), "permission denied".to_string());
+
         let err = apply_agent_with_runner(
-            &component(),
+            &lu_component(),
             "v0.4.1",
-            &ctx,
+            &context,
             &mut AutoState::default(),
             &runner,
         )
@@ -1341,108 +1786,26 @@ mod tests {
     }
 
     #[test]
-    fn recovery_failure_keeps_node_drained_and_persists_bad_mark() {
+    fn controller_backs_up_waits_for_idle_and_restarts_detected_unit() {
         let td = tempfile::tempdir().unwrap();
-        let prefix = Some(td.path());
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix,
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
-        let mut runner = FakeRunner::new();
-        runner.fail.insert(
-            "systemctl is-active --quiet lu-agent.service".to_string(),
-            "agent unhealthy".to_string(),
-        );
-        let mut st = AutoState::default();
-        let err =
-            apply_agent_with_runner(&component(), "v0.4.1", &ctx, &mut st, &runner).unwrap_err();
-        assert!(err.to_string().contains("agent unhealthy"));
-        assert!(err.to_string().contains("recovery failed"));
-        assert!(st
-            .bad_versions
-            .get("ting")
-            .unwrap()
-            .contains(&"v0.4.1".to_string()));
-        let saved = crate::auto_update::state::load(prefix).unwrap();
-        assert!(saved
-            .bad_versions
-            .get("ting")
-            .unwrap()
-            .contains(&"v0.4.1".to_string()));
-        let cmds = runner.calls.lock().unwrap().commands.clone();
-        assert!(!cmds
-            .iter()
-            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("undrain")));
-    }
-
-    #[test]
-    fn restart_failure_triggers_recovery_without_undrain() {
-        let td = tempfile::tempdir().unwrap();
-        let prefix = Some(td.path());
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix,
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
-        let mut runner = FakeRunner::new();
-        runner.fail.insert(
-            "systemctl restart lu-agent.service".to_string(),
-            "restart exploded".to_string(),
-        );
-        let mut existing = state::State::default();
-        existing.components.insert(
-            "ting".to_string(),
-            state::InstalledComponent {
-                version: "v0.4.0".to_string(),
-                target: "test".to_string(),
-                checksum: "abc".to_string(),
-                installed_at: "before".to_string(),
-                previous_version: None,
-            },
-        );
-        state::save(&state::default_state_path(prefix), &existing).unwrap();
-        let mut st = AutoState::default();
-        let err =
-            apply_agent_with_runner(&component(), "v0.4.1", &ctx, &mut st, &runner).unwrap_err();
-        assert!(err.to_string().contains("restart exploded"));
-        assert!(st
-            .bad_versions
-            .get("ting")
-            .unwrap()
-            .contains(&"v0.4.1".to_string()));
-        let cmds = runner.calls.lock().unwrap().commands.clone();
-        assert!(!cmds
-            .iter()
-            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("undrain")));
-    }
-
-    #[test]
-    fn controller_backs_up_to_a_unique_out_file_with_the_cli_config() {
-        let td = tempfile::tempdir().unwrap();
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix: Some(td.path()),
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
         let runner = FakeRunner::new();
-        *runner.status.lock().unwrap() = STATUS_IDLE_NEW.to_string();
-        let mut st = AutoState::default();
-        let lu = crate::component::builtin_components()
-            .into_iter()
-            .find(|c| c.name == "lu")
-            .unwrap();
-        let skipped =
-            apply_controller_with_runner(&lu, "v0.4.1", "release notes", &ctx, &mut st, &runner)
-                .unwrap();
+        runner.set_status(&status_json("0.4.0", 1, 0));
+        runner.push_status(&status_json("0.4.1", 0, 0));
+        let calls = runner.calls.clone();
+
+        let skipped = apply_controller_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            "release notes",
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap();
         assert!(skipped.is_none());
-        let cmds = runner.calls.lock().unwrap().commands.clone();
+        let cmds = calls.lock().unwrap().commands.clone();
         let backup = cmds
             .iter()
             .find(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("backup"))
@@ -1458,164 +1821,210 @@ mod tests {
             .to_string_lossy()
             .starts_with("lu-backup-"));
         assert!(fs::metadata(out_path).unwrap().len() > 0);
-        assert!(cmds
+        let wait = cmds
             .iter()
-            .any(|(p, a)| p == "lu" && a == &["status", "--json"]));
-        assert!(cmds
+            .position(|(p, a)| p == "lu" && a == &["status", "--json"])
+            .unwrap();
+        let restart = cmds
             .iter()
-            .any(|(p, a)| p == "systemctl" && a == &["restart", "lu.service"]));
+            .position(|(p, a)| p == "systemctl" && a == &["restart", "lu-controller.service"])
+            .expect("controller unit must be restarted");
+        assert!(wait < restart);
+        assert!(!cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("drain")));
     }
 
     #[test]
-    fn controller_fails_closed_on_busy_status() {
+    fn failed_backup_refuses_controller_update() {
+        struct BackupFails(FakeRunner);
+        impl ApplyRunner for BackupFails {
+            fn command(&self, p: &str, a: &[&str], t: Duration) -> Result<CommandOutput> {
+                if a.first().copied() == Some("backup") {
+                    return Err(Error::msg("backup failed"));
+                }
+                self.0.command(p, a, t)
+            }
+            fn install(&self, _c: &Component, _o: &InstallOptions) -> Result<InstallOutcome> {
+                Err(Error::msg("install must not run after a failed backup"))
+            }
+            fn archive_binaries(&self, c: &Component, v: &str) -> Result<Vec<String>> {
+                self.0.archive_binaries(c, v)
+            }
+            fn health_endpoint(&self, u: &str, t: Duration) -> std::result::Result<bool, String> {
+                self.0.health_endpoint(u, t)
+            }
+        }
+
         let td = tempfile::tempdir().unwrap();
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix: Some(td.path()),
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
-        let runner = FakeRunner::new();
-        *runner.status.lock().unwrap() =
-            r#"{"version":"0.4.0","jobs":{"leased":1,"running":0,"recovering":0,"needs_input":0}}"#
-                .to_string();
-        let reason = apply_controller_with_runner(
-            &component::builtin_components()
-                .into_iter()
-                .find(|c| c.name == "lu")
-                .unwrap(),
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let inner = FakeRunner::new();
+        let installs = inner.calls.clone();
+        let runner = BackupFails(inner);
+
+        let err = apply_controller_with_runner(
+            &lu_component(),
             "v0.4.1",
             "release notes",
-            &ctx,
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("backup failed"),
+            "unexpected: {err}"
+        );
+        assert_eq!(installs.lock().unwrap().installs, 0);
+    }
+
+    #[test]
+    fn controller_waits_for_busy_jobs_then_skips_on_timeout() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let runner = FakeRunner::new();
+        runner.set_status(&status_json("0.4.0", 1, 1));
+
+        let reason = apply_controller_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            "release notes",
+            &context,
             &mut AutoState::default(),
             &runner,
         )
         .unwrap()
-        .unwrap();
-        assert!(reason.contains("not idle"));
+        .expect("busy controller must be skipped");
+        assert!(reason.contains("not idle"), "{reason}");
         assert_eq!(runner.calls.lock().unwrap().installs, 0);
-    }
-
-    fn reiki_component() -> Component {
-        component::builtin_components()
-            .into_iter()
-            .find(|c| c.name == "reiki")
+        assert!(!runner
+            .calls
+            .lock()
             .unwrap()
+            .commands
+            .iter()
+            .any(|(p, a)| p == "lu" && a.first().map(String::as_str) == Some("backup")));
     }
 
     #[test]
-    fn reiki_drains_checks_config_then_restarts_and_undrains() {
+    fn reiki_checks_staged_config_before_restart_then_health_and_undrain() {
         let td = tempfile::tempdir().unwrap();
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix: Some(td.path()),
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
         let runner = FakeRunner::new();
         let calls = runner.calls.clone();
-        let mut st = AutoState::default();
-        apply_reiki_with_runner(&reiki_component(), "v0.4.1", &ctx, &mut st, &runner).unwrap();
 
+        apply_reiki_with_runner(
+            &reiki_component(),
+            "v0.4.1",
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap();
+
+        let staged = runner.last_staged.lock().unwrap().clone().unwrap();
+        assert_eq!(staged.binary, "reiki");
+        assert_eq!(
+            staged.args,
+            vec!["check", "--config", "/var/lib/reiki/reiki.toml"]
+        );
         let cmds = calls.lock().unwrap().commands.clone();
         let drain = cmds
             .iter()
             .position(|(p, a)| p == "lu" && a == &["drain", "n1"])
-            .expect("node must be drained");
-        let check = cmds
-            .iter()
-            .position(|(p, a)| p == "reiki" && a.first().map(String::as_str) == Some("check"))
-            .expect("config must be checked");
+            .unwrap();
         let restart = cmds
             .iter()
             .position(|(p, a)| p == "systemctl" && a == &["restart", "reiki.service"])
-            .expect("unit must be restarted");
-        let active = cmds
+            .unwrap();
+        let check = cmds
             .iter()
-            .position(|(p, a)| p == "systemctl" && a == &["is-active", "--quiet", "reiki.service"])
-            .expect("unit health must be checked");
+            .position(|(p, a)| p == "reiki" && a.first().map(String::as_str) == Some("check"))
+            .unwrap();
+        let health = calls.lock().unwrap().health_checks;
         let undrain = cmds
             .iter()
             .position(|(p, a)| p == "lu" && a == &["undrain", "n1"])
-            .expect("node must be undrained");
-        assert!(drain < check && check < restart && restart < active && active < undrain);
-        assert_eq!(
-            cmds.iter()
-                .filter(|(p, a)| p == "reiki" && a.first().map(String::as_str) == Some("check"))
-                .count(),
-            2,
-            "config is checked before restart and again as health"
-        );
+            .unwrap();
+        assert!(drain < restart && restart < check && check < undrain);
+        assert_eq!(health, 1, "admin health endpoint must be checked");
     }
 
     #[test]
-    fn reiki_config_failure_rolls_back_restarts_and_marks_version_bad() {
+    fn staged_config_failure_keeps_old_binary_and_marks_version_bad() {
         let td = tempfile::tempdir().unwrap();
         let prefix = td.path();
         fs::write(prefix.join("reiki"), b"old").unwrap();
         fs::write(prefix.join("reiki.prev"), b"old prev").unwrap();
-        let mut existing = state::State::default();
-        existing.components.insert(
-            "reiki".to_string(),
-            state::InstalledComponent {
-                version: "v0.4.0".to_string(),
-                target: "test".to_string(),
-                checksum: "abc".to_string(),
-                installed_at: "before".to_string(),
-                previous_version: None,
-            },
-        );
-        state::save(&state::default_state_path(Some(prefix)), &existing).unwrap();
-        let ctx = ApplyContext {
-            cfg: &cfg(&td.path().join("backups")),
-            prefix: Some(prefix),
-            config_path: Some(Path::new("tuishou.toml")),
-            verifier: None,
-            verify_config: None,
-        };
+        seed_state(prefix, "reiki", "v0.4.0");
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, prefix);
         let runner = FakeRunner::new();
-        runner.fail_once.lock().unwrap().insert(
-            "reiki check --config /var/lib/reiki/reiki.toml".to_string(),
-            "invalid config".to_string(),
-        );
+        *runner.staged_fail.lock().unwrap() = true;
         let calls = runner.calls.clone();
         let mut st = AutoState::default();
-        let err = apply_reiki_with_runner(&reiki_component(), "v0.4.1", &ctx, &mut st, &runner)
+
+        let err = apply_reiki_with_runner(&reiki_component(), "v0.4.1", &context, &mut st, &runner)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("marked v0.4.1 bad"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(fs::read(prefix.join("reiki")).unwrap(), b"old");
+        assert!(st.bad_versions["reiki"].contains(&"v0.4.1".to_string()));
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .any(|(p, a)| p == "systemctl" && a.first().map(String::as_str) == Some("restart")));
+        assert!(calls
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+    }
+
+    #[test]
+    fn failed_reiki_health_rolls_back_restarts_and_marks_version_bad() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        fs::write(prefix.join("reiki"), b"old").unwrap();
+        fs::write(prefix.join("reiki.prev"), b"old prev").unwrap();
+        seed_state(prefix, "reiki", "v0.4.0");
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, prefix);
+        let runner = FakeRunner::new();
+        runner.set_health(false);
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+
+        let err = apply_reiki_with_runner(&reiki_component(), "v0.4.1", &context, &mut st, &runner)
             .unwrap_err();
         assert!(
             err.to_string().contains("marked v0.4.1 bad"),
             "unexpected error: {err}"
         );
         assert_eq!(fs::read(prefix.join("reiki")).unwrap(), b"old prev");
-        let bad = st
-            .bad_versions
-            .get("reiki")
-            .expect("bad version must be recorded immediately");
-        assert!(bad.iter().any(|v| v == "v0.4.1"));
-
-        let cmds = calls.lock().unwrap().commands.clone();
-        let check = cmds
-            .iter()
-            .position(|(p, a)| p == "reiki" && a.first().map(String::as_str) == Some("check"))
-            .expect("config check must run");
-        let first_restart = cmds
-            .iter()
-            .position(|(p, a)| p == "systemctl" && a == &["restart", "reiki.service"])
-            .expect("recovery must restart");
-        assert!(
-            check < first_restart,
-            "bad config must prevent the first restart"
-        );
+        assert!(st.bad_versions["reiki"].contains(&"v0.4.1".to_string()));
         assert_eq!(
-            cmds.iter()
+            calls
+                .lock()
+                .unwrap()
+                .commands
+                .iter()
                 .filter(|(p, a)| p == "systemctl" && a == &["restart", "reiki.service"])
                 .count(),
-            1,
-            "the failed config check must prevent the first restart; only recovery restarts"
+            2
         );
-        assert!(cmds
+        assert!(calls
+            .lock()
+            .unwrap()
+            .commands
             .iter()
             .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
     }

@@ -1,0 +1,11 @@
+# One-shot tuishou automatic update cycle. Enable the component opt-ins in the
+# config file; [auto_update] enabled = true alone does not opt a component in.
+[Unit]
+Description=tuishou scheduled auto-update (one cycle, opt-in)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tuishou --config /etc/tuishou.toml auto-update run --once
+EnvironmentFile=-/etc/tuishou/auto-update.env
