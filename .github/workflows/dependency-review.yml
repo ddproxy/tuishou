@@ -21,4 +21,4 @@ jobs:
           # Cargo.lock lists packages that are not compiled or that record a non-SPDX licence string:
           # aws-lc-fips-sys (optional, not built), sigstore-protobuf-specs-derive (repository is Apache-2.0),
           # walkdir (Unlicense/MIT written with a slash).
-          allow-dependencies-licenses: 'pkg:cargo/aws-lc-fips-sys, pkg:cargo/sigstore-protobuf-specs-derive, pkg:cargo/walkdir'
+          allow-dependencies-licenses: 'pkg:cargo/aws-lc-fips-sys, pkg:cargo/sigstore-protobuf-specs-derive, pkg:cargo/walkdir, pkg:githubactions/Swatinem/rust-cache'
