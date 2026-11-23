@@ -13,6 +13,7 @@ pub const COMMANDS: &[&str] = &[
     "completions",
     "man",
     "verify",
+    "top",
 ];
 
 const GLOBAL_OPTIONS: &[&str] = &[
@@ -75,6 +76,7 @@ pub fn command_options(command: &str) -> &'static [&'static str] {
         "completions" => &[],
         "man" => &[],
         "verify" => &["--repo", "--signer-workflow", "--tag"],
+        "top" => &["--reiki-cmd", "--lu-cmd"],
         _ => &[],
     }
 }
@@ -156,6 +158,16 @@ mod tests {
     fn completes_verify_flags() {
         let out = candidates(&words(&["verify", "--sig"]));
         assert_eq!(out, "--signer-workflow");
+    }
+
+    #[test]
+    fn completes_top_command_and_flags() {
+        let out = candidates(&words(&["to"]));
+        assert_eq!(out, "top");
+        let out = candidates(&words(&["top", "--re"]));
+        assert_eq!(out, "--reiki-cmd");
+        let out = candidates(&words(&["top", "--lu"]));
+        assert_eq!(out, "--lu-cmd");
     }
 
     #[test]

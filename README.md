@@ -21,11 +21,73 @@ Expected first lines:
 ```text
 PASS: checksum: PASS (tuishou-<tag>-x86_64-unknown-linux-musl.tar.gz)
 PASS: attestation: PASS (tuishou verify tuishou-<tag>-x86_64-unknown-linux-musl.tar.gz)
+## Commands
+
+```sh
+# Install a component (latest release, verified in process)
+tuishou install reiki
+tuishou install lu
+
+# Install a specific version into a prefix
+tuishou install lu --version v0.4.0 --prefix /opt/tuishou/bin
+
+# Record an existing binary without replacing it
+tuishou adopt lu --version v0.4.0 --prefix /usr/local/bin
+
+# Check every default component (0 none, 10 update available, 1 error, 2 usage)
+tuishou update --check
+
+# Update every default component (same as `update all`)
+tuishou update
+
+# Inspect an artifact's attestation
+tuishou verify reiki-v0.2.1-x86_64-unknown-linux-musl.tar.gz \
+  --repo ddproxy/reiki --tag v0.2.1
+
+# Show one fixed-vocabulary status line per component (stable JSON with --json)
+tuishou status
+tuishou status --json
+
+# Roll back a component to the previous binary
+tuishou rollback reiki
+
+# Opt-in scheduled auto-update (off by default, not recommended for production)
+tuishou auto-update status --json
+tuishou auto-update install-timer --interval 10m
+
+# Update the tuishou binary itself from its own release
+tuishou self-update --version v0.2.0
+
+# Host `reiki top` and `lu top` in one terminal (Alt+1/Alt+2 switch, Ctrl+b ? help)
+tuishou top
+tuishou top --lu-cmd 'lu top --url http://127.0.0.1:8080'
+
+# Print shell completions or the man page
+tuishou completions bash
+tuishou man
 ```
 
 The installer verifies the checksum before it has a verifier, then runs the binary it just installed to verify its own archive. It removes the new binary and exits 4 if that attestation check fails. It never calls `sudo`; if the prefix is not writable it prints the exact command to rerun as root. See [install](docs/install.md).
 
 To inspect before running:
+`--allow-unattested` is an explicit local opt-in that warns and continues when verification fails. Auto-update refuses it.
+
+`tuishou top` hosts both component TUIs without reloading them. The `top` feature is on by default in release builds; minimal builds can drop it with `cargo build --no-default-features --locked`. See [top.md](docs/top.md) for keys, command overrides, state and shutdown behaviour.
+
+## Documentation
+
+- [Components](docs/components.md)
+- [Hosted TUIs](docs/top.md)
+- [Quick start](docs/quick-start.md)
+- [Install and update](docs/install-update.md)
+- [Node update procedure](docs/node-update.md)
+- [Verify a tuishou release](docs/verify-release.md)
+- [Scheduled auto-update (opt-in)](docs/auto-update.md)
+- [Dogfooding / adoption](docs/dogfooding.md)
+- [Security](docs/security.md)
+- [FAQ](docs/faq.md)
+
+## Development
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh

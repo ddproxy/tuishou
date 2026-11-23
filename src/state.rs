@@ -46,6 +46,30 @@ pub fn default_state_path(prefix: Option<&Path>) -> PathBuf {
     PathBuf::from(".tuishou.json")
 }
 
+/// Host TUI state lives beside install state, in its own file so `top` never
+/// rewrites the installer's state. With a prefix it stays under that prefix.
+#[cfg(feature = "top")]
+pub fn top_state_path(prefix: Option<&Path>) -> PathBuf {
+    if let Some(prefix) = prefix {
+        return prefix.join(".tuishou-top.json");
+    }
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        if !xdg.is_empty() {
+            return PathBuf::from(xdg).join("tuishou").join("top.json");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("tuishou")
+                .join("top.json");
+        }
+    }
+    PathBuf::from(".tuishou-top.json")
+}
+
 pub fn load(path: &Path) -> Result<State> {
     if !path.exists() {
         return Ok(State::default());
@@ -59,13 +83,19 @@ pub fn load(path: &Path) -> Result<State> {
 }
 
 pub fn save(path: &Path, state: &State) -> Result<()> {
+    save_value(path, state)
+}
+
+/// Atomic write for auxiliary state files with the same permissions and
+/// durability as the install state file.
+pub fn save_value<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| Error::Write {
             path: parent.to_path_buf(),
             source,
         })?;
     }
-    let text = serde_json::to_string_pretty(state)
+    let text = serde_json::to_string_pretty(value)
         .map_err(|e| Error::msg(format!("failed to serialize state: {e}")))?;
     atomic_write(path, format!("{text}\n").as_bytes())
 }
@@ -169,6 +199,28 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[cfg(feature = "top")]
+    #[test]
+    fn top_state_path_uses_state_dir_and_prefix() {
+        let _g = crate::test_env_lock();
+        let td = tempfile::tempdir().unwrap();
+        let old = std::env::var_os("XDG_STATE_HOME");
+        // Env mutation is serialised by test_env_lock.
+        std::env::set_var("XDG_STATE_HOME", td.path());
+        assert_eq!(
+            top_state_path(None),
+            td.path().join("tuishou").join("top.json")
+        );
+        assert_eq!(
+            top_state_path(Some(Path::new("/opt/bin"))),
+            PathBuf::from("/opt/bin/.tuishou-top.json")
+        );
+        match old {
+            Some(value) => std::env::set_var("XDG_STATE_HOME", value),
+            None => std::env::remove_var("XDG_STATE_HOME"),
+        }
     }
 
     #[cfg(unix)]

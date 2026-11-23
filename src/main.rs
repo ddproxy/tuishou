@@ -23,6 +23,8 @@ mod self_update;
 mod state;
 mod status;
 mod target;
+#[cfg(feature = "top")]
+mod top;
 mod verify;
 mod version;
 

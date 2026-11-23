@@ -8,6 +8,7 @@
 
 ### Added
 
+- Added `tuishou top`, a ratatui host for `reiki top` and `lu top`. Each child runs in its own pty and vt100 screen, both stay alive across tab swaps, resizes go to both, and mouse tracking is forwarded only when requested. `Alt+1`/`F1`, `Alt+2`/`F2` and `Ctrl+Tab` switch tabs; `Ctrl+b` opens restart/quit/help commands. The active tab, restart counts and last argv are saved under the state dir. The `top` feature is on by default and can be disabled with `--no-default-features`; docs, completions and man page are updated.
 - Added `[update].start_delay_max` (default `0`, recommended `10m` for fleets) for a random delay before an update cycle, and `[update].max_unavailable` (default unset) to skip a cycle when the controller already reports enough draining or offline nodes. Both are honoured by `update` and `auto-update`; unreadable controller state fails closed when a limit is set.
 - Added `docs/node-update.md` with the single-node drain/install/restart/health/rollback/undrain procedure, manual invocation, scheduling guidance and an "Updating many nodes" section with an Ansible example. Added tests for the removed command and config keys, jitter bounds, fleet-limit allow/refuse/fail-closed behaviour and the shared local update path.
 - `docs/components.md` documents the built-in Reiki, Lu and Tuishou defaults, their release assets, binaries, service units, signer workflows and health checks. Man page, completions and examples now use Reiki and Lu first.
