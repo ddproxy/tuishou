@@ -40,4 +40,4 @@ Auto-update refuses `require_attestation = false` and the `--allow-unattested` f
 
 ## Command not present
 
-`tuishou top` is not implemented in v0.3.0. The installer lists it as planned in its next-steps block. Use `tuishou status` for current state.
+`tuishou top` is not implemented in v0.3.1. The installer lists it as planned in its next-steps block. Use `tuishou status` for current state.

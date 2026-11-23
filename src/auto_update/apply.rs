@@ -396,22 +396,17 @@ fn node_runs_lu(runner: &dyn ApplyRunner, node: &str, ctx: &ApplyContext<'_>) ->
         Ok(t) => t,
         Err(_) => return false,
     };
-    if let Ok(out) = checked(runner, "lu", &["nodes", "--json"], timeout) {
-        if let Ok(statuses) = lu::parse_nodes(&out.stdout) {
-            if statuses
-                .iter()
-                .any(|s| s.name == node && s.version.as_deref().is_some())
-            {
-                return true;
-            }
-        }
+    // A host is a Lu agent node only when its agent unit is installed and enabled. Being able to
+    // reach a controller with the operator CLI says nothing about this host (a workstation with
+    // the CLI would otherwise be drained and have a unit restarted), and a node name found in the
+    // controller's list is not enough on its own either: the unit is what gets restarted.
+    if !unit_present_and_enabled(runner, &ctx.cfg.agent_unit, timeout) {
+        return false;
     }
-    match checked(runner, "lu", &["status", "--json"], timeout) {
-        Ok(out) => {
-            lu::status_reports_version(&out.stdout, "0.0.0") || !out.stdout.trim().is_empty()
-        }
-        Err(_) => false,
-    }
+    // The controller's node list is not consulted: the apply path drains by name and fails closed
+    // when the controller does not know it, and an unreachable controller is handled there too.
+    let _ = node;
+    true
 }
 
 fn node_healthy(
@@ -1821,6 +1816,23 @@ mod tests {
         fn health_endpoint(&self, u: &str, t: Duration) -> std::result::Result<bool, String> {
             self.0.health_endpoint(u, t)
         }
+    }
+
+    #[test]
+    fn a_host_without_the_agent_unit_is_not_a_lu_agent_node() {
+        let td = tempfile::tempdir().unwrap();
+        let config = cfg(&td.path().join("backups"));
+        let context = ctx(&config, td.path());
+        let runner = FakeRunner::new();
+
+        // An operator workstation can reach the controller (lu status prints a document) but has
+        // no agent unit: it must never be treated as a node to drain and restart.
+        runner.set_enabled(&[]);
+        assert!(!node_runs_lu(&runner, "workstation", &context));
+        runner.set_enabled(&["lu-controller.service"]);
+        assert!(!node_runs_lu(&runner, "workstation", &context));
+        runner.set_enabled(&["ting.service"]);
+        assert!(node_runs_lu(&runner, "dev-ct-9", &context));
     }
 
     #[test]

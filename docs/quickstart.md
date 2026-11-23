@@ -36,6 +36,6 @@ Assumptions: Linux x86_64, `bash`, `curl`, `tar` and `sha256sum` available. A no
    tuishou auto-update install-timer --interval 10m
    ```
 
-   `tuishou top` is reserved and not implemented in v0.3.0. Auto-update needs `[auto_update] enabled = true` and systemd units installed by the operator; `install-timer` only prints them.
+   `tuishou top` is reserved and not implemented in v0.3.1. Auto-update needs `[auto_update] enabled = true` and systemd units installed by the operator; `install-timer` only prints them.
 
 Full command reference: [cli.md](cli.md). Install options: [install.md](install.md).

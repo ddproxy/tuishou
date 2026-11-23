@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## [0.3.1]
+
+### Fixed
+
+- A host counts as a Lu agent node only when its agent unit is installed and enabled. Reaching a controller with the operator CLI no longer makes an operator workstation drain a node and restart a unit during `tuishou update lu`.
+
 ## [0.3.0]
 
 ### Added
