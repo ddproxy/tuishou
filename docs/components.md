@@ -21,6 +21,9 @@ one of `agent_unit` and `controller_unit` must qualify; ambiguous or missing
 roles fail closed. The defaults are `ting.service` and
 `lu-controller.service`.
 
+`tuishou top` hosts the Reiki and Lu TUIs side by side from the binaries above;
+see [top.md](top.md) for keys, command overrides and state.
+
 Every command reports components in the order above. A normal line uses one fixed
 phrase: `up to date (vX)`, `update available vA -> vB`, `updated vA -> vB`,
 `not installed (latest vB)`, `not in this release (archive lacks: <binaries>)`,

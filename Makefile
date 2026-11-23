@@ -1,7 +1,8 @@
-.PHONY: help build test installer-test lint docs docs-check check install release-check validate-workflows
+.PHONY: help build build-minimal test installer-test lint docs docs-check check install release-check validate-workflows
 
 help:
 	@printf '%s\n' 'build            compile the project' \
+		'build-minimal    build without the top feature' \
 		'test             workflow validation, installer test and cargo tests' \
 		'installer-test   test install.sh against a local fake release server' \
 		'lint             rustfmt, clippy and shellcheck when available' \
@@ -17,6 +18,9 @@ build:
 validate-workflows:
 	bash scripts/validate-workflows.sh
 	bash scripts/test-validate-workflows.sh
+
+build-minimal:
+	cargo build --locked --no-default-features
 
 test: validate-workflows installer-test
 	cargo test --workspace --locked --features test-hooks

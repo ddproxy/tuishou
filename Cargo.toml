@@ -8,6 +8,18 @@ description = "Install and update the Tuishou stack from GitHub releases"
 repository = "https://github.com/ddproxy/tuishou"
 
 [features]
+# `top` is on by default so release builds include `tuishou top`; minimal
+# builds can drop it with `--no-default-features`.
+default = ["top"]
+top = [
+    "dep:crossterm",
+    "dep:nix",
+    "dep:portable-pty",
+    "dep:ratatui",
+    "dep:signal-hook",
+    "dep:tui-term",
+    "dep:vt100",
+]
 # Test-only hooks. Never enabled by build or release targets.
 test-hooks = []
 
@@ -15,7 +27,10 @@ test-hooks = []
 base64 = "=0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
 const-oid = "=0.10.2"
+crossterm = { version = "0.29", optional = true }
 flate2 = "1"
+portable-pty = { version = "0.9", optional = true }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "crossterm_0_29", "layout-cache"], optional = true }
 serde = { version = "1", features = ["derive"] }
 tempfile = "3"
 serde_json = "1"
@@ -29,8 +44,18 @@ tar = "0.4"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde", "std"] }
 toml = "1.2"
+tui-term = { version = "0.3.4", optional = true }
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
+vt100 = { version = "=0.16.2", optional = true }
 x509-cert = { version = "=0.3.0", features = ["pem"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", features = ["signal"], optional = true }
+signal-hook = { version = "0.3", optional = true }
+
+[dev-dependencies]
+portable-pty = "0.9"
+vt100 = "=0.16.2"
 
 [profile.release]
 lto = true

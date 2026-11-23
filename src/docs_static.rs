@@ -87,6 +87,27 @@ Every \fBauto-update\fR action accepts \fB--prefix\fR, which overrides
 \fBinstall-timer\fR uses the configured \fBinterval\fR unless \fB--interval\fR
 is given; both are subject to the 5m minimum.
 .TP
+.B top [\fB--reiki-cmd\fR \fIARGV\fR] [\fB--lu-cmd\fR \fIARGV\fR]
+Host \fBreiki top\fR and \fBlu top\fR in one terminal. Both children start at
+launch and keep running, each in its own pseudo-terminal with a vt100 screen;
+only the active one is drawn, so selection, scroll position and filters survive
+a swap. Resizes are forwarded to both children. Requires the \fBtop\fR feature,
+which is on by default in release builds; minimal builds can drop it with
+\fBcargo build --no-default-features\fR.
+.IP
+Keys: \fBAlt+1\fR or \fBF1\fR selects Reiki, \fBAlt+2\fR or \fBF2\fR selects Lu,
+\fBCtrl+Tab\fR cycles. Everything else goes to the active child. The prefix
+\fBCtrl+b\fR opens host commands: \fBr\fR restarts the active child, \fBq\fR
+quits all, \fB?\fR shows help, and \fBEsc\fR cancels. Mouse events are passed
+through only while the active child requests mouse tracking.
+.IP
+Each \fIARGV\fR is a quoted argument string, not a shell command: quotes group
+arguments and nothing is expanded. \fB[top] reiki_cmd\fR and \fB[top] lu_cmd\fR
+in \fItuishou.toml\fR accept the same argv as arrays. Program defaults come
+from the component registry; tokens should be supplied through the child's own
+environment variables, never on the command line. The active tab, restart
+counts and last arguments are recorded under the state directory.
+.TP
 .B adopt <component> --version <tag>
 Record an existing binary in state without replacing it.
 .TP
@@ -127,6 +148,10 @@ With \fB--prefix\fR this is \fI<prefix>/.tuishou\fR instead.
 .TP
 .I dist/
 Generated completions and man page; not committed to source control.
+.TP
+.I $XDG_STATE_HOME/tuishou/top.json
+Host TUI state: last active tab, per-child restart count and last arguments
+(mode 0600). With \fB--prefix\fR this is \fI<prefix>/.tuishou-top.json\fR.
 .TP
 .I $XDG_STATE_HOME/tuishou/verify-cache/
 Trusted-root cache (mode 0700); override with \fB[verify].cache_dir\fR.

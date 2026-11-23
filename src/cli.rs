@@ -157,6 +157,19 @@ pub enum Commands {
     #[command(subcommand)]
     AutoUpdate(AutoUpdateAction),
 
+    /// Host `reiki top` and `lu top` in one terminal (requires the `top` feature)
+    #[command(
+        after_help = "Keys: Alt+1/F1 reiki, Alt+2/F2 lu, Ctrl+Tab cycle.\nCtrl+b is the prefix: r restart, q quit, ? help.\nEverything else goes to the active child; mouse is passed through when it asks for it."
+    )]
+    Top {
+        /// Override the reiki argv, e.g. --reiki-cmd 'reiki top --config /etc/reiki.toml'. Quotes group arguments; no shell expansion.
+        #[arg(long, value_name = "ARGV")]
+        reiki_cmd: Option<String>,
+        /// Override the lu argv, e.g. --lu-cmd 'lu top --url http://127.0.0.1:8080'. Quotes group arguments; no shell expansion.
+        #[arg(long, value_name = "ARGV")]
+        lu_cmd: Option<String>,
+    },
+
     /// Record an existing binary in state without replacing it
     Adopt {
         /// Component name
@@ -708,6 +721,19 @@ pub fn run() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Complete { .. } => unreachable!("handled before config load"),
+        Commands::Top { reiki_cmd, lu_cmd } => {
+            #[cfg(feature = "top")]
+            {
+                crate::top::run(&loaded, reiki_cmd.as_deref(), lu_cmd.as_deref())
+            }
+            #[cfg(not(feature = "top"))]
+            {
+                let _ = (reiki_cmd, lu_cmd);
+                Err(Error::Usage(
+                    "tuishou top requires the `top` feature; rebuild with `cargo build --release --features top` (on by default)".to_string(),
+                ))
+            }
+        }
         Commands::Adopt {
             component,
             version,

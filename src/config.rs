@@ -23,6 +23,46 @@ pub struct ConfigFile {
 
     #[serde(default)]
     pub verify: VerifyConfig,
+
+    /// Settings for `tuishou top`; accepted by minimal builds too so one
+    /// config file works with both feature sets.
+    #[serde(default)]
+    pub top: TopConfig,
+}
+
+/// Per-child command overrides for the host TUI. Each vector is an argv, not a
+/// shell command; no argument is expanded or logged.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(default)]
+pub struct TopConfig {
+    pub reiki_cmd: Option<Vec<String>>,
+    pub lu_cmd: Option<Vec<String>>,
+}
+
+impl TopConfig {
+    #[cfg(feature = "top")]
+    pub fn command_for(&self, component: &str) -> Option<&[String]> {
+        match component {
+            "reiki" => self.reiki_cmd.as_deref(),
+            "lu" => self.lu_cmd.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for (name, argv) in [
+            ("top.reiki_cmd", self.reiki_cmd.as_deref()),
+            ("top.lu_cmd", self.lu_cmd.as_deref()),
+        ] {
+            if let Some(argv) = argv {
+                if argv.is_empty() || argv[0].trim().is_empty() {
+                    return Err(Error::msg(format!("{name} must be a non-empty argv")));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// How the Sigstore public-good trust root is obtained. `embedded` uses the
@@ -400,6 +440,8 @@ pub struct LoadedConfig {
     pub auto_update: AutoUpdateConfig,
     pub update: UpdateConfig,
     pub verify: VerifyConfig,
+    #[cfg_attr(not(feature = "top"), allow(dead_code))]
+    pub top: TopConfig,
     /// Path of the config file as loaded; passed to child processes that read
     /// the same controller configuration (for example `lu backup --config`).
     pub config_path: PathBuf,
@@ -473,6 +515,7 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
             auto_update: AutoUpdateConfig::default(),
             update: UpdateConfig::default(),
             verify: VerifyConfig::default(),
+            top: TopConfig::default(),
         }
     } else {
         let text = std::fs::read_to_string(&path).map_err(|source| Error::Read {
@@ -545,11 +588,16 @@ pub fn load_config(config_path: Option<&Path>) -> Result<LoadedConfig> {
             path: path.clone(),
             source: Box::new(e),
         })?;
+    cfg.top.validate().map_err(|e| Error::Config {
+        path: path.clone(),
+        source: Box::new(e),
+    })?;
     Ok(LoadedConfig {
         components,
         auto_update: cfg.auto_update,
         update: cfg.update,
         verify: cfg.verify,
+        top: cfg.top,
         config_path: path,
     })
 }
@@ -693,6 +741,23 @@ mod tests {
     #[test]
     fn unknown_key_in_verify_section_is_rejected() {
         assert!(cfg("[verify]\nbogus = 1\n").is_err());
+    }
+
+    #[cfg(feature = "top")]
+    #[test]
+    fn top_section_parses_argv_overrides() {
+        let parsed =
+            cfg("[top]\nreiki_cmd = [\"reiki\", \"top\", \"--config\", \"/etc/reiki.toml\"]\n")
+                .unwrap();
+        let argv = parsed.top.command_for("reiki").unwrap();
+        assert_eq!(argv, ["reiki", "top", "--config", "/etc/reiki.toml"]);
+        assert!(parsed.top.command_for("lu").is_none());
+        assert!(cfg("[top]\nbogus = 1\n").is_err());
+        assert!(cfg("[top]\nlu_cmd = [\" \"]\n")
+            .unwrap()
+            .top
+            .validate()
+            .is_err());
     }
 
     #[test]
