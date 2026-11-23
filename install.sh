@@ -100,6 +100,7 @@ die_install() {
   exit "$EXIT_INSTALL"
 }
 
+# shellcheck disable=SC2329 # invoked through the EXIT trap
 cleanup() {
   if [[ -n $stage_dir && -d $stage_dir ]]; then
     rm -rf -- "$stage_dir"

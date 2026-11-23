@@ -98,8 +98,7 @@ while (my $client = $server->accept) {
   fi
   FIX_SERVER_PID=$!
 
-  local attempt
-  for attempt in {1..50}; do
+  for _ in {1..50}; do
     if curl -sS -o /dev/null "$FIX_API_BASE/" > /dev/null 2>&1; then
       return 0
     fi
