@@ -60,16 +60,34 @@ pub fn fetch_latest(agent: &ureq::Agent, repo: &str) -> Result<Release> {
 }
 
 pub fn fetch_tagged(agent: &ureq::Agent, repo: &str, version: &str) -> Result<Release> {
-    let tag = normalize_tag(version);
-    let url = format!("{}/repos/{repo}/releases/tags/{tag}", github_api_base());
+    let requested = normalize_tag(version);
+    let url = format!(
+        "{}/repos/{repo}/releases/tags/{requested}",
+        github_api_base()
+    );
     let value = http::get_json(agent, &url).map_err(|e| match e {
         Error::Http(m) if m.contains("status 404") => Error::ReleaseNotFound {
             component: repo.to_string(),
-            version: tag.clone(),
+            version: requested.clone(),
         },
         other => other,
     })?;
-    parse_release(value)
+    let release = parse_release(value)?;
+    ensure_requested_tag(&release, &requested)?;
+    Ok(release)
+}
+
+/// Bind the requested tag to the release metadata before it is used to name
+/// assets or build attestation identities.
+pub fn ensure_requested_tag(release: &Release, requested: &str) -> Result<()> {
+    let requested = normalize_tag(requested);
+    if release.tag != requested {
+        return Err(Error::msg(format!(
+            "release tag mismatch: requested {requested}, server returned {}",
+            release.tag
+        )));
+    }
+    Ok(())
 }
 
 /// List releases with a conditional request. `attempts` controls how many
@@ -152,17 +170,17 @@ pub fn find_asset<'a>(release: &'a Release, name: &str) -> Result<&'a ReleaseAss
 /// Resolve the release's source commit to a SHA so attestation certificates can
 /// be checked against the source digest extension. Handles both the case where
 /// `target_commitish` is already a SHA and the common case where it is a branch
-/// or ref name.
-pub fn fetch_source_digest(
-    agent: &ureq::Agent,
-    repo: &str,
-    release: &Release,
-) -> Result<Option<String>> {
+/// or ref name. Install/update paths require the field; a missing value refuses
+/// the release instead of silently disabling the source binding.
+pub fn fetch_source_digest(agent: &ureq::Agent, repo: &str, release: &Release) -> Result<String> {
     let Some(commitish) = release.target_commitish.as_deref() else {
-        return Ok(None);
+        return Err(Error::msg(format!(
+            "release {} has no target_commitish; refusing to skip source digest binding",
+            release.tag
+        )));
     };
     if is_sha1(commitish) {
-        return Ok(Some(commitish.to_ascii_lowercase()));
+        return Ok(commitish.to_ascii_lowercase());
     }
     let ref_path = if let Some(rest) = commitish.strip_prefix("refs/") {
         rest.to_string()
@@ -202,7 +220,7 @@ pub fn fetch_source_digest(
             "could not resolve {repo} {ref_path} to a commit sha"
         )));
     }
-    Ok(Some(sha.to_ascii_lowercase()))
+    Ok(sha.to_ascii_lowercase())
 }
 
 fn is_sha1(s: &str) -> bool {
@@ -221,5 +239,38 @@ mod tests {
         assert!(!requires_new_database(
             "Requires: new controller database soon"
         ));
+    }
+
+    #[test]
+    fn requested_tag_must_match_release_metadata() {
+        let release = parse_release(serde_json::json!({
+            "tag_name": "v0.3.0",
+            "assets": []
+        }))
+        .unwrap();
+        assert!(ensure_requested_tag(&release, "v0.4.0").is_err());
+        assert!(ensure_requested_tag(&release, "0.3.0").is_ok());
+    }
+
+    #[test]
+    fn source_digest_requires_release_commitish() {
+        let missing = parse_release(serde_json::json!({
+            "tag_name": "v0.4.0",
+            "assets": []
+        }))
+        .unwrap();
+        let err = fetch_source_digest(&crate::http::agent(), "owner/repo", &missing).unwrap_err();
+        assert!(err.to_string().contains("target_commitish"), "{err}");
+
+        let pinned = parse_release(serde_json::json!({
+            "tag_name": "v0.4.0",
+            "assets": [],
+            "target_commitish": "0123456789abcdef0123456789abcdef01234567"
+        }))
+        .unwrap();
+        assert_eq!(
+            fetch_source_digest(&crate::http::agent(), "owner/repo", &pinned).unwrap(),
+            "0123456789abcdef0123456789abcdef01234567"
+        );
     }
 }

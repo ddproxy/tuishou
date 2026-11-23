@@ -11,7 +11,7 @@ Assumptions: Linux x86_64, `bash`, `curl`, `tar` and `sha256sum` available. A no
    # expect: PASS: attestation: PASS (tuishou verify
    ```
 
-   The installer checks the archive checksum, installs `tuishou`, verifies the archive with `tuishou verify`, then installs `reiki` and `lu`. A failed attestation removes the binary and exits 4.
+   The installer checks the archive checksum, installs `tuishou`, verifies the archive with `tuishou verify`, then installs `reiki` and `lu`. A failed attestation removes the binary and exits 4. This one-line form is for evaluation only: it cannot verify the verifier before running it. Production installs must obtain the bootstrap digest from an independent trusted record and pass `--expect-sha256 <digest>` to the installer before any extraction, as shown in `docs/install.md`.
 
 2. Put the user install on `PATH` (skip for root).
 

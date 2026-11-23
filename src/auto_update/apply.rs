@@ -1,7 +1,7 @@
 //! Applying an eligible release. Agents use the real Lu drain path; the
 //! controller is guarded by policy, idleness, backups and schema checks.
 
-use crate::auto_update::state::AutoState;
+use crate::auto_update::state::{AutoState, ControllerBackup};
 use crate::component::Component;
 use crate::config::{AutoUpdateConfig, ControllerPolicy, VerifyConfig};
 use crate::duration::{in_window, parse_duration, parse_hhmm};
@@ -487,8 +487,10 @@ fn previous_version(component: &Component, prefix: Option<&Path>) -> Option<Stri
 }
 
 /// Apply to a running node agent: drain -> install -> restart -> health ->
-/// undrain. Any health failure restores `.prev`, restarts, verifies restored
-/// health, marks the version bad and leaves the node drained if recovery fails.
+/// recheck drain -> commit state -> undrain. Health, drain recheck and state
+/// commit are one transaction: any failure restores `.prev`, restarts, verifies
+/// restored health, marks the version bad and leaves the node drained if
+/// recovery fails.
 /// Returns `Some(reason)` when the release archive does not contain an agent
 /// binary for this component. Such a release is skipped, not failed: draining
 /// and restarting a node would be pointless and disruptive.
@@ -605,8 +607,52 @@ pub fn apply_agent_with_runner(
         poll_until(health_timeout, || node_healthy(runner, &node, version, ctx))
     };
     if healthy {
-        // Only advance state once the new version is confirmed live.
-        install::record_installed(component, version, receipt(&outcome)?, ctx.prefix)?;
+        let mut commit_error = None;
+        if drained {
+            // The drain is part of the apply transaction: re-check it before
+            // recording the new version or releasing the node.
+            match checked(runner, "lu", &["nodes", "--json"], command_timeout(ctx)?) {
+                Ok(out) if lu::nodes_report_drained(&out.stdout, &node) => {}
+                Ok(_) => {
+                    commit_error = Some(format!(
+                        "node {node} no longer reports drained with no active job before state commit"
+                    ));
+                }
+                Err(e) => {
+                    commit_error = Some(format!(
+                        "cannot re-check drain state for node {node} before state commit: {}",
+                        one_line(&e.to_string())
+                    ));
+                }
+            }
+        }
+        if commit_error.is_none() {
+            // A failed state commit leaves the new binary live with a stale
+            // recorded version, so it is a transaction failure too.
+            if let Err(e) = receipt(&outcome)
+                .and_then(|r| install::record_installed(component, version, r, ctx.prefix))
+            {
+                commit_error = Some(format!("state commit failed: {}", one_line(&e.to_string())));
+            }
+        }
+        if let Some(reason) = commit_error {
+            journal(
+                "agent_commit_recheck_failed",
+                &[("node", &node), ("reason", &one_line(&reason))],
+            );
+            return recover_agent(
+                component,
+                version,
+                &node,
+                drained,
+                ctx,
+                state,
+                runner,
+                &reason,
+                health_timeout,
+            )
+            .map(|()| None);
+        }
         if drained {
             undrain(runner, &node, ctx)?;
         }
@@ -714,8 +760,9 @@ fn recover_agent(
 
 /// Apply to Reiki. On a node that runs Lu this follows the same drain/deadline
 /// discipline as the agent path, then checks Reiki's config before restarting
-/// its unit and polling health. Every failure path restores the old binary,
-/// rechecks health and undrains before marking the version bad.
+/// its unit and polling health. Failures restore the old binary and mark the
+/// version bad; a drained node is only undrained after restored health is
+/// verified. Failed recovery leaves it drained for operator action.
 pub fn apply_reiki(
     component: &Component,
     version: &str,
@@ -894,16 +941,29 @@ fn recover_reiki(
             ));
         }
     }
+    let mut left_drained = false;
     if drained {
-        if let Err(e) = undrain(runner, node, ctx) {
-            recovery_errors.push(format!("undrain failed: {e}"));
+        if recovery_errors.is_empty() {
+            if let Err(e) = undrain(runner, node, ctx) {
+                recovery_errors.push(format!("undrain failed: {e}"));
+                left_drained = true;
+            }
+        } else {
+            // Never release a node whose recovery is unverified.
+            left_drained = true;
         }
     }
     if !recovery_errors.is_empty() {
+        let drain_note = if left_drained {
+            format!("; node {node} left drained for operator action")
+        } else {
+            String::new()
+        };
         return Err(Error::msg(format!(
-            "reiki update failed for {version}: {}; recovery failed: {}",
+            "reiki update failed for {version}: {}; recovery failed: {}{}",
             one_line(failure_reason),
-            one_line(&recovery_errors.join("; "))
+            one_line(&recovery_errors.join("; ")),
+            drain_note
         )));
     }
     Err(Error::msg(format!(
@@ -1074,15 +1134,56 @@ fn create_backup_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Hash a backup after checking it is a regular, non-empty, 0600, readable
+/// file. Symlinks and unusual file types fail closed.
+fn backup_checksum(path: &Path) -> Result<String> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| Error::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(Error::msg(format!(
+            "backup {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() == 0 {
+        return Err(Error::msg(format!("backup {} is empty", path.display())));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o600 {
+            return Err(Error::msg(format!(
+                "backup {} must be mode 0600, found {mode:04o}",
+                path.display()
+            )));
+        }
+    }
+    crate::verify::sha256_file(path)
+}
+
+fn verify_backup_record(record: &ControllerBackup) -> Result<()> {
+    let checksum = backup_checksum(&record.path)?;
+    if checksum != record.checksum {
+        return Err(Error::msg(format!(
+            "backup {} no longer matches the recorded checksum",
+            record.path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Back up the controller before installing a new binary. The real Lu 0.4
-/// interface is `lu backup --out <FILE>`; a failed or empty backup refuses the
-/// update so a controller is never replaced without a restore point.
+/// interface is `lu backup --out <FILE>`; a failed or unusable backup refuses
+/// the update so a controller is never replaced without a restore point.
 fn take_backup(
     cfg: &AutoUpdateConfig,
     runner: &dyn ApplyRunner,
     cmd_timeout: Duration,
     config_path: Option<&Path>,
-) -> Result<()> {
+) -> Result<ControllerBackup> {
     let dir = cfg
         .backup_dir
         .as_ref()
@@ -1105,16 +1206,7 @@ fn take_backup(
     args.extend_from_slice(&["--out", &out_arg]);
     checked(runner, "lu", &args, cmd_timeout)?;
 
-    let metadata = fs::metadata(&path).map_err(|source| Error::Read {
-        path: path.clone(),
-        source,
-    })?;
-    if !metadata.is_file() || metadata.len() == 0 {
-        return Err(Error::msg(format!(
-            "lu backup did not produce a non-empty backup file at {}",
-            path.display()
-        )));
-    }
+    let checksum = backup_checksum(&path)?;
 
     let mut entries: Vec<_> = fs::read_dir(dir)
         .map_err(|source| Error::Read {
@@ -1146,10 +1238,11 @@ fn take_backup(
         "controller_backup",
         &[
             ("path", &one_line(&path.to_string_lossy())),
+            ("checksum", &checksum),
             ("kept", &keep.to_string()),
         ],
     );
-    Ok(())
+    Ok(ControllerBackup { path, checksum })
 }
 
 /// Apply to the controller. Returns `Some(reason)` when the controller was
@@ -1185,9 +1278,47 @@ pub fn apply_controller_with_runner(
         );
         return Ok(Some(reason));
     }
-    take_backup(ctx.cfg, runner, cmd_timeout, ctx.config_path)?;
+    let backup = take_backup(ctx.cfg, runner, cmd_timeout, ctx.config_path)?;
+    state.controller_backup = Some(backup.clone());
+    crate::auto_update::state::save(ctx.prefix, state)?;
+    journal(
+        "controller_backup_recorded",
+        &[("path", &one_line(&backup.path.to_string_lossy()))],
+    );
     let opts = install_options(ctx, version, false);
     let outcome = runner.install(component, &opts)?;
+
+    // The idleness check before backup/install is not a lease. Re-check it
+    // after install, immediately before restarting the new binary.
+    let (idle, idle_error) = match checked(runner, "lu", &["status", "--json"], cmd_timeout) {
+        Ok(out) if lu::controller_idle(&out.stdout) => (true, None),
+        Ok(_) => (false, None),
+        Err(e) => (false, Some(e.to_string())),
+    };
+    if !idle {
+        let reason = match idle_error {
+            Some(e) => format!(
+                "cannot re-check controller idleness before restart: {}",
+                one_line(&e)
+            ),
+            None => "controller is no longer idle after backup and install".to_string(),
+        };
+        journal(
+            "controller_idle_recheck_failed",
+            &[("reason", &one_line(&reason))],
+        );
+        return recover_controller(
+            component,
+            version,
+            ctx,
+            state,
+            runner,
+            &reason,
+            health_timeout,
+        )
+        .map(|()| None);
+    }
+    journal("controller_idle_rechecked", &[]);
 
     let mut startup_error = None;
     if let Err(e) = restart(runner, &ctx.cfg.controller_unit, ctx) {
@@ -1248,6 +1379,20 @@ fn recover_controller(
     mark_bad(state, &component.name, version, ctx.prefix);
 
     let mut recovery_errors = Vec::new();
+    match &state.controller_backup {
+        Some(backup) => {
+            if let Err(e) = verify_backup_record(backup) {
+                recovery_errors.push(format!(
+                    "controller backup at {} is unusable: {}; keep this file for manual restore",
+                    backup.path.display(),
+                    one_line(&e.to_string())
+                ));
+            }
+        }
+        None => recovery_errors.push(
+            "no controller backup checksum recorded; manual restore may be required".to_string(),
+        ),
+    }
     if let Err(e) = rollback::restore_binaries(component, ctx.prefix, false) {
         recovery_errors.push(format!("restore .prev failed: {e}"));
     }
@@ -1306,6 +1451,12 @@ mod tests {
         )
     }
 
+    fn node_json_busy(version: &str, last_seen: &str) -> String {
+        format!(
+            r#"[{{"name":"n1","version":"{version}","draining":false,"current_job":{{"id":"j1"}},"online":true,"last_seen":"{last_seen}"}}]"#
+        )
+    }
+
     fn status_json(version: &str, leased: u32, running: u32) -> String {
         format!(
             r#"{{"version":"{version}","jobs":{{"leased":{leased},"running":{running},"recovering":0,"needs_input":0}}}}"#
@@ -1325,6 +1476,7 @@ mod tests {
         fail: BTreeMap<String, String>,
         fail_once: Arc<Mutex<BTreeMap<String, String>>>,
         node: Arc<Mutex<(String, String)>>,
+        nodes: Arc<Mutex<VecDeque<String>>>,
         status: Arc<Mutex<VecDeque<String>>>,
         enabled: Arc<Mutex<Vec<String>>>,
         present: Vec<String>,
@@ -1332,6 +1484,7 @@ mod tests {
         archive_names: Option<Vec<String>>,
         install_version: String,
         health: Arc<Mutex<VecDeque<bool>>>,
+        recovery_health: Option<bool>,
         reiki_restarts: Arc<Mutex<usize>>,
         staged_fail: Arc<Mutex<bool>>,
         last_staged: Arc<Mutex<Option<StagedCheck>>>,
@@ -1344,6 +1497,7 @@ mod tests {
                 fail: BTreeMap::new(),
                 fail_once: Arc::new(Mutex::new(BTreeMap::new())),
                 node: Arc::new(Mutex::new(("0.4.0".to_string(), recent()))),
+                nodes: Arc::new(Mutex::new(VecDeque::new())),
                 status: Arc::new(Mutex::new(VecDeque::from([status_json("0.4.0", 0, 0)]))),
                 enabled: Arc::new(Mutex::new(vec!["ting.service".to_string()])),
                 present: vec![
@@ -1358,6 +1512,7 @@ mod tests {
                 archive_names: None,
                 install_version: "v0.4.1".to_string(),
                 health: Arc::new(Mutex::new(VecDeque::from([true]))),
+                recovery_health: None,
                 reiki_restarts: Arc::new(Mutex::new(0)),
                 staged_fail: Arc::new(Mutex::new(false)),
                 last_staged: Arc::new(Mutex::new(None)),
@@ -1388,8 +1543,25 @@ mod tests {
             self.health.lock().unwrap().push_back(healthy);
         }
 
+        fn set_recovery_health(&mut self, healthy: bool) {
+            self.recovery_health = Some(healthy);
+        }
+
         fn push_status(&self, body: &str) {
             self.status.lock().unwrap().push_back(body.to_string());
+        }
+
+        fn push_nodes(&self, body: &str) {
+            self.nodes.lock().unwrap().push_back(body.to_string());
+        }
+
+        fn next_nodes(&self) -> Option<String> {
+            let mut nodes = self.nodes.lock().unwrap();
+            if nodes.len() > 1 {
+                nodes.pop_front()
+            } else {
+                nodes.front().cloned()
+            }
         }
 
         fn next_status(&self) -> String {
@@ -1424,14 +1596,17 @@ mod tests {
                 let mut restarts = self.reiki_restarts.lock().unwrap();
                 *restarts += 1;
                 if *restarts == 2 {
-                    self.push_health(true);
+                    self.push_health(self.recovery_health.unwrap_or(true));
                 }
             }
             let body = match (program, args.first().copied(), args.get(1).copied()) {
-                ("lu", Some("nodes"), Some("--json")) => {
-                    let (version, seen) = self.node.lock().unwrap().clone();
-                    node_json(&version, &seen)
-                }
+                ("lu", Some("nodes"), Some("--json")) => match self.next_nodes() {
+                    Some(body) => body,
+                    None => {
+                        let (version, seen) = self.node.lock().unwrap().clone();
+                        node_json(&version, &seen)
+                    }
+                },
                 ("lu", Some("status"), Some("--json")) => self.next_status(),
                 ("lu", Some("backup"), _) => {
                     if let Some(pos) = args.iter().position(|a| *a == "--out") {
@@ -1562,7 +1737,90 @@ mod tests {
                 previous_version: None,
             },
         );
-        state::save(&state::default_state_path(Some(prefix)), &existing).unwrap();
+        let state_path = state::default_state_path(Some(prefix));
+        state::save(&state_path, &existing).unwrap();
+        let mut good = state::KnownGood::default();
+        if let Some(c) = component::builtin_components()
+            .into_iter()
+            .find(|c| c.name == component)
+        {
+            for name in &c.binaries {
+                let prev = prefix.join(format!("{name}.prev"));
+                if prev.exists() {
+                    good.checksums
+                        .insert(name.clone(), crate::verify::sha256_file(&prev).unwrap());
+                }
+            }
+        }
+        state::save_known_good(&state_path, &good).unwrap();
+    }
+
+    fn seed_controller(prefix: &Path) {
+        fs::write(prefix.join("lu"), b"old").unwrap();
+        fs::write(prefix.join("lu.prev"), b"old prev").unwrap();
+        seed_state(prefix, "lu", "v0.4.0");
+    }
+
+    #[derive(Clone, Copy)]
+    enum BackupFault {
+        LooseMode,
+        Empty,
+        TamperAfterInstall,
+        RemoveAfterInstall,
+    }
+
+    struct FaultyBackup(FakeRunner, BackupFault, Mutex<Option<PathBuf>>);
+
+    impl FaultyBackup {
+        fn new(inner: FakeRunner, fault: BackupFault) -> Self {
+            Self(inner, fault, Mutex::new(None))
+        }
+    }
+
+    impl ApplyRunner for FaultyBackup {
+        fn command(&self, p: &str, a: &[&str], t: Duration) -> Result<CommandOutput> {
+            let out = self.0.command(p, a, t)?;
+            if a.first().copied() == Some("backup") {
+                if let Some(pos) = a.iter().position(|arg| *arg == "--out") {
+                    if let Some(arg) = a.get(pos + 1) {
+                        let path = PathBuf::from(arg);
+                        match self.1 {
+                            BackupFault::LooseMode => {
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+                                        .unwrap();
+                                }
+                            }
+                            BackupFault::Empty => fs::write(&path, b"").unwrap(),
+                            BackupFault::TamperAfterInstall | BackupFault::RemoveAfterInstall => {}
+                        }
+                        *self.2.lock().unwrap() = Some(path);
+                    }
+                }
+            }
+            Ok(out)
+        }
+
+        fn install(&self, c: &Component, o: &InstallOptions) -> Result<InstallOutcome> {
+            let out = self.0.install(c, o)?;
+            let path = self.2.lock().unwrap().clone().expect("backup path");
+            match self.1 {
+                BackupFault::TamperAfterInstall => fs::write(path, b"tampered").unwrap(),
+                BackupFault::RemoveAfterInstall => fs::remove_file(path).unwrap(),
+                BackupFault::LooseMode | BackupFault::Empty => {}
+            }
+            Ok(out)
+        }
+
+        fn archive_binaries(&self, c: &Component, v: &str) -> Result<Vec<String>> {
+            self.0.archive_binaries(c, v)
+        }
+
+        fn health_endpoint(&self, u: &str, t: Duration) -> std::result::Result<bool, String> {
+            self.0.health_endpoint(u, t)
+        }
     }
 
     #[test]
@@ -1786,6 +2044,76 @@ mod tests {
     }
 
     #[test]
+    fn agent_precommit_drain_recheck_rolls_back_and_skips_state_commit() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        seed_controller(prefix);
+        let config = cfg(&prefix.join("backups"));
+        let context = ctx(&config, prefix);
+        let runner = FakeRunner::new();
+        let seen = recent();
+        runner.push_nodes(&node_json("0.4.1", &seen));
+        runner.push_nodes(&node_json("0.4.1", &seen));
+        runner.push_nodes(&node_json_busy("0.4.1", &seen));
+        runner.push_nodes(&node_json("0.4.0", &seen));
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+
+        let err = apply_agent_with_runner(&lu_component(), "v0.4.1", &context, &mut st, &runner)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no longer reports drained"),
+            "unexpected error: {err}"
+        );
+        let recorded = state::load(&state::default_state_path(Some(prefix))).unwrap();
+        assert_eq!(recorded.components["lu"].version, "v0.4.0");
+        let cmds = calls.lock().unwrap().commands.clone();
+        assert_eq!(
+            cmds.iter()
+                .filter(|(p, a)| p == "systemctl" && a == &["restart", "ting.service"])
+                .count(),
+            2,
+            "new and restored binaries must each be started"
+        );
+        assert!(cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+    }
+
+    #[test]
+    fn agent_state_commit_failure_recovers_and_undrains() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        let state_path = state::default_state_path(Some(prefix));
+        fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        fs::write(&state_path, "not json").unwrap();
+        let config = cfg(&prefix.join("backups"));
+        let context = ctx(&config, prefix);
+        let runner = FakeRunner::new();
+        runner.set_node("0.4.1", &recent());
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+
+        let err = apply_agent_with_runner(&lu_component(), "v0.4.1", &context, &mut st, &runner)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("state commit failed"),
+            "unexpected error: {err}"
+        );
+        assert!(st.bad_versions["lu"].contains(&"v0.4.1".to_string()));
+        let cmds = calls.lock().unwrap().commands.clone();
+        assert_eq!(
+            cmds.iter()
+                .filter(|(p, a)| p == "systemctl" && a == &["restart", "ting.service"])
+                .count(),
+            2
+        );
+        assert!(cmds
+            .iter()
+            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+    }
+
+    #[test]
     fn controller_backs_up_waits_for_idle_and_restarts_detected_unit() {
         let td = tempfile::tempdir().unwrap();
         let config = cfg(&td.path().join("backups"));
@@ -1909,6 +2237,183 @@ mod tests {
     }
 
     #[test]
+    fn controller_idle_recheck_aborts_before_new_binary_restart() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        seed_controller(prefix);
+        let config = cfg(&prefix.join("backups"));
+        let context = ctx(&config, prefix);
+        let runner = FakeRunner::new();
+        runner.set_status(&status_json("0.4.0", 0, 0));
+        runner.push_status(&status_json("0.4.0", 1, 0));
+        let calls = runner.calls.clone();
+
+        let err = apply_controller_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            "release notes",
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("no longer idle"),
+            "unexpected error: {err}"
+        );
+        let recorded = state::load(&state::default_state_path(Some(prefix))).unwrap();
+        assert_eq!(recorded.components["lu"].version, "v0.4.0");
+        let cmds = calls.lock().unwrap().commands.clone();
+        let status_calls: Vec<_> = cmds
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, a))| p == "lu" && a == &["status", "--json"])
+            .collect();
+        let recheck = status_calls[1].0;
+        let restarts: Vec<_> = cmds
+            .iter()
+            .enumerate()
+            .filter(|(_, (p, a))| p == "systemctl" && a == &["restart", "lu-controller.service"])
+            .collect();
+        assert_eq!(
+            restarts.len(),
+            1,
+            "only the recovery restart of the old binary may run"
+        );
+        assert!(restarts[0].0 > recheck);
+    }
+
+    #[test]
+    fn controller_recovery_fails_when_backup_changes_after_install() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        let backup_dir = prefix.join("backups");
+        seed_controller(prefix);
+        let config = cfg(&backup_dir);
+        let context = ctx(&config, prefix);
+        let inner = FakeRunner::new();
+        inner.fail_once.lock().unwrap().insert(
+            "systemctl is-active --quiet lu-controller.service".to_string(),
+            "controller down".to_string(),
+        );
+        let mut st = AutoState::default();
+        let runner = FaultyBackup::new(inner, BackupFault::TamperAfterInstall);
+
+        let err = apply_controller_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            "release notes",
+            &context,
+            &mut st,
+            &runner,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no longer matches the recorded checksum"),
+            "unexpected error: {err}"
+        );
+        assert!(!err
+            .to_string()
+            .contains("restored .prev, verified restored health"));
+        let backup = st
+            .controller_backup
+            .clone()
+            .expect("checksum must be recorded");
+        assert!(backup.path.starts_with(&backup_dir));
+        assert_ne!(
+            crate::verify::sha256_file(&backup.path).unwrap(),
+            backup.checksum
+        );
+        assert!(backup.path.exists(), "keep the backup for manual restore");
+        assert!(st.bad_versions["lu"].contains(&"v0.4.1".to_string()));
+    }
+
+    #[test]
+    fn controller_recovery_fails_when_backup_is_missing_after_install() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        let backup_dir = prefix.join("backups");
+        seed_controller(prefix);
+        let config = cfg(&backup_dir);
+        let context = ctx(&config, prefix);
+        let inner = FakeRunner::new();
+        inner.fail_once.lock().unwrap().insert(
+            "systemctl is-active --quiet lu-controller.service".to_string(),
+            "controller down".to_string(),
+        );
+        let mut st = AutoState::default();
+        let runner = FaultyBackup::new(inner, BackupFault::RemoveAfterInstall);
+
+        let err = apply_controller_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            "release notes",
+            &context,
+            &mut st,
+            &runner,
+        )
+        .unwrap_err();
+        let backup = st
+            .controller_backup
+            .clone()
+            .expect("checksum must be recorded");
+        assert!(
+            err.to_string().contains(&format!(
+                "controller backup at {} is unusable",
+                backup.path.display()
+            )),
+            "unexpected error: {err}"
+        );
+        assert!(err.to_string().contains("manual restore"));
+        assert!(st.bad_versions["lu"].contains(&"v0.4.1".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn controller_backup_must_be_regular_nonempty_and_restricted() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        seed_controller(prefix);
+        let config = cfg(&prefix.join("backups"));
+        let context = ctx(&config, prefix);
+        let inner = FakeRunner::new();
+        let runner = FaultyBackup::new(inner, BackupFault::LooseMode);
+        let err = apply_controller_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            "release notes",
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("0600"), "unexpected: {err}");
+        assert_eq!(runner.0.calls.lock().unwrap().installs, 0);
+
+        let inner = FakeRunner::new();
+        let runner = FaultyBackup::new(inner, BackupFault::Empty);
+        let err = apply_controller_with_runner(
+            &lu_component(),
+            "v0.4.1",
+            "release notes",
+            &context,
+            &mut AutoState::default(),
+            &runner,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected: {err}");
+        assert_eq!(runner.0.calls.lock().unwrap().installs, 0);
+
+        let not_a_file = prefix.join("backups").join("directory.sql");
+        fs::create_dir(&not_a_file).unwrap();
+        assert!(backup_checksum(&not_a_file)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+    }
+
+    #[test]
     fn reiki_checks_staged_config_before_restart_then_health_and_undrain() {
         let td = tempfile::tempdir().unwrap();
         let config = cfg(&td.path().join("backups"));
@@ -1998,18 +2503,23 @@ mod tests {
         seed_state(prefix, "reiki", "v0.4.0");
         let config = cfg(&td.path().join("backups"));
         let context = ctx(&config, prefix);
-        let runner = FakeRunner::new();
+        let mut runner = FakeRunner::new();
         runner.set_health(false);
+        runner.set_recovery_health(false);
         let calls = runner.calls.clone();
         let mut st = AutoState::default();
 
         let err = apply_reiki_with_runner(&reiki_component(), "v0.4.1", &context, &mut st, &runner)
             .unwrap_err();
         assert!(
-            err.to_string().contains("marked v0.4.1 bad"),
+            err.to_string().contains("recovery failed"),
             "unexpected error: {err}"
         );
-        assert_eq!(fs::read(prefix.join("reiki")).unwrap(), b"old prev");
+        assert_eq!(
+            fs::read(prefix.join("reiki")).unwrap(),
+            b"old prev",
+            "error: {err}"
+        );
         assert!(st.bad_versions["reiki"].contains(&"v0.4.1".to_string()));
         assert_eq!(
             calls
@@ -2021,7 +2531,37 @@ mod tests {
                 .count(),
             2
         );
-        assert!(calls
+        assert!(err.to_string().contains("left drained"), "{err}");
+        assert!(!calls
+            .lock()
+            .unwrap()
+            .commands
+            .iter()
+            .any(|(p, a)| p == "lu" && a == &["undrain", "n1"]));
+    }
+
+    #[test]
+    fn reiki_recovery_failure_leaves_node_drained() {
+        let td = tempfile::tempdir().unwrap();
+        let prefix = td.path();
+        fs::write(prefix.join("reiki"), b"old").unwrap();
+        fs::write(prefix.join("reiki.prev"), b"old prev").unwrap();
+        seed_state(prefix, "reiki", "v0.4.0");
+        let config = cfg(&prefix.join("backups"));
+        let context = ctx(&config, prefix);
+        let mut runner = FakeRunner::new();
+        runner.fail.insert(
+            "systemctl restart reiki.service".to_string(),
+            "restart unavailable".to_string(),
+        );
+        let calls = runner.calls.clone();
+        let mut st = AutoState::default();
+
+        let err = apply_reiki_with_runner(&reiki_component(), "v0.4.1", &context, &mut st, &runner)
+            .unwrap_err();
+        assert!(err.to_string().contains("left drained"), "{err}");
+        assert!(st.bad_versions["reiki"].contains(&"v0.4.1".to_string()));
+        assert!(!calls
             .lock()
             .unwrap()
             .commands

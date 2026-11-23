@@ -81,7 +81,7 @@ Verify a local artifact against its GitHub attestation bundle. Flags:
 | --- | --- | --- |
 | `--repo <owner/name>` | required | Repository that produced the artifact. |
 | `--signer-workflow <path>` | `[verify].signer_workflow` | Expected signer workflow; the config default is `.github/workflows/release.yml`. |
-| `--tag <tag>` | certificate SAN | Expected release tag when given; it must be a tag ref. |
+| `--tag <tag>` | required | Expected release tag; it must be a tag ref and is resolved to a source commit digest. |
 
 `--json` prints `digest`, `issuer`, `identity`, `workflow`, `ref`, `log_index` and `predicate_type`. Text output prints all fields except `predicate_type`.
 

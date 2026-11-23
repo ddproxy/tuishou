@@ -25,6 +25,15 @@ pub struct AutoState {
     pub failures: BTreeMap<String, u32>,
     #[serde(default)]
     pub caches: BTreeMap<String, ReleaseCache>,
+    /// Checksum of the controller DB backup kept for manual restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_backup: Option<ControllerBackup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ControllerBackup {
+    pub path: PathBuf,
+    pub checksum: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -366,6 +375,35 @@ mod tests {
         let stale = state_dir(Some(prefix)).join("lock.d");
         fs::create_dir_all(&stale).unwrap();
         assert!(CycleLock::acquire(Some(prefix)).is_ok());
+    }
+
+    #[test]
+    fn old_state_without_backup_record_still_loads() {
+        let td = tempfile::tempdir().unwrap();
+        ensure_state_dir(Some(td.path())).unwrap();
+        fs::write(state_path(Some(td.path())), r#"{"last_check":"old"}"#).unwrap();
+        let loaded = load(Some(td.path())).unwrap();
+        assert_eq!(loaded.last_check.as_deref(), Some("old"));
+        assert!(loaded.controller_backup.is_none());
+    }
+
+    #[test]
+    fn controller_backup_record_round_trips() {
+        let td = tempfile::tempdir().unwrap();
+        let state = AutoState {
+            controller_backup: Some(ControllerBackup {
+                path: td.path().join("backup.sql"),
+                checksum: "0123456789abcdef".to_string(),
+            }),
+            ..AutoState::default()
+        };
+        save(Some(td.path()), &state).unwrap();
+        let loaded = load(Some(td.path())).unwrap();
+        let backup = loaded
+            .controller_backup
+            .expect("backup record must persist");
+        assert_eq!(backup.path, td.path().join("backup.sql"));
+        assert_eq!(backup.checksum, "0123456789abcdef");
     }
 
     #[test]

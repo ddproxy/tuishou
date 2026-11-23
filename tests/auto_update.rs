@@ -188,7 +188,7 @@ fn release_routes(
 ) -> Vec<Route> {
     let checksum_name = format!("{asset}.sha256");
     let release = serde_json::json!({
-        "tag_name": tag,
+        "target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name": tag,
         "body": body,
         "prerelease": tag.contains('-'),
         "draft": false,
@@ -711,12 +711,16 @@ fn reiki_staged_config_failure_keeps_old_binary_and_marks_bad() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let staged = fs::read_to_string(fx.td.join("reiki-staged.log")).unwrap_or_default();
-    assert!(
-        staged.contains("staged reiki check --config /var/lib/reiki/reiki.toml"),
-        "staged log: {staged}; stdout={} stderr={}",
+    // The staged check runs with a minimal environment; its invocation is
+    // reported in the failure reason rather than through a helper log.
+    let combined = format!(
+        "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        combined.contains("reiki check --config /var/lib/reiki/reiki.toml"),
+        "output: {combined}"
     );
     let log = fx.shims.log();
     assert!(!log.contains("systemctl restart reiki.service"), "{log}");
@@ -755,7 +759,9 @@ fn failed_reiki_health_endpoint_rolls_back_and_marks_bad() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(log.contains("lu undrain n1"), "{log}");
+    // The node stays drained when restored health cannot be verified.
+    assert!(!log.contains("lu undrain n1"), "{log}");
+    assert!(fx.shims.drained.exists());
     assert_eq!(
         fs::read(fx.bin.join("reiki")).unwrap(),
         b"#!/bin/sh\necho old reiki\n"

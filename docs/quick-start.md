@@ -5,6 +5,29 @@
 Install `tuishou` with cargo or from a release binary. Release binaries are verified
 in process against their GitHub attestations; no GitHub CLI is required.
 
+## Bootstrap trust
+
+Before `tuishou` exists, the installer can check digests but cannot verify an
+attestation. The `.sha256` asset comes from the same release as the archive, so
+it is a consistency check, not a trust bootstrap. The `tuishou verify` step runs
+the binary that was just installed, so in-process attestation cannot verify the
+verifier itself.
+
+Fetch the archive digest from an independent trusted channel (release records,
+a signed note or a configuration-management record) and pin it:
+
+```sh
+BOOTSTRAP_SHA256=$(awk '{ print $1; exit }' /etc/tuishou/bootstrap.sha256)
+curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu --expect-sha256 "$BOOTSTRAP_SHA256"
+```
+
+`--expect-sha256` takes 64 hex characters, case-insensitive. It is checked
+before extraction; a mismatch exits 4 and installs nothing. Without it the
+one-line install still works, with the bootstrap limitation above. Mandatory
+pinned digests and signed packages are a residual design decision, not
+implemented in this build. See [install.md](install.md) and
+[security.md](security.md).
+
 ## Defaults
 
 `tuishou` manages `reiki`, `lu` and `tuishou` out of the box. See

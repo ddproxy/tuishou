@@ -136,25 +136,53 @@ available:
 
 The timer's `RandomizedDelaySec` provides a second layer of fleet jitter. An
 example Ansible task installs `tuishou` on every node and runs the update
-locally, with no SSH orchestration from tuishou itself:
+locally, with no SSH orchestration from tuishou itself. It pins the bootstrap
+archive digest from an independently controlled record before the installer is
+allowed to extract anything. A `.sha256` asset from the same release, or an
+in-process attestation run by the binary being installed, is not a trust
+bootstrap:
 
 ```yaml
 - name: Update the Tuishou stack on every node
   become: true
   block:
-    - name: Install tuishou
-      ansible.builtin.get_url:
-        url: "https://github.com/ddproxy/tuishou/releases/download/v0.2.1/tuishou-v0.2.1-{{ tuishou_target }}.tar.gz"
-        dest: "/tmp/tuishou-v0.2.1-{{ tuishou_target }}.tar.gz"
-        mode: "0644"
+    - name: Read the pinned archive digest from trusted records
+      ansible.builtin.uri:
+        url: "{{ tuishou_bootstrap_digest_url }}"
+        return_content: true
+      register: tuishou_bootstrap
+      delegate_to: localhost
+      become: false
 
-    - name: Unpack tuishou
-      ansible.builtin.unarchive:
-        src: "/tmp/tuishou-v0.2.1-{{ tuishou_target }}.tar.gz"
-        dest: "/usr/local/bin"
-        remote_src: true
-        include: ["tuishou"]
-        mode: "0755"
+    - name: Set the pinned digest
+      ansible.builtin.set_fact:
+        tuishou_expected_sha256: "{{ tuishou_bootstrap.content | trim | split | first | lower }}"
+
+    - name: Refuse a malformed pinned digest
+      ansible.builtin.assert:
+        that:
+          - tuishou_expected_sha256 is match('^[0-9a-f]{64}$')
+
+    - name: Fetch the installer
+      ansible.builtin.get_url:
+        url: "https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh"
+        dest: "/tmp/tuishou-install.sh"
+        mode: "0600"
+
+    - name: Install tuishou with the pinned digest
+      ansible.builtin.command:
+        argv:
+          - "bash"
+          - "/tmp/tuishou-install.sh"
+          - "--version"
+          - "v0.2.1"
+          - "--no-components"
+          - "--prefix"
+          - "/usr/local"
+          - "--yes"
+          - "--expect-sha256"
+          - "{{ tuishou_expected_sha256 }}"
+      changed_when: false
 
     - name: Deploy node config
       ansible.builtin.copy:
@@ -174,6 +202,8 @@ locally, with no SSH orchestration from tuishou itself:
       changed_when: false
 ```
 
-Set `tuishou_target` per host (for example
-`x86_64-unknown-linux-musl`) and keep the config owned by root or the running
-user; group- or world-writable configs are refused.
+Set `tuishou_bootstrap_digest_url` to a record you control independently of the
+GitHub release, and keep the config owned by root or the running user;
+group- or world-writable configs are refused. Ansible's `become` supplies
+privilege for the task; the installer itself never invokes `sudo`. Mandatory
+pinned digests and signed packages remain a residual design decision.

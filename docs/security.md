@@ -4,22 +4,29 @@ For reviewers: verification scope, trust boundaries and bootstrap limits.
 
 ## Bootstrap trust boundary
 
-Before `tuishou` exists on the host, the shell installer can check only the SHA-256 digest from the `.sha256` asset against the downloaded archive. Both come from the same release; a checksum-only check does not prove who built the archive. The installer does not claim attestation success at this step.
+Before `tuishou` exists on the host, the installer can check digests but cannot verify an attestation. The `.sha256` asset comes from the same release as the archive, so a check against it proves consistency between two files from the same untrusted channel; it does not prove who built the archive and is not a trust bootstrap.
 
-After the checksum passes, the installer extracts and stages the downloaded binary and runs its own `verify` command on the archive:
+The out-of-band root of trust must come from outside this repo: release records, a signed note or a configuration-management record. Pass its 64-hex digest as `--expect-sha256` (case-insensitive). The installer compares it to the downloaded archive immediately, before extraction, and exits 4 on invalid format or mismatch. The release `.sha256` is still checked afterwards as a secondary consistency check.
+
+```sh
+BOOTSTRAP_SHA256=$(awk '{ print $1; exit }' /etc/tuishou/bootstrap.sha256)
+curl -fsSL https://raw.githubusercontent.com/ddproxy/tuishou/main/install.sh | bash -s -- --components reiki,lu --expect-sha256 "$BOOTSTRAP_SHA256"
+```
+
+After both checks pass, the installer extracts and stages the downloaded binary and runs its own `verify` command on the archive:
 
 ```sh
 tuishou verify <archive> --repo ddproxy/tuishou --tag <tag>
 ```
 
-That command checks the GitHub attestation in process. If it fails, the installer removes the new binary, restores `tuishou.prev` when present, and exits 4. The bootstrap caveat is unavoidable: the verifier is the artifact being installed. There is no offline installer attestation. See [limits.md](limits.md).
+That command checks the GitHub attestation in process. If it fails, the installer removes the new binary, restores `tuishou.prev` when present, and exits 4. The bootstrap caveat remains: the verifier is the artifact being installed, so in-process attestation cannot verify the verifier. There is no offline installer attestation. Pinning is optional in this build; mandatory pinned digests and signed packages are a residual design decision. See [limits.md](limits.md).
 
 ## Trust boundaries
 
 | Boundary | What crosses it | Trust rule |
 | --- | --- | --- |
 | GitHub release API and assets | Tag metadata, archives, `.sha256` files and attestation bundles | Metadata comes from the GitHub API; asset downloads carry no token. The digest and attestation decide whether an artifact is accepted. |
-| Shell installer | `install.sh` fetched over https | Resolves a release, checks SHA-256, stages the binary and runs its `verify` command. It never invokes `sudo`; an unwritable prefix prints a root rerun command. |
+| Shell installer | `install.sh` fetched over https | Resolves a release, checks an optional out-of-band pinned digest before extraction, checks the release `.sha256` as a consistency check, stages the binary and runs its `verify` command. It never invokes `sudo`; an unwritable prefix prints a root rerun command. |
 | Verifier binary | The installed `tuishou` executable | Its `verify` command checks the archive's attestation in process; no external CLI or login is used. Component installs fail closed unless the operator passes `--allow-unattested` explicitly; auto-update refuses that flag. |
 | Config file | `tuishou.toml` | Refused unless owned by the running user or root and not writable by group or others. Unknown keys are errors. Repositories and asset hosts cannot be overridden. |
 | Host execution | Local install, update and service commands | Runs with the privileges of the invoking account; no privilege elevation and no fleet SSH. Only trusted configs should be used. |

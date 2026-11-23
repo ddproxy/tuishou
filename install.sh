@@ -23,6 +23,7 @@ prefix=""
 release_json=""
 archive_name=""
 checksum_name=""
+expect_sha256=""
 original_args=("$@")
 
 info() {
@@ -63,6 +64,10 @@ Options:
   --components <list>  Comma-separated components to install (default: reiki,lu).
                        Known components: reiki, lu. tuishou is always installed.
   --version <tag>      tuishou release tag (default: latest stable).
+  --expect-sha256 <digest>
+                       Pin the archive SHA-256 (64 hex chars) from an
+                       independent trusted channel; checked before extraction.
+                       The release .sha256 stays a consistency check.
   --prefix <dir>       Install root; binaries go in <dir>/bin.
                        Default: /usr/local as root, otherwise ~/.local.
   --no-components      Install tuishou only.
@@ -210,6 +215,17 @@ while (($# > 0)); do
       version_raw="${1#*=}"
       shift
       ;;
+    --expect-sha256)
+      (($# >= 2)) || die_usage "--expect-sha256 needs a digest"
+      expect_sha256_raw="$2"
+      expect_sha256_set=1
+      shift 2
+      ;;
+    --expect-sha256=*)
+      expect_sha256_raw="${1#*=}"
+      expect_sha256_set=1
+      shift
+      ;;
     --prefix)
       (($# >= 2)) || die_usage "--prefix needs a directory"
       prefix="$2"
@@ -243,9 +259,17 @@ done
 
 components_raw="${components_raw:-$DEFAULT_COMPONENTS}"
 version_raw="${version_raw:-}"
+expect_sha256_raw="${expect_sha256_raw:-}"
+expect_sha256_set="${expect_sha256_set:-0}"
 no_components="${no_components:-0}"
 dry_run="${dry_run:-0}"
 yes="${yes:-0}"
+
+if [[ $expect_sha256_set -eq 1 ]]; then
+  expect_sha256=$(printf '%s' "$expect_sha256_raw" | tr '[:upper:]' '[:lower:]')
+  [[ $expect_sha256 =~ ^[0-9a-f]{64}$ ]] ||
+    die_verify "--expect-sha256 must be 64 hexadecimal characters (SHA-256)"
+fi
 
 if [[ $no_components -eq 1 ]]; then
   components_raw=""
@@ -306,6 +330,11 @@ if [[ $dry_run -eq 1 ]]; then
   info "dry run: no changes will be made"
   info "platform: $os/$arch ($TARGET)"
   info "tuishou: $tag -> $prefix (binary: $dest)"
+  if [[ -n $expect_sha256 ]]; then
+    info "pinned SHA-256: $expect_sha256 (out of band; checked before extraction)"
+  else
+    info "pinned SHA-256: none supplied"
+  fi
   if [[ ${#COMPONENTS[@]} -eq 0 ]]; then
     info "components: none (--no-components or empty list)"
   else
@@ -359,12 +388,15 @@ check_asset_url "$checksum_url"
 if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$stage_dir/$archive_name" "$archive_url"; then
   die_install "download failed for $archive_name"
 fi
+actual=$(sha256sum "$stage_dir/$archive_name" | awk '{ print $1 }')
+if [[ -n $expect_sha256 && $actual != "$expect_sha256" ]]; then
+  die_verify "pinned SHA-256 mismatch for $archive_name: expected $expect_sha256, got $actual"
+fi
 if ! curl -fsSL --retry 3 --connect-timeout 10 -o "$stage_dir/$checksum_name" "$checksum_url"; then
   die_install "download failed for $checksum_name"
 fi
 
 expected=$(awk 'NF { print $1; exit }' "$stage_dir/$checksum_name" | tr '[:upper:]' '[:lower:]')
-actual=$(sha256sum "$stage_dir/$archive_name" | awk '{ print $1 }')
 if [[ ! $expected =~ ^[0-9a-f]{64}$ ]]; then
   die_verify "checksum file for $archive_name is not a SHA-256 digest"
 fi
@@ -372,7 +404,13 @@ if [[ $actual != "$expected" ]]; then
   die_verify "checksum mismatch for $archive_name: expected $expected, got $actual"
 fi
 pass "checksum: PASS ($archive_name)"
-info "bootstrap: only the checksum can be checked before tuishou exists; attestation follows installation"
+if [[ -n $expect_sha256 ]]; then
+  pass "pinned SHA-256: PASS ($archive_name)"
+  info "bootstrap: the pinned digest came from an independent trusted channel"
+else
+  warn "bootstrap: no --expect-sha256 supplied; a checksum from the same release is not a trust bootstrap"
+fi
+info "bootstrap: only the checksum can be checked before tuishou exists; in-process attestation cannot verify the verifier"
 
 mkdir -p "$stage_dir/extract"
 if ! tar -tzf "$stage_dir/$archive_name" | grep -qx 'tuishou'; then

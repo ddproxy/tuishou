@@ -140,7 +140,7 @@ fn setup_release(
     let checksum = format!("{}  {}\n", sha256_hex(archive), asset_name);
     let checksum_name = format!("{asset_name}.sha256");
     let release_json = serde_json::json!({
-        "tag_name": tag,
+        "target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name": tag,
         "body": format!("## {tag}\n\n- changes\n"),
         "assets": [
             {"name": asset_name, "browser_download_url": format!("{server_base}/dl/{asset_name}")},
@@ -253,7 +253,7 @@ fn wrong_checksum_fails() {
     let checksum_name = format!("{asset}.sha256");
     let server = FakeServer::start_with(|base| {
         let release_json = serde_json::json!({
-            "tag_name": "v0.4.0",
+            "target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name": "v0.4.0",
             "body": "",
             "assets": [
                 {"name": asset, "browser_download_url": format!("{base}/dl/{asset}")},
@@ -315,7 +315,7 @@ fn truncated_download_fails_closed() {
     let checksum_name = format!("{asset}.sha256");
     let server = FakeServer::start_with(|base| {
         let release_json = serde_json::json!({
-            "tag_name": "v0.4.0", "body": "",
+            "target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name": "v0.4.0", "body": "",
             "assets": [
                 {"name": asset, "browser_download_url": format!("{base}/dl/{asset}")},
                 {"name": checksum_name, "browser_download_url": format!("{base}/dl/{checksum_name}")}
@@ -368,7 +368,7 @@ fn oversize_download_fails() {
     let checksum_name = format!("{asset}.sha256");
     let server = FakeServer::start_with(|base| {
         let release_json = serde_json::json!({
-            "tag_name": "v0.4.0", "body": "",
+            "target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name": "v0.4.0", "body": "",
             "assets": [
                 {"name": asset, "browser_download_url": format!("{base}/dl/{asset}")},
                 {"name": checksum_name, "browser_download_url": format!("{base}/dl/{checksum_name}")}
@@ -505,7 +505,7 @@ fn archive_path_traversal_rejected() {
     let asset = format!("lu-v0.4.0-{target}.tar.gz");
     let checksum_name = format!("{asset}.sha256");
     let server = FakeServer::start_with(|base| {
-        let release_json = serde_json::json!({"tag_name":"v0.4.0","body":"","assets":[
+        let release_json = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":"v0.4.0","body":"","assets":[
             {"name":asset,"browser_download_url":format!("{base}/dl/{asset}")},
             {"name":checksum_name,"browser_download_url":format!("{base}/dl/{checksum_name}")}
         ]})
@@ -564,7 +564,7 @@ fn archive_symlink_rejected() {
     let asset = format!("lu-v0.4.0-{target}.tar.gz");
     let checksum_name = format!("{asset}.sha256");
     let server = FakeServer::start_with(|base| {
-        let release_json = serde_json::json!({"tag_name":"v0.4.0","body":"","assets":[
+        let release_json = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":"v0.4.0","body":"","assets":[
             {"name":asset,"browser_download_url":format!("{base}/dl/{asset}")},
             {"name":checksum_name,"browser_download_url":format!("{base}/dl/{checksum_name}")}
         ]})
@@ -630,7 +630,7 @@ fn prev_retention_and_rollback() {
             ("v0.5.0", asset2.clone(), a2.clone()),
         ] {
             let checksum_name = format!("{asset}.sha256");
-            let rel = serde_json::json!({"tag_name":tag,"body":"","assets":[
+            let rel = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":tag,"body":"","assets":[
                 {"name":asset,"browser_download_url":format!("{base}/dl/{asset}")},
                 {"name":checksum_name,"browser_download_url":format!("{base}/dl/{checksum_name}")}
             ]})
@@ -652,7 +652,7 @@ fn prev_retention_and_rollback() {
             ));
         }
         // latest points to v0.5.0
-        let latest = serde_json::json!({"tag_name":"v0.5.0","body":"","assets":[
+        let latest = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":"v0.5.0","body":"","assets":[
             {"name":asset2,"browser_download_url":format!("{base}/dl/{asset2}")},
             {"name":format!("{asset2}.sha256"),"browser_download_url":format!("{base}/dl/{asset2}.sha256")}
         ]}).to_string();
@@ -737,7 +737,7 @@ fn update_check_exit_codes() {
             ("v0.5.0", asset2.clone(), a2.clone()),
         ] {
             let checksum_name = format!("{asset}.sha256");
-            let rel = serde_json::json!({"tag_name":tag,"body":"## " ,"assets":[
+            let rel = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":tag,"body":"## " ,"assets":[
                 {"name":asset,"browser_download_url":format!("{base}/dl/{asset}")},
                 {"name":checksum_name,"browser_download_url":format!("{base}/dl/{checksum_name}")}
             ]})
@@ -758,7 +758,7 @@ fn update_check_exit_codes() {
                 "text/plain".to_string(),
             ));
         }
-        let latest = serde_json::json!({"tag_name":"v0.5.0","body":"## v0.5.0\n- x","assets":[
+        let latest = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":"v0.5.0","body":"## v0.5.0\n- x","assets":[
             {"name":asset2,"browser_download_url":format!("{base}/dl/{asset2}")},
             {"name":format!("{asset2}.sha256"),"browser_download_url":format!("{base}/dl/{asset2}.sha256")}
         ]}).to_string();
@@ -841,7 +841,7 @@ fn major_version_refusal() {
             ("v1.0.0", asset2.clone(), a2.clone()),
         ] {
             let checksum_name = format!("{asset}.sha256");
-            let rel = serde_json::json!({"tag_name":tag,"body":"","assets":[
+            let rel = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":tag,"body":"","assets":[
                 {"name":asset,"browser_download_url":format!("{base}/dl/{asset}")},
                 {"name":checksum_name,"browser_download_url":format!("{base}/dl/{checksum_name}")}
             ]})
@@ -862,7 +862,7 @@ fn major_version_refusal() {
                 "text/plain".to_string(),
             ));
         }
-        let latest = serde_json::json!({"tag_name":"v1.0.0","body":"","assets":[
+        let latest = serde_json::json!({"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","tag_name":"v1.0.0","body":"","assets":[
             {"name":asset2,"browser_download_url":format!("{base}/dl/{asset2}")},
             {"name":format!("{asset2}.sha256"),"browser_download_url":format!("{base}/dl/{asset2}.sha256")}
         ]}).to_string();

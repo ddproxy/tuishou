@@ -117,7 +117,7 @@ Print a shell completion script to stdout.
 .B man
 Print this man page to stdout.
 .TP
-.B verify \fIfile\fR --repo \fIowner/name\fR [\fB--signer-workflow\fR \fIpath\fR] [\fB--tag\fR \fItag\fR]
+.B verify \fIfile\fR --repo \fIowner/name\fR --tag \fItag\fR [\fB--signer-workflow\fR \fIpath\fR]
 Verify a local artifact against its GitHub attestation bundle. Prints the
 subject digest, OIDC issuer, workflow identity, expected workflow path, ref and
 Rekor log index. Exit status is 0 when verified, 1 when refused and 2 for usage

@@ -70,6 +70,31 @@ out=$(expect_exit 4 fixture_installer_env bash "$installer" --prefix "$work/bad-
 assert_contains "$out" "checksum mismatch"
 assert_absent "$work/bad-checksum/bin/tuishou"
 
+section "pinned digest format"
+out=$(expect_exit 4 fixture_installer_env bash "$installer" --prefix "$work/pinned-format" --yes --expect-sha256 "not-a-digest")
+assert_contains "$out" "--expect-sha256 must be 64 hexadecimal characters"
+assert_absent "$work/pinned-format"
+
+section "pinned digest mismatch"
+good_digest=$(sha256sum "$FIX_SERVER_ROOT/assets/$FIX_ARCHIVE_GOOD" | awk '{ print $1 }')
+wrong_digest=$(printf '%s' "${good_digest}-mismatch" | sha256sum | awk '{ print $1 }')
+out=$(expect_exit 4 fixture_installer_env bash "$installer" --prefix "$work/pinned-bad" --yes --expect-sha256 "$wrong_digest")
+assert_contains "$out" "pinned SHA-256 mismatch"
+assert_absent "$work/pinned-bad/bin/tuishou"
+
+section "pinned digest succeeds and is case-insensitive"
+out=$(fixture_installer_env bash "$installer" --prefix "$work/pinned-good" --yes --no-components --expect-sha256 "${good_digest^^}")
+assert_contains "$out" "pinned SHA-256: PASS"
+assert_contains "$out" "attestation: PASS (tuishou verify"
+assert_contains "$out" "checksum: PASS"
+[[ -x $work/pinned-good/bin/tuishou ]]
+
+section "pinned digest keeps the release checksum as a consistency check"
+bad_digest=$(sha256sum "$FIX_SERVER_ROOT/assets/$FIX_ARCHIVE_BAD" | awk '{ print $1 }')
+out=$(expect_exit 4 fixture_installer_env bash "$installer" --prefix "$work/pinned-checksum" --yes --version "$FIX_BAD_TAG" --expect-sha256 "$bad_digest")
+assert_contains "$out" "checksum mismatch"
+assert_absent "$work/pinned-checksum/bin/tuishou"
+
 section "attestation failure removes the new binary"
 # shellcheck disable=SC2030
 out=$(export TUISHOU_TEST_ATTESTATION=fail; expect_exit 4 fixture_installer_env bash "$installer" --prefix "$work/bad-attestation" --yes)
