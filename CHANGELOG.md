@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed
+
+- Agent nodes drain, wait, check health and undrain through `ting drain`, `ting wait-idle`, `ting status --json` and `ting undrain`, so no operator credential is needed on a node. An older `ting` without these commands fails closed with guidance and leaves the node untouched. Requires a Lu release that includes the agent self-drain commands.
+- Node name resolves from `[auto_update] node_name`, `TUISHOU_NODE_NAME`, the ting `[agent] name`, then the system hostname; `localhost` and invalid names are refused. New `ting_config` key.
+
+### Fixed
+
+- Heartbeat freshness accepts Lu's numeric `last_seen` timestamp.
+
 ## [0.3.2]
 
 ### Fixed

@@ -10,6 +10,7 @@ use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NodeStatus {
+    #[allow(dead_code)]
     pub name: String,
     #[serde(default)]
     pub version: Option<String>,
@@ -20,13 +21,15 @@ pub struct NodeStatus {
     #[serde(default)]
     pub online: Option<bool>,
     #[serde(default)]
-    pub last_seen: Option<String>,
+    /// Lu reports this as a unix timestamp in seconds; older shapes used an RFC 3339 string.
+    pub last_seen: Option<serde_json::Value>,
 }
 
 pub fn parse_nodes(json: &str) -> Result<Vec<NodeStatus>, String> {
     serde_json::from_str::<Vec<NodeStatus>>(json).map_err(|e| e.to_string())
 }
 
+#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
 pub fn find_node(json: &str, node: &str) -> Result<NodeStatus, String> {
     let nodes = parse_nodes(json)?;
     nodes
@@ -42,6 +45,7 @@ pub fn node_is_drained(node: &NodeStatus) -> bool {
     node.draining == Some(true) && node.current_job.is_none()
 }
 
+#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
 pub fn nodes_report_drained(json: &str, node: &str) -> bool {
     find_node(json, node)
         .map(|n| node_is_drained(&n))
@@ -68,6 +72,7 @@ pub fn normalize_version(value: &str) -> &str {
 }
 
 /// Compare the exact `version` field of the named node with a release tag.
+#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
 pub fn node_reports_version(json: &str, node: &str, tag: &str) -> bool {
     find_node(json, node)
         .ok()
@@ -78,6 +83,7 @@ pub fn node_reports_version(json: &str, node: &str, tag: &str) -> bool {
 
 /// A node must report both the exact version and a recent heartbeat. Missing
 /// or unparseable timestamps fail closed so an offline node cannot pass health.
+#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
 pub fn node_healthy(json: &str, node: &str, tag: &str, max_age: std::time::Duration) -> bool {
     if !node_reports_version(json, node, tag) {
         return false;
@@ -85,14 +91,55 @@ pub fn node_healthy(json: &str, node: &str, tag: &str, max_age: std::time::Durat
     let Ok(status) = find_node(json, node) else {
         return false;
     };
-    let Some(last_seen) = status.last_seen.as_deref() else {
-        return false;
-    };
-    let Ok(seen) = OffsetDateTime::parse(last_seen, &Rfc3339) else {
+    status_is_fresh(&status, max_age)
+}
+
+/// The heartbeat time of a node, from either a unix timestamp or an RFC 3339 string.
+fn last_seen_time(status: &NodeStatus) -> Option<OffsetDateTime> {
+    match status.last_seen.as_ref()? {
+        serde_json::Value::Number(n) => {
+            let secs = n.as_i64().or_else(|| n.as_f64().map(|f| f as i64))?;
+            OffsetDateTime::from_unix_timestamp(secs).ok()
+        }
+        serde_json::Value::String(s) => OffsetDateTime::parse(s, &Rfc3339).ok(),
+        _ => None,
+    }
+}
+
+/// A status counts as fresh only with a readable heartbeat that is not in the future and not
+/// older than `max_age`; anything else fails closed.
+pub fn status_is_fresh(status: &NodeStatus, max_age: std::time::Duration) -> bool {
+    let Some(seen) = last_seen_time(status) else {
         return false;
     };
     let now = OffsetDateTime::now_utc();
     now >= seen && (now - seen) <= max_age
+}
+
+/// Parse the node's own view as printed by `ting status --json` (one object with the same fields
+/// as an entry of `lu nodes --json`).
+pub fn parse_self(json: &str) -> Result<NodeStatus, String> {
+    serde_json::from_str::<NodeStatus>(json).map_err(|e| e.to_string())
+}
+
+/// The node's own view reports drained only when draining is true and no job is current.
+pub fn self_is_drained(json: &str) -> bool {
+    parse_self(json)
+        .map(|n| node_is_drained(&n))
+        .unwrap_or(false)
+}
+
+/// The node's own view reports the exact version, is online and has a fresh heartbeat.
+pub fn self_is_healthy(json: &str, tag: &str, max_age: std::time::Duration) -> bool {
+    let Ok(status) = parse_self(json) else {
+        return false;
+    };
+    let version_ok = status
+        .version
+        .as_deref()
+        .map(|v| normalize_version(v) == normalize_version(tag))
+        .unwrap_or(false);
+    version_ok && status.online != Some(false) && status_is_fresh(&status, max_age)
 }
 
 /// `lu status --json` reports a controller version and a `jobs` object.
@@ -109,6 +156,7 @@ pub fn status_reports_version(json: &str, tag: &str) -> bool {
 
 /// A minimal reachability signal: the controller answered with a status
 /// document that includes its version. Idleness is checked separately.
+#[allow(dead_code)] // operator-side parser, kept for operator views of `lu nodes --json`
 pub fn status_available(json: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
