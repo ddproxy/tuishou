@@ -82,8 +82,8 @@ class ReleaseVersionTest(unittest.TestCase):
 
         base = key(f"v{CURRENT}")
         dev = key(f"v{NEXT}-dev.7.gabc1234")
-        later = key("v0.3.6-dev.10.gdef5678")
-        next_stable = key("v0.3.6")
+        later = key(f"v{NEXT}-dev.10.gdef5678")
+        next_stable = key(f"v{NEXT}")
         self.assertLess(base, dev)
         self.assertLess(dev, later)
         self.assertLess(later, next_stable)
