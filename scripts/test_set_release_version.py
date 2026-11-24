@@ -19,6 +19,10 @@ assert spec and spec.loader
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
+CURRENT = module.read_version(ROOT)
+_major, _minor, _patch = (int(part) for part in CURRENT.split("."))
+NEXT = f"{_major}.{_minor}.{_patch + 1}"
+
 
 class ReleaseVersionTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -41,7 +45,7 @@ class ReleaseVersionTest(unittest.TestCase):
         lock = (self.root / "Cargo.lock").read_text(encoding="utf-8")
         for arguments in (
             ("check", "v9.9.9"),
-            ("check", "v0.3.6-dev.7.gabc1234"),
+            ("check", f"v{NEXT}-dev.7.gabc1234"),
             ("set", "v9.9.9"),
             ("set", "v9.9.10-dev.9.gabc1234"),
         ):
@@ -50,13 +54,13 @@ class ReleaseVersionTest(unittest.TestCase):
             self.assertIn("set-release-version:", result.stderr)
             self.assertEqual((self.root / "Cargo.toml").read_text(encoding="utf-8"), manifest)
             self.assertEqual((self.root / "Cargo.lock").read_text(encoding="utf-8"), lock)
-        self.assertEqual(self.run_script("check", "v0.3.5").returncode, 0)
-        self.assertEqual(self.run_script("set", "v0.3.5").returncode, 0)
+        self.assertEqual(self.run_script("check", f"v{CURRENT}").returncode, 0)
+        self.assertEqual(self.run_script("set", f"v{CURRENT}").returncode, 0)
 
     def test_dev_rewrite_correct(self) -> None:
-        result = self.run_script("set", "v0.3.6-dev.7.gabc1234")
+        result = self.run_script("set", f"v{NEXT}-dev.7.gabc1234")
         self.assertEqual(result.returncode, 0, result.stderr)
-        version = "0.3.6-dev.7.gabc1234"
+        version = f"{NEXT}-dev.7.gabc1234"
         manifest = (self.root / "Cargo.toml").read_text(encoding="utf-8")
         lock = (self.root / "Cargo.lock").read_text(encoding="utf-8")
         self.assertIn(f'version = "{version}"', manifest.split("[package]", 1)[1])
@@ -68,7 +72,7 @@ class ReleaseVersionTest(unittest.TestCase):
     def test_dev_tag_uses_next_patch(self) -> None:
         result = self.run_script("dev-tag", "--commits", "7", "--hash", "abc1234")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "v0.3.6-dev.7.gabc1234")
+        self.assertEqual(result.stdout.strip(), f"v{NEXT}-dev.7.gabc1234")
 
     def test_ordering_sorts_after_base_stable_and_before_next(self) -> None:
         def key(tag: str) -> tuple[int, int, int, int, int, str]:
@@ -76,8 +80,8 @@ class ReleaseVersionTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             return tuple(json.loads(result.stdout))  # type: ignore[return-value]
 
-        base = key("v0.3.5")
-        dev = key("v0.3.6-dev.7.gabc1234")
+        base = key(f"v{CURRENT}")
+        dev = key(f"v{NEXT}-dev.7.gabc1234")
         later = key("v0.3.6-dev.10.gdef5678")
         next_stable = key("v0.3.6")
         self.assertLess(base, dev)
