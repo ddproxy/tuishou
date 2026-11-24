@@ -99,6 +99,13 @@ pub fn verify_bundle(
     })
 }
 
+/// Build the expected Fulcio workflow identity and tag ref for a release.
+fn expected_identity(repo: &str, workflow: &str, tag: &str) -> (String, String) {
+    let ref_value = format!("refs/tags/{tag}");
+    let identity = format!("{SUBJECT_PREFIX}{repo}/{workflow}@{ref_value}");
+    (identity, ref_value)
+}
+
 fn resolve_identity(
     materials: &BundleMaterials,
     request: &AttestationRequest,
@@ -109,8 +116,11 @@ fn resolve_identity(
     );
     if let Some(tag) = &request.tag {
         super::validate_tag(tag, "expected release tag")?;
-        let ref_value = format!("refs/tags/{tag}");
-        return Ok((format!("{prefix}{ref_value}"), ref_value));
+        return Ok(expected_identity(
+            &request.repo,
+            &request.signer_workflow,
+            tag,
+        ));
     }
     let sans = subject_alt_names(&materials.certificate)?;
     let mut candidates: Vec<String> = sans
@@ -141,6 +151,51 @@ fn resolve_identity(
             request.repo, request.signer_workflow
         ))),
     }
+}
+
+/// Compare certificate SANs with the expected workflow identity. Matching stays
+/// byte-exact: another workflow path or another ref is always refused.
+fn check_workflow_identity(
+    sans: &[String],
+    repo: &str,
+    workflow: &str,
+    identity: &str,
+    ref_value: &str,
+) -> Result<()> {
+    if sans.iter().any(|name| name == identity) {
+        return Ok(());
+    }
+    let expected_prefix = format!("{SUBJECT_PREFIX}{repo}/{workflow}@");
+    let actual = sans
+        .iter()
+        .find(|name| name.starts_with(&expected_prefix))
+        .or_else(|| sans.first())
+        .map(String::as_str)
+        .unwrap_or("<none>");
+    Err(Error::AttestationRefused(format!(
+        "workflow identity mismatch: expected ref {ref_value} for {repo}/{workflow}, actual ref {} from {}; override the expected signer workflow with --signer-workflow <path>",
+        printable(san_ref(actual)),
+        printable(actual)
+    )))
+}
+
+/// Certificate text is untrusted until the chain is verified: escape control
+/// characters and cap the length before it reaches an error message.
+fn printable(text: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let mut out: String = text
+        .chars()
+        .take(MAX_CHARS)
+        .flat_map(char::escape_debug)
+        .collect();
+    if text.chars().count() > MAX_CHARS {
+        out.push_str("...");
+    }
+    out
+}
+
+fn san_ref(uri: &str) -> &str {
+    uri.rsplit_once('@').map_or(uri, |(_, reference)| reference)
 }
 
 fn parse_materials(bundle: &Bundle) -> Result<BundleMaterials> {
@@ -222,12 +277,13 @@ fn check_certificate_policy(
         )));
     }
     let sans = subject_alt_names(&materials.certificate)?;
-    if !sans.iter().any(|name| name == identity) {
-        return Err(Error::AttestationRefused(format!(
-            "workflow identity mismatch: expected {identity}, got {}",
-            sans.join(", ")
-        )));
-    }
+    check_workflow_identity(
+        &sans,
+        &request.repo,
+        &request.signer_workflow,
+        identity,
+        ref_value,
+    )?;
 
     let actual_ref = first_extension(
         &materials.certificate,
@@ -571,6 +627,82 @@ mod tests {
         let mut wrong_workflow = request();
         wrong_workflow.signer_workflow = ".github/workflows/ci.yml".to_string();
         assert!(verify_bundle(&wrong_workflow, trust_root(), TUISHOU_V010_BUNDLE, good).is_err());
+    }
+
+    const DEV_REPO: &str = "ddproxy/tuishou";
+    const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
+    const DEV_TAG: &str = "v0.6.2-dev.1.gc08a5a0";
+
+    fn dev_expected() -> (String, String) {
+        expected_identity(DEV_REPO, RELEASE_WORKFLOW, DEV_TAG)
+    }
+
+    fn san(workflow: &str, reference: &str) -> String {
+        format!("https://github.com/{DEV_REPO}/{workflow}@{reference}")
+    }
+
+    fn check_dev_sans(sans: &[String]) -> Result<()> {
+        let (identity, ref_value) = dev_expected();
+        check_workflow_identity(sans, DEV_REPO, RELEASE_WORKFLOW, &identity, &ref_value)
+    }
+
+    #[test]
+    fn dev_tag_release_workflow_identity_is_accepted() {
+        let (identity, ref_value) = dev_expected();
+        assert_eq!(ref_value, "refs/tags/v0.6.2-dev.1.gc08a5a0");
+        assert_eq!(
+            identity,
+            "https://github.com/ddproxy/tuishou/.github/workflows/release.yml@refs/tags/v0.6.2-dev.1.gc08a5a0"
+        );
+        check_dev_sans(&[san(RELEASE_WORKFLOW, &ref_value)]).unwrap();
+    }
+
+    #[test]
+    fn branch_ref_signer_identity_is_refused() {
+        let err = check_dev_sans(&[san(RELEASE_WORKFLOW, "refs/heads/main")]).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("expected ref refs/tags/v0.6.2-dev.1.gc08a5a0"),
+            "{text}"
+        );
+        assert!(text.contains("actual ref refs/heads/main"), "{text}");
+        assert!(text.contains("--signer-workflow"), "{text}");
+    }
+
+    #[test]
+    fn other_workflow_signer_identity_is_refused() {
+        let (_, ref_value) = dev_expected();
+        let err = check_dev_sans(&[san(".github/workflows/ci.yml", &ref_value)]).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains(&ref_value), "{text}");
+        assert!(text.contains(".github/workflows/ci.yml"), "{text}");
+        assert!(text.contains("--signer-workflow"), "{text}");
+    }
+
+    #[test]
+    fn mismatch_message_escapes_and_truncates_certificate_text() {
+        let hostile = format!(
+            "https://github.com/x/y\n\u{1b}[31m{}@refs/heads/{}",
+            "a".repeat(50),
+            "b".repeat(500)
+        );
+        let err = check_dev_sans(&[hostile]).unwrap_err();
+        let text = err.to_string();
+        assert!(!text.contains('\n') && !text.contains('\u{1b}'), "{text}");
+        assert!(text.len() < 900, "{}", text.len());
+        assert!(text.contains("..."), "{text}");
+    }
+
+    #[test]
+    fn different_dev_tag_signer_identity_is_refused() {
+        let actual_ref = "refs/tags/v0.6.2-dev.2.g1111111";
+        let err = check_dev_sans(&[san(RELEASE_WORKFLOW, actual_ref)]).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("expected ref refs/tags/v0.6.2-dev.1.gc08a5a0"),
+            "{text}"
+        );
+        assert!(text.contains(&format!("actual ref {actual_ref}")), "{text}");
     }
 
     #[test]

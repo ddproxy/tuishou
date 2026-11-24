@@ -93,3 +93,29 @@ validation, 24 installer cases and 226 Rust tests.
 - `TUISHOU_TIMER_EXE` remains an operator override, now strictly validated, so
   a deliberately privileged operator can still choose a trusted executable.
 - `top` persists the active tab and restart counts, but no executable argv.
+
+## Dev tag identity claim check
+
+The verifier requires signer identity `release.yml@refs/tags/<tag>`. It compares the full SAN URI
+`https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>`
+byte for byte (`src/verify/sigstore_backend.rs`), with the default workflow path
+set in `src/config.rs`. Docs and tests follow the full URI from the code.
+
+The dev publishing claim matches the workflows: `.github/workflows/dev-release.yml`
+pushes `refs/tags/$TAG` and runs `gh workflow run release.yml --ref "$TAG"`;
+`.github/workflows/release.yml` enables `workflow_dispatch` and builds only when
+`github.ref_type == 'tag'`. `scripts/set-release-version.py` formats dev tags as
+`vX.Y.(Z+1)-dev.N.g<hash>`, which covers the example tag in the task.
+
+`tuishou verify` requires `--repo` and `--tag`. `AttestationRequest.tag` is
+optional internally, but the install and verify paths always set it. No code path
+accepts a `refs/heads/...` workflow identity.
+
+## Validation note
+
+`cargo test --workspace` without features fails in `tests/auto_update.rs`: those
+tests use an HTTP fake server, and normal builds correctly refuse insecure
+loopback URLs. The Makefile/CI contract is
+`cargo test --workspace --locked --features test-hooks`, which passes along with
+`cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -D warnings`
+and `scripts/docs-check.sh`.

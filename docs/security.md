@@ -39,7 +39,9 @@ official `sigstore` Rust crate (Apache-2.0) and GitHub's attestations API. Verif
 is fail closed: a digest mismatch, malformed bundle, untrusted chain, missing Rekor
 proof, wrong OIDC issuer or workflow identity, wrong source ref/digest, unexpected
 predicate, or any internal error stops the install with exit 1. `--allow-unattested`
-explicitly warns and continues for local use, but auto-update refuses it. See
+explicitly warns and continues for local use, but auto-update refuses it. Both stable
+and dev channels require the release workflow identity on `refs/tags/<tag>`; dev
+builds are dispatched on their tag ref so the identity matches. See
 [verify-release.md](verify-release.md).
 
 No subprocess is executed for attestation verification; there is no dependency on an

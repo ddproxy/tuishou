@@ -32,6 +32,24 @@ subject, missing verification material, malformed bundle, oversized response, or
 verification error is refused with a specific error. No fallback accepts a bundle that
 failed verification.
 
+### Signer identity by channel
+
+Stable and dev releases use the same identity rule. The certificate SAN must equal
+`https://github.com/<owner>/<repo>/.github/workflows/release.yml@refs/tags/<tag>`
+exactly, and the source ref extension must equal `refs/tags/<tag>`. Stable tags are
+`vX.Y.Z`; dev tags are `vX.Y.Z-dev.N.g<hash>`, for example
+`v0.6.2-dev.1.gc08a5a0`. A branch ref such as `refs/heads/main`, a different
+workflow file, or a different tag is refused.
+
+Dev releases push the dev tag and dispatch `release.yml` with `workflow_dispatch`
+on that tag ref. The signing certificate therefore carries `refs/tags/<tag>`, not a
+branch ref. Verification never accepts `refs/heads/...`.
+
+`--signer-workflow <path>` and `[verify].signer_workflow` change only the expected
+workflow path; `--tag` still selects the expected tag ref. A mismatch error names
+the expected and actual refs and shows the override flag. No override weakens the
+strict identity check.
+
 ## Trust roots and cache
 
 By default, `tuishou` ships a pinned Sigstore trusted root and TUF root. It reuses a
