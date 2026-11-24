@@ -53,7 +53,7 @@ The `tuishou` binary uses `0` ok, `1` error, `2` usage, and `10` updates availab
 - Remote fleet SSH is out of scope. Removed commands and config sections are not part of the installer.
 - `tuishou top` hosts the `reiki` and `lu` TUIs when the `top` feature is enabled by default. It spawns child processes with a cleared environment and config-scoped state; see [top.md](top.md).
 - No offline installer attestation: the verifier is the artifact being installed.
-- Auto-update is opt-in, off by default, stable-only and not recommended for production.
+- Auto-update is opt-in, off by default and not recommended for production. The `dev` channel takes automatic dev pre-releases on agent and Reiki nodes only; the controller and other prereleases are refused.
 - One rollback copy per binary (`<name>.prev`) is kept. It is not a backup system.
 - Containers, source builds, Windows and macOS installers are out of scope.
 

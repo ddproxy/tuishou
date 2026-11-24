@@ -1,0 +1,91 @@
+name: Dev release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions: {}
+
+jobs:
+  tag:
+    name: Tag dev build
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Plan dev build
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          skip() {
+            echo "$1"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "reason=$1" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          git fetch --force --tags origin '+refs/heads/main:refs/remotes/origin/main'
+          actual="$(git rev-parse refs/remotes/origin/main)"
+          if [[ "$HEAD_SHA" != "$actual" ]]; then
+            skip "main moved to $actual"
+          fi
+          git checkout --detach "$HEAD_SHA"
+
+          if [[ $(git rev-list --parents -n 1 "$HEAD_SHA" | wc -w) -gt 1 ]]; then
+            docs_only=true
+            while IFS= read -r path; do
+              [[ -z "$path" ]] && continue
+              case "$path" in
+                docs/*|*.md|llms.txt|assets/*) ;;
+                *) docs_only=false ;;
+              esac
+            done < <(git diff --name-only "${HEAD_SHA}^" "$HEAD_SHA")
+            if [[ "$docs_only" == "true" ]]; then
+              skip "docs-only change"
+            fi
+          fi
+
+          stable="$(git tag --merged "$HEAD_SHA" --list 'v[0-9]*.[0-9]*.[0-9]*' |
+            grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+          if [[ -n "$stable" ]]; then
+            commits="$(git rev-list --count "${stable}..${HEAD_SHA}")"
+          else
+            commits="$(git rev-list --count "$HEAD_SHA")"
+          fi
+          short="$(git rev-parse --short=7 "$HEAD_SHA")"
+          tag="$(python3 scripts/set-release-version.py dev-tag --commits "$commits" --hash "$short")"
+
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            skip "tag $tag exists"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            skip "release $tag exists"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Push dev tag
+        if: steps.plan.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.plan.outputs.tag }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+          git tag "$TAG" "$HEAD_SHA"
+          git push origin "refs/tags/$TAG"
+          # Tag pushes made with GITHUB_TOKEN start no workflows; dispatch on the tag ref.
+          gh workflow run release.yml --ref "$TAG"

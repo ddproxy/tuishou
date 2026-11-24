@@ -31,6 +31,11 @@ jobs:
         run: |
           cargo clippy --workspace --all-targets --locked --no-default-features --features test-hooks -- -D warnings
           cargo test --workspace --locked --no-default-features --features test-hooks
+      - name: Workflow and release script checks
+        run: |
+          bash scripts/validate-workflows.sh
+          bash scripts/test-validate-workflows.sh
+          python3 scripts/test_set_release_version.py
       - name: Test
         run: cargo test --workspace --locked --features test-hooks
       - name: Installer test

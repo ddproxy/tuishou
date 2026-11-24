@@ -102,7 +102,9 @@ Auto-update is opt-in and **not recommended for production**: it installs new
 releases without human review. Two switches are required: `[auto_update]
 enabled = true` and `auto_update = true` in each `[[component]]` block you want
 scheduled. `[auto_update].components` does not opt components in. Only the
-`stable` channel is accepted; prereleases are refused.
+`stable` channel is the default. The `dev` channel accepts automatic dev
+pre-releases tagged `vX.Y.Z-dev.<N>.g<hash>` on agent and Reiki nodes; the
+controller and other prereleases stay refused.
 
 The shipped `contrib/tuishou-update.service` and `contrib/tuishou-update.timer`
 run one cycle with a randomized delay and `Persistent=true`. Set the config path

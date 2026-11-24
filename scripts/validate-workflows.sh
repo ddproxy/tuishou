@@ -132,6 +132,33 @@ if [ "$explicit_paths" -eq 0 ]; then
     echo "dependency-review missing NCSA" >&2
     fail=1
   fi
+
+  # Dev builds run only after CI and dispatch the release workflow on the dev tag.
+  dev="$root/.github/workflows/dev-release.yml"
+  release="$root/.github/workflows/release.yml"
+  if [ ! -f "$dev" ]; then
+    echo "missing dev release workflow" >&2
+    fail=1
+  else
+    for pattern in 'workflows: \[CI\]' 'gh workflow run release.yml'; do
+      if ! grep -q -- "$pattern" "$dev"; then
+        echo "dev release workflow missing policy: $pattern" >&2
+        fail=1
+      fi
+    done
+  fi
+  if [ ! -f "$release" ]; then
+    echo "missing release workflow" >&2
+    fail=1
+  else
+    for pattern in 'workflow_dispatch:' 'set-release-version.py set' '--prerelease' \
+      'prune-list --keep 10' '!v\*-dev'; do
+      if ! grep -q -- "$pattern" "$release"; then
+        echo "release workflow missing policy: $pattern" >&2
+        fail=1
+      fi
+    done
+  fi
 fi
 
 # Full syntax and expression check when actionlint is available (CI installs it).
