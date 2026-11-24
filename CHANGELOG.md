@@ -4,6 +4,7 @@
 
 ### Added
 
+- CI on `main` now tags and publishes code changes as `vX.Y.(Z+1)-dev.<N>.g<hash>` pre-releases after the `ci` workflow succeeds. Dev builds run the release workflow, dispatched on the dev tag, with the same attestation and asset layout as stable releases, rewrite the version only in the build checkout, and keep the newest 10 dev pre-releases. Documentation-only changes, a moved `main` and existing tags are skipped. Stable tags still require the `Cargo.toml` version.
 - `[auto_update] channel = "dev"` accepts automatic dev builds (`vX.Y.Z-dev.N.g<hash>` pre-releases) for agent and Reiki nodes. They order by the commit count N, rank below the stable release of the same core, are never installed on the controller, and other pre-release tags stay refused.
 
 ## [0.3.5]

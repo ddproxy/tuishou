@@ -23,6 +23,11 @@ build-minimal:
 	cargo build --locked --no-default-features
 
 test: validate-workflows installer-test
+	@if command -v python3 >/dev/null 2>&1; then \
+		python3 scripts/test_set_release_version.py; \
+	else \
+		echo "python3 not installed; skipping version script tests"; \
+	fi
 	cargo test --workspace --locked --features test-hooks
 
 installer-test:

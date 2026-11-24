@@ -280,7 +280,7 @@ What it does not cover: the shell bootstrap runs the downloaded binary's `verify
 - Only one rollback copy per binary is kept; it is not a backup system.
 - `tuishou top` does not exist in this build. The installer prints it as a planned command in its next-steps block; do not automate it.
 - Attestation needs API access and is not cached offline by the installer. Normal release binaries ignore the test-only loopback and fake-verifier hooks.
-- Auto-update is opt-in, stable-only, and not recommended for production. Prerelease channels are rejected.
+- Auto-update is opt-in and not recommended for production. The `dev` channel accepts automatic dev pre-releases for agent and Reiki nodes, never the controller; other prereleases stay refused.
 - Containers, source builds, Windows and macOS installers are out of scope. See [limits](docs/limits.md).
 
 ## FAQ
@@ -304,7 +304,7 @@ make docs-check
 make release-check
 ```
 
-`make test` runs workflow validation, the fake-server installer test and the Rust suite. `make docs-check` executes every quickstart command in a throwaway directory, validates both config examples with the real validator, and checks links, style and flag drift. CI runs the same checks. Tagged `v*` releases are built and attested by the release workflow. Commit messages are terse and imperative, without personal names. See [AGENTS.md](AGENTS.md).
+`make test` runs workflow validation, the release version script tests when Python is available, the fake-server installer test and the Rust suite. `make docs-check` executes every quickstart command in a throwaway directory, validates both config examples with the real validator, and checks links, style and flag drift. CI runs the same checks. Tagged `v*` releases are built and attested by the release workflow. After CI succeeds on a code change pushed to `main`, a dev pre-release is tagged, built and attested through that same workflow; the newest 10 dev pre-releases are kept. Documentation-only changes do not create a dev build. Commit messages are terse and imperative, without personal names. See [AGENTS.md](AGENTS.md).
 
 ## License and links
 

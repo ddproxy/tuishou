@@ -60,6 +60,22 @@ fn validator_rejects_out_of_range_sha_lengths() {
 }
 
 #[test]
+fn dev_release_follows_ci_and_dispatches_the_release_workflow() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/dev-release.yml");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("workflows: [CI]"));
+    assert!(text.contains("github.event.workflow_run.conclusion == 'success'"));
+    assert!(text.contains("gh workflow run release.yml --ref \"$TAG\""));
+    assert!(text.contains("python3 scripts/set-release-version.py dev-tag"));
+    let out = run(&path);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn release_workflow_builds_both_musl_targets() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/release.yml");
     let text = fs::read_to_string(&path).unwrap();
@@ -73,6 +89,10 @@ fn release_workflow_builds_both_musl_targets() {
     assert!(text.contains("arch: aarch64"));
     assert!(text.contains("OUT=\"tuishou-${TAG}-${TARGET}\""));
     assert!(text.contains("tuishou-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"));
+    assert!(text.contains("workflow_dispatch:"));
+    assert!(text.contains("'!v*-dev.*'"));
+    assert!(text.contains("prune-list --keep 10"));
+    assert!(text.contains("set-release-version.py set"));
     assert!(
         text.contains("AARCH64_MUSL_LINKER"),
         "cross-linker limit must be explicit"

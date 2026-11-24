@@ -39,6 +39,12 @@ bash install.sh --components reiki,lu
 | `--yes` | off | Replace an existing binary without a prompt. |
 | `--help` | - | Print usage and exit 0. |
 
+## Release channels
+
+Stable releases are tagged `vX.Y.Z`. After CI succeeds on a code change pushed to `main`, this repository also publishes a GitHub pre-release tagged `vX.Y.(Z+1)-dev.<N>.g<hash>`, where `N` counts commits since the last stable tag. Dev builds run the same release workflow (dispatched on the dev tag, so the signing identity is `refs/tags/<tag>`), attestation and asset layout as stable releases: `tuishou-<tag>-<target>.tar.gz` with a `.sha256`, completions and a man page, plus a CycloneDX SBOM. Only the build checkout gets the dev version; the source commit is unchanged. The newest 10 dev pre-releases are kept; older ones and their tags are deleted.
+
+`--version` selects a specific tag, so a dev pre-release can be installed for canary testing. Without it the installer queries `releases/latest`, which never returns a pre-release. The same digest, checksum and attestation rules below apply to dev tags. Use them on canaries, not a fleet.
+
 ## What the installer does
 
 1. Detects the platform. Only Linux x86_64 (`x86_64-unknown-linux-musl`) is installed by this script; other platforms exit 3 and list the release targets that exist.
