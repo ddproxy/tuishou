@@ -66,6 +66,9 @@ jobs:
           else
             commits="$(git rev-list --count "$HEAD_SHA")"
           fi
+          if [[ "$commits" -eq 0 ]]; then
+            skip "head is the stable release ${stable}"
+          fi
           short="$(git rev-parse --short=7 "$HEAD_SHA")"
           tag="$(python3 scripts/set-release-version.py dev-tag --commits "$commits" --hash "$short")"
 
