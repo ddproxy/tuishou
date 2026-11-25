@@ -4,50 +4,36 @@
 
 ### Added
 
-- Added a repository hygiene test that scans tracked files for internal-looking node names, internal domains, private addresses outside documentation ranges and upstream key-owner labels. Justified exceptions are path-scoped and require a reason in `tests/fixtures/repo-hygiene-allowlist.txt`.
-- Added opt-in `[auto_update] self = true` for replacing the running `tuishou` binary at the end of an auto-update cycle. Eligible stable or dev releases use the same in-process attestation and workflow identity as component updates. The verified binary is smoke-checked before an atomic fsync-and-rename swap beside the running binary, with `<binary>.prev` retained and a `--version` confirmation on the next scheduled pass. A failed staged check or first pass marks the tag bad; a first-pass failure restores `.prev`. Only `tuishou-auto-update.timer` is restarted, never the running service.
-- Added fake-release tests for the disabled default, stable and dev selection, attestation failure, staged smoke failure and first-pass rollback, plus unit tests for timer-only restart and version matching.
-
-### Changed
-
-- Staged installs now fsync each temp file before its atomic rename and best-effort fsync the parent directory.
-- Test fixtures use neutral node names and reserved neutral host labels instead of internal-looking ones. No stored or wire value changed.
-
-### Fixed
-
-- Attestation fixture instructions use repository-relative destinations instead of an internal workspace path.
+- `[auto_update] self = true` replaces the running `tuishou` binary at the end of an auto-update cycle.
 
 ## [0.3.6]
 
 ### Added
 
-- CI on `main` now tags and publishes code changes as `vX.Y.(Z+1)-dev.<N>.g<hash>` pre-releases after the `ci` workflow succeeds. Dev builds run the release workflow, dispatched on the dev tag, with the same attestation and asset layout as stable releases, rewrite the version only in the build checkout, and keep the newest 10 dev pre-releases. Documentation-only changes, a moved `main` and existing tags are skipped. Stable tags still require the `Cargo.toml` version.
-- `[auto_update] channel = "dev"` accepts automatic dev builds (`vX.Y.Z-dev.N.g<hash>` pre-releases) for agent and Reiki nodes. They order by the commit count N, rank below the stable release of the same core, are never installed on the controller, and other pre-release tags stay refused.
-- Added unit tests for verifier workflow identity matching with dev tags: the release workflow SAN on `refs/tags/<tag>` is accepted, while `refs/heads/main`, another workflow file, and another tag are refused.
-- Added a separate `fuzz/` cargo-fuzz workspace with four libFuzzer targets for TOML config, release JSON, Lu node and status JSON, and version tags. Seeds come from existing test data. `make fuzz-smoke` and a weekly `Fuzz` workflow run every target briefly; crash artifacts are uploaded only on failure. No library behavior changed.
+- `[auto_update] channel = "dev"` accepts dev pre-releases for agent and Reiki nodes.
 
 ### Changed
 
-- Workflow identity mismatch errors now name the expected and actual refs and point to `--signer-workflow` as the override. The identity check itself is unchanged. Documentation states the same rule for stable and dev channels.
+- Workflow identity errors name both refs and `--signer-workflow`.
 
 ## [0.3.5]
 
 ### Fixed
 
-- Reiki health URLs on an IP address owned by the node (for example a listener bound to the node's LAN address) are accepted for cleartext http; 0.3.4 only allowed loopback and refused the config of nodes whose Reiki admin listener is not on loopback. Hostnames and foreign addresses are still refused.
+- Reiki health URLs on node-owned IPs accept cleartext http.
 
 ## [0.3.4]
 
 ### Fixed
 
-- Agent health reads the heartbeat age that `ting status --json` actually reports (`last_heartbeat_age_secs`); the timestamp form still works. Without this an update would fail its health check and roll back.
+- Agent health reads the heartbeat age reported by `ting status --json`.
 
 ## [0.3.3]
 
 ### Changed
 
-- Agent nodes drain, wait, check health and undrain through `ting drain`, `ting wait-idle`, `ting status --json` and `ting undrain`, so no operator credential is needed on a node. An older `ting` without these commands fails closed with guidance and leaves the node untouched. Requires a Lu release that includes the agent self-drain commands.
-- Node name resolves from `[auto_update] node_name`, `TUISHOU_NODE_NAME`, the ting `[agent] name`, then the system hostname; `localhost` and invalid names are refused. New `ting_config` key.
+- Breaking: Agent updates use `ting` drain commands and require a Lu release with self-drain support.
+- Node names resolve from `[auto_update].node_name`, `TUISHOU_NODE_NAME`, the ting agent name, then hostname.
 
 ### Fixed
 
@@ -57,124 +43,76 @@
 
 ### Fixed
 
-- Attestation verification now considers only SLSA build provenance. A subject that also carries a release attestation or an SBOM no longer fails with "bundle must contain exactly one transparency log entry".
-- The source commit is resolved from the release tag (following annotated tags to the commit), not from the release's `target_commitish` branch name, so a release built from an older commit of a moving branch verifies.
-- A host with neither a Reiki configuration nor an enabled Reiki unit gets a plain binary swap and a recorded install; a missing configuration no longer marks the new release as bad.
+- Attestation verification considers only SLSA build provenance.
+- Source commits resolve from the release tag, including annotated tags.
+- Hosts without Reiki config or unit get a plain binary swap.
 
 ## [0.3.1]
 
 ### Fixed
 
-- A host counts as a Lu agent node only when its agent unit is installed and enabled. Reaching a controller with the operator CLI no longer makes an operator workstation drain a node and restart a unit during `tuishou update lu`.
+- A host counts as a Lu agent node only when its agent unit is installed and enabled.
 
 ## [0.3.0]
 
 ### Added
 
-- Added `install.sh --expect-sha256 <digest>` to verify the bootstrap archive before extraction. The digest must come from an independent trusted record; the same-release `.sha256` is only a consistency check.
-- Installs now record a `.known-good.json` sidecar beside state. Rollback refuses a `.prev` file without a matching recorded checksum.
+- `install.sh` installs `tuishou` and components with checksum and attestation checks, staging and rollback.
+- `tuishou top` hosts Reiki and Lu TUIs in tabs.
+- `[update].start_delay_max` and `[update].max_unavailable` control update delays and controller availability.
 
 ### Changed
 
-- `tuishou verify` now requires `--tag`; the tag is resolved to a source commit and checked against the certificate source digest.
-- Manual `install`, `update`, `rollback`, `self-update` and `adopt` take the auto-update cycle lock. Contention fails with `another tuishou update cycle is in progress` instead of interleaving with a cycle.
-- `--allow-unattested` no longer executes release-provided code: staged checks and smoke checks are skipped when attestation failed.
-- Generated systemd units pin `PATH` and restrict `TUISHOU_TIMER_EXE` to an absolute regular file under `/usr/local/bin`, `/usr/bin`, `/bin` or `/opt/tuishou/bin`. Config and prefix values containing whitespace, `%`, quotes, `$` or backslashes are refused.
-- Configured trust-root and cache paths are ownership- and symlink-checked; missing release `target_commitish` is now a refusal, and release `tag_name` must match the requested tag.
+- Breaking: Reiki and Lu are default components; `ting` is not a default.
+- Breaking: A bare `tuishou update` updates all components; adding a missing component requires a named `install` or `update`.
+- Breaking: `tuishou verify` requires `--tag`.
+- Breaking: Config files require owner or root ownership and no group or other write access.
+- Breaking: Generated units pin `PATH` and restrict `TUISHOU_TIMER_EXE` to approved paths.
+- Commands print one status line per component; `--json` reports the same data.
+- Reiki updates drain a Lu node, check config, restart, health-check and roll back on failure.
+- `--allow-unattested` skips staged and smoke checks when attestation fails.
 
 ### Fixed
 
-- Install temps use random `O_EXCL` files with private modes; symlinked or group/other-writable prefixes and backup targets are refused, and failed commits leave no orphaned temp files.
-- Attestation responses accept at most 16 bundles and load trust material once per verification run.
-- Skipped archive entries are bounded by one total decompressed-byte counter.
-- Reiki recovery stays drained when restore, restart or restored-health checks fail; controller idleness is rechecked before backup/restart and state-commit failures trigger recovery.
-- Child processes use a fixed minimal environment, vetted absolute executables, bounded output and deadline coverage that includes descendants holding output pipes.
-- Deferred installs preserve the current binary as `.prev` and record its checksum before health checks, so a failed first update can roll back to a verified known-good backup.
+- Rollback checks recorded checksums and skips optional binaries without a previous copy.
+- Reiki recovery keeps a node drained when restore, restart or health checks fail.
 
 ### Removed
 
-- Removed `tuishou roll`, the remote SSH runner and the inventory file format, together with their docs, examples, man page entries, completions and tests. Config sections belonging to them are now unknown keys. `tuishou update` and `auto-update` are the only update paths; each node updates itself.
-
-### Added
-
-- Added `tuishou top`, a ratatui host for `reiki top` and `lu top`. Each child runs in its own pty and vt100 screen, both stay alive across tab swaps, resizes go to both, and mouse tracking is forwarded only when requested. `Alt+1`/`F1`, `Alt+2`/`F2` and `Ctrl+Tab` switch tabs; `Ctrl+b` opens restart/quit/help commands. The active tab, restart counts and last argv are saved under the state dir. The `top` feature is on by default and can be disabled with `--no-default-features`; docs, completions and man page are updated.
-- Added `[update].start_delay_max` (default `0`, recommended `10m` for fleets) for a random delay before an update cycle, and `[update].max_unavailable` (default unset) to skip a cycle when the controller already reports enough draining or offline nodes. Both are honoured by `update` and `auto-update`; unreadable controller state fails closed when a limit is set.
-- Added `docs/node-update.md` with the single-node drain/install/restart/health/rollback/undrain procedure, manual invocation, scheduling guidance and an "Updating many nodes" section with an Ansible example. Added tests for the removed command and config keys, jitter bounds, fleet-limit allow/refuse/fail-closed behaviour and the shared local update path.
-- `docs/components.md` documents the built-in Reiki, Lu and Tuishou defaults, their release assets, binaries, service units, signer workflows and health checks. Man page, completions and examples now use Reiki and Lu first.
-- New integration coverage for bare `update`, unknown component usage errors, shared `--check` exit codes, per-component reporting, `install all` with a missing binary, config trust, and rejected repository overrides. Auto-update tests cover Reiki-before-Lu ordering, Reiki drain/config-check/restart/health and rollback with a bad-version mark.
-- Added `install.sh`, a single-script installer for Linux x86_64 (`x86_64-unknown-linux-musl`) with `--components`, `--version`, `--prefix`, `--no-components`, `--dry-run`, `--yes` and `--help`. It fetches release metadata, checks SHA-256, stages the binary, runs `tuishou verify` on its own archive, records it with `tuishou adopt`, installs the requested components, and prints an install summary with next commands. It never invokes `sudo`; an unwritable prefix prints a root rerun command. `NO_COLOR` and non-TTY output suppress color. Exit codes are `0` ok, `2` usage, `3` unsupported platform, `4` verification failed and `5` install failed.
-- Added the bootstrap verification sequence: the shell checks the `.sha256` asset before a verifier exists, then runs the downloaded binary's `verify` command; failure removes the new binary and exits 4. Installs are staged and keep one `tuishou.prev` rollback copy.
-- Added a local fake release server (`tests/fixtures/installer/`) and 11 installer cases in `tests/installer_test.sh`: usage errors, unsupported platforms, dry run, checksum mismatch, attestation failure, unwritable prefixes, component installs, quickstart proof, idempotency, rollback restore and `--no-components`. `make installer-test` runs them; `make test` and CI run the same script.
-- Docs rewrite: README template and docs index, plus quickstart, install, configuration, operations, security, limits, troubleshooting, CLI and architecture pages, `llms.txt` and `AGENTS.md`. `scripts/docs-check.sh` runs quickstart commands, validates config examples and checks links. `tuishou top` is described as planned only; it is not in this build.
-
-### Changed
-
-- Reiki and Lu are equal first-class defaults alongside Tuishou. `ting` is no longer a default; the recognition path remains for a future one-line return.
-- Every command now prints exactly one fixed-vocabulary status line per component in table order, and `--json` carries the same data. `status`, `update --check` and `auto-update` share one evaluation.
-- A bare `tuishou update` means `update all`. Components absent from a release are reported as `not in this release` and never counted as updates. Not-installed components are installed only by an explicit `install <name>` or `update <name>`.
-- Config files are refused unless owned by the running user or root and not group/other writable. Component overrides may change paths and policy but never the repository or asset host.
-- Reiki updates drain a Lu node when present, check the Reiki config before restart, health-check after restart and roll back with a bad-version mark on failure.
-- Installer failures are fail closed: checksum and attestation refusals leave no unverified binary at the destination, and a previous binary is restored from `tuishou.prev` when present. Unsupported platforms exit 3 and list the existing release targets; component installs fail closed unless `--allow-unattested` is passed explicitly (auto-update still refuses it).
-
-### Fixed
-
-- Rollback skips optional binaries that have no previous copy, so Lu controller-only archives restore cleanly.
-- A failed bootstrap attestation no longer leaves an unverified `tuishou` in the bin directory; the new binary is removed and the previous one restored when present.
-- An unwritable prefix now exits 5 with the exact root rerun command instead of failing later in the install. `--dry-run` resolves and reports a release without touching the prefix.
+- Breaking: `tuishou roll`, the remote SSH runner and the inventory format are removed; their config keys are unknown.
 
 ## v0.2.1 - 2026-11-22
 
 ### Changed
 
-- Release archives are built for x86_64 Linux only. The aarch64 build failed to link with the new verification dependencies; it returns once the cross toolchain is fixed.
+- Breaking: Release archives target x86_64 Linux only.
 
 ## v0.2.0 - 2026-11-22
 
-### Changed
-
-- Attestation verification now runs in process via the official `sigstore` Rust crate instead of spawning an external CLI. No external GitHub CLI, login, or subprocess is required for install, update, self-update, roll, or auto-update. Verification is fail closed across all paths; auto-update still refuses `--allow-unattested`.
-- Added a `[verify]` config section with `signer_workflow`, per-component overrides, embedded/pinned or operator-managed trust roots, a `0700` cache directory, and a configurable `cache_ttl`. Tokens are read only from `GITHUB_TOKEN`/`GH_TOKEN`, sent only to `api.github.com`, and stripped on redirects.
-- Added `tuishou verify <file> --repo owner/name [--signer-workflow path] [--tag tag]`, which prints the digest, issuer, identity, workflow, ref, and Rekor log index. Exit status is 0 verified, 1 refused, 2 usage.
-- Replaced external-CLI test scaffolding with fake verifiers and real signed-bundle fixtures; CI now proves tests pass with no external CLI on PATH and with a failing binary first on PATH.
-
-### Fixed
-
-- Auto-update cycles now hold a kernel-managed advisory lock for the whole cycle; a killed process cannot leave a stale `lock.d` behind, and hold/create/release/expiry operations share the same lock.
-- State and hold writes use unique temporary files, `sync_all`, rename and directory fsync; concurrent writers can no longer collide on `auto.json.tmp`.
-- Every `lu`/`systemctl`/`ssh`/notifier child uses an argument vector and a hard deadline; timed-out children are killed and reaped. Command execution is behind a thin runner so failure paths are unit-testable.
-- Drain and undrain now call the real Lu 0.4 commands (`lu drain <node>`, `lu undrain <node>`). Undrain failures are propagated; drain state comes only from `lu nodes --json`, requires an explicit `draining: true` with no current job, and uses exact version comparison (`0.4.10` no longer matches `0.4.1`).
-- Agent and controller installs are transactional: staged binaries are smoke-checked before commit, the whole set commits atomically, the last good `.prev` is preserved, and state is recorded only after health confirmation.
-- Health/recovery failures keep a node drained when verification fails, restore and verify the previous version, persist the bad-version mark immediately, and report the real command error text.
-- Controller idleness now requires all four `lu status --json` job counters (`leased`, `running`, `recovering`, `needs_input`) to be present non-negative integers and zero; any other shape fails closed. Backups run as `lu backup`.
-- Controller and agent binary ownership no longer overlap: `lu` owns only `lu`, while `ting` owns `ting` and `lu-agent`. Controller updates restart and health-check `controller_unit`.
-- Controller schema gating checks every release up to the candidate, fails closed when release notes are missing, and refuses the `Requires: new controller database` marker in any intermediate release.
-- GitHub tokens are attached only to GitHub API requests, never to asset or allowed hosts, and are stripped from headers on any cross-origin redirect. Token values are redacted from HTTP errors, journal fields, notifications, child-process output and top-level CLI errors.
-- Added global `--config <path>` / `TUISHOU_CONFIG`; generated systemd units use an absolute config path and both `OnBootSec` and `OnActiveSec`.
-- Controller backups now call `lu backup --config <path> --out <file>` with the loaded config, write to a unique mode `0600` file in a mode `0700` directory, fail closed on missing or empty output, and prune to `backup_keep`.
-- Release selection uses full version precedence, including pre-releases, so `v1.2.1-rc.10` ranks above `v1.2.1-rc2`. Releases without a usable `published_at` are skipped when `min_release_age` is configured.
-- Agent auto-update checks the verified archive contents before draining; a release with none of the expected agent binaries is recorded as `skipped` instead of failing the cycle.
-- Every `auto-update` action and `adopt` accept `--prefix` and honour `auto_update.prefix`; hold, status, bad-version state, lock files and generated service units all use the resolved absolute prefix.
-- `auto-update install-timer` now defaults to the validated configured interval, still enforces the 5m minimum, and includes `--prefix <absolute path>` in `ExecStart` when a prefix is in effect.
-- CI/test guidance and fixtures use the real Lu interface with an empty `HOME` and a non-root user; docs and generated completions/man page were updated accordingly.
-
 ### Added
 
-- Opt-in scheduled auto-update (`tuishou auto-update ...`): off by default, documented as not recommended for production. One-shot cycles under an exclusive flock, systemd timer printer (no daemon), hold/release/clear-bad controls, ETag/rate-limit aware release listing, `min_release_age`, patch/minor/any policy with 0.y minor treated as breaking, mandatory in-process attestation verification with the configured signer workflow (`--allow-unattested` refused), node agent drain/install/restart/health/undrain with rollback and bad-version marking, conservative controller policy (manual default, when_idle/window with backup retention and schema-change marker refusal), single-line journal logging, and optional notify argument vector.
-- `tuishou adopt <component> --version <tag>` records an existing binary in state without replacing it (dogfooding path for hand-installed nodes).
-- Default component table points at `ddproxy/tuishou-lu` with real release naming `lu-<tag>-<target>.tar.gz`; `lu-agent` accepted while the rename to `ting` lands. Component configs may set per-release `binary_ranges` for expected archive contents.
-- `docs/auto-update.md`, `docs/dogfooding.md`, and an Ansible-friendly status/adopt snippet. `tuishou status --json` documented as a stable automation schema.
+- `tuishou auto-update` runs opt-in one-shot cycles with hold, status and bad-version controls.
+- `tuishou adopt <component> --version <tag>` records an installed binary in state.
+- `tuishou self-update` replaces the running binary from its own release archive.
+- `tuishou completions` and `tuishou man` generate shell completions and a man page.
 
 ### Changed
 
-- Hardened `scripts/validate-workflows.sh`: remote actions must use `owner/repo[/path]@<40 lowercase hex>` with an optional version comment; short/long/uppercase SHAs and branch refs are rejected. Digest-pinned `docker://` images and local `./` actions remain allowed. Added positive and negative fixtures plus fixture tests (`scripts/test-validate-workflows.sh`, `tests/validator.rs`).
-- Added `tuishou self-update`: updates the running binary from its own release archive using the same checksum and in-process attestation verification, atomic replace, and `.prev` retention as component installs.
-- Added `make release-check` and `scripts/release-check.sh`: builds the local release archive layout for the host target, serves it from a fake release, installs with `tuishou install`, and verifies the installed binary's `--version`.
-- Added shell completions (`tuishou completions bash|zsh|fish`), a man page (`tuishou man`), and build-time generation of both into gitignored `dist/`.
-- Added a "Verify a tuishou release" guide and a test that parses and dry-runs the documented `roll` inventory example.
+- `tuishou verify <file>` verifies releases without an external CLI and prints attestation details.
+- `[verify]` sets the signer workflow, trust roots, cache and cache lifetime.
+- `--config <path>` and `TUISHOU_CONFIG` select the config file.
+- Release selection uses full version precedence and honors `min_release_age`.
+- `auto-update` actions and `adopt` accept `--prefix` and honor `auto_update.prefix`.
+- `auto-update install-timer` uses the configured interval with a 5m minimum.
+- Controller updates refuse releases with missing notes or an intermediate schema-change marker.
+- Failed health or recovery checks keep a node drained and restore the previous version.
+
+### Security
+
+- Tokens go only to GitHub API requests and are redacted from errors and logs.
 
 ## v0.1.0 - 2026-11-21
 
-- Initial release of `tuishou`.
-- Install, update, status, rollback, and fleet roll commands.
-- SHA-256 verification and safe archive extraction.
-- Atomic installs with `.prev` retention and JSON state.
+### Added
+
+- Initial release provides install, update, status, rollback, SHA-256 checks and atomic installs.
