@@ -810,7 +810,7 @@ mod tests {
     #[test]
     fn health_url_with_userinfo_is_rejected() {
         let c = AutoUpdateConfig {
-            reiki_health_url: "http://127.0.0.1:80@internal.example/health".to_string(),
+            reiki_health_url: "http://127.0.0.1:80@health.example/health".to_string(),
             ..AutoUpdateConfig::default()
         };
         assert!(c.validate().is_err());

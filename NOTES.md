@@ -176,3 +176,39 @@ validation, 24 installer cases and 249 Rust tests (196 unit, 16 auto-update
 integration, 2 docs, 21 integration, 5 self-update, 4 top and 5 validator).
 Shellcheck is not installed in this environment and was skipped. Cargo reports
 an unrelated warning that the placeholder `fw-tui` patch is unused.
+
+## Public repository hygiene review
+
+Every candidate below was checked against the current code and docs. No
+behavior, wire format or stored value was changed.
+
+- Internal-looking node names appeared only in auto-update unit fixtures.
+  They were renamed to a neutral name; no release archive, state key or CLI
+  value used them.
+- Internal-looking labels in health-URL tests were renamed to reserved neutral
+  labels. The tests still cover HTTPS acceptance, cleartext refusal, userinfo
+  rejection and loopback lookalikes.
+- An internal workspace path in attestation fixture instructions was replaced
+  with repository-relative destinations.
+
+Verified and left unchanged:
+
+- Signed upstream trust-root metadata carries upstream key-owner labels and a
+  cloud KMS URI inside its signed body. `src/verify/trust.rs` embeds the file
+  and pins its checksum, so editing it would break trust-root validation. The
+  exception is path-scoped in `tests/fixtures/repo-hygiene-allowlist.txt` with
+  a reason; no label value is repeated here.
+- Signed upstream attestation fixtures carry upstream certificate and workflow
+  identities, including an RFC822 subject alternative name. They are pinned by
+  checksum in `tests/fixtures/attestation/README.md` and used only for negative
+  tests or as a historical positive release bundle.
+- The MIT license notice is public attribution.
+- Loopback addresses, RFC 5737 documentation addresses, reserved `.example`,
+  `.test` and `.invalid` labels and public GitHub or Sigstore endpoints are
+  legitimate. No RFC 1918, CGNAT or link-local address was found.
+- Workflow and job names are public generic CI identifiers. No internal job
+  name was found.
+
+`tests/repo_hygiene.rs` fails when a repository file reintroduces a forbidden
+identifier outside the allowlist. `make lint`, `make test` and `make docs-check`
+pass with the new check enabled.

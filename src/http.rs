@@ -553,10 +553,10 @@ mod tests {
         assert!(validate_health_url("http://127.0.0.1:8080/health").is_ok());
         assert!(validate_health_url("http://localhost:8080/health").is_ok());
         assert!(validate_health_url("http://[::1]:8080/health").is_ok());
-        assert!(validate_health_url("https://internal.example/health").is_ok());
-        assert!(validate_health_url("http://internal.example/health").is_err());
-        assert!(validate_health_url("http://127.0.0.1:80@internal.example/health").is_err());
-        assert!(validate_health_url("https://user@internal.example/health").is_err());
+        assert!(validate_health_url("https://health.example/health").is_ok());
+        assert!(validate_health_url("http://health.example/health").is_err());
+        assert!(validate_health_url("http://127.0.0.1:80@health.example/health").is_err());
+        assert!(validate_health_url("https://user@health.example/health").is_err());
         assert!(validate_health_url("http://127.0.0.1.example/health").is_err());
     }
 

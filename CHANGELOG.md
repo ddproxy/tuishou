@@ -4,12 +4,18 @@
 
 ### Added
 
+- Added a repository hygiene test that scans tracked files for internal-looking node names, internal domains, private addresses outside documentation ranges and upstream key-owner labels. Justified exceptions are path-scoped and require a reason in `tests/fixtures/repo-hygiene-allowlist.txt`.
 - Added opt-in `[auto_update] self = true` for replacing the running `tuishou` binary at the end of an auto-update cycle. Eligible stable or dev releases use the same in-process attestation and workflow identity as component updates. The verified binary is smoke-checked before an atomic fsync-and-rename swap beside the running binary, with `<binary>.prev` retained and a `--version` confirmation on the next scheduled pass. A failed staged check or first pass marks the tag bad; a first-pass failure restores `.prev`. Only `tuishou-auto-update.timer` is restarted, never the running service.
 - Added fake-release tests for the disabled default, stable and dev selection, attestation failure, staged smoke failure and first-pass rollback, plus unit tests for timer-only restart and version matching.
 
 ### Changed
 
 - Staged installs now fsync each temp file before its atomic rename and best-effort fsync the parent directory.
+- Test fixtures use neutral node names and reserved neutral host labels instead of internal-looking ones. No stored or wire value changed.
+
+### Fixed
+
+- Attestation fixture instructions use repository-relative destinations instead of an internal workspace path.
 
 ## [0.3.6]
 

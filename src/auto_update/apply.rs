@@ -1949,7 +1949,7 @@ mod tests {
         runner.set_enabled(&["lu-controller.service"]);
         assert!(!node_runs_lu(&runner, "workstation", &context));
         runner.set_enabled(&["ting.service"]);
-        assert!(node_runs_lu(&runner, "dev-ct-9", &context));
+        assert!(node_runs_lu(&runner, "node-9", &context));
     }
 
     #[test]
@@ -2721,7 +2721,7 @@ mod tests {
     fn node_name_prefers_config_then_ting_then_refuses_localhost() {
         let td = tempfile::tempdir().unwrap();
         let ting = td.path().join("ting.toml");
-        fs::write(&ting, "[agent]\nname = \"dev-ct-9\"\n").unwrap();
+        fs::write(&ting, "[agent]\nname = \"node-9\"\n").unwrap();
         let mut c = AutoUpdateConfig {
             ting_config: Some(ting.clone()),
             ..AutoUpdateConfig::default()
@@ -2730,7 +2730,7 @@ mod tests {
         assert_eq!(node_name(&c).unwrap(), "explicit");
         c.node_name = None;
         if std::env::var("TUISHOU_NODE_NAME").is_err() {
-            assert_eq!(node_name(&c).unwrap(), "dev-ct-9");
+            assert_eq!(node_name(&c).unwrap(), "node-9");
         }
         c.node_name = Some("localhost".to_string());
         assert!(node_name(&c).is_err());
