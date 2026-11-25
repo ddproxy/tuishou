@@ -1,5 +1,7 @@
 /target
 /dist
+/fuzz/target
+/fuzz/artifacts
 *.log
 .env
 .DS_Store

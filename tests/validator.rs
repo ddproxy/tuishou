@@ -109,3 +109,26 @@ fn release_workflow_builds_both_musl_targets() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn fuzz_workflow_runs_weekly_smoke_and_keeps_failures_only() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows/fuzz.yml");
+    let text = fs::read_to_string(&path).unwrap();
+    for needle in [
+        "workflow_dispatch:",
+        "schedule:",
+        "cron: '0 6 * * 0'",
+        "rustup toolchain install nightly",
+        "make fuzz-smoke",
+        "if: failure()",
+        "path: fuzz/artifacts/",
+    ] {
+        assert!(text.contains(needle), "missing {needle} in fuzz workflow");
+    }
+    let out = run(&path);
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

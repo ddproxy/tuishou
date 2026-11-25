@@ -1,0 +1,29 @@
+[auto_update]
+enabled = true
+prefix = "/usr/local/bin"
+interval = "10m"
+components = ["reiki", "lu", "tuishou"]
+policy = "patch"
+min_release_age = "10m"
+channel = "stable"
+max_version = "v9.9.9"
+require_attestation = true
+controller_policy = "manual"
+backup_keep = 5
+drain_timeout = "30m"
+controller_wait_timeout = "30m"
+health_timeout = "5m"
+heartbeat_max_age = "5m"
+command_timeout = "30s"
+agent_unit = "ting.service"
+controller_unit = "lu-controller.service"
+reiki_health_url = "http://127.0.0.1:8080/health"
+notify_after_failures = 3
+
+[update]
+start_delay_max = "0"
+
+[verify]
+signer_workflow = ".github/workflows/release.yml"
+trust_root = "embedded"
+cache_ttl = "24h"

@@ -1,4 +1,8 @@
-.PHONY: help build build-minimal test installer-test lint docs docs-check check install release-check validate-workflows
+.PHONY: help build build-minimal test installer-test lint docs docs-check check install release-check validate-workflows fuzz-smoke
+
+FUZZ_TARGETS := config_toml release_json node_json version_tag
+FUZZ_TOOLCHAIN ?= +nightly
+FUZZ_SECONDS ?= 5
 
 help:
 	@printf '%s\n' 'build            compile the project' \
@@ -10,7 +14,8 @@ help:
 		'docs-check       run quickstart commands, validate config examples, check links' \
 		'check            lint plus docs-check' \
 		'install          run install.sh with INSTALL_ARGS' \
-		'release-check    local release rehearsal'
+		'release-check    local release rehearsal' \
+		'fuzz-smoke       run every fuzz target briefly with nightly libFuzzer'
 
 build:
 	cargo build --locked
@@ -55,3 +60,14 @@ install:
 
 release-check: build
 	bash scripts/release-check.sh
+
+fuzz-smoke:
+	@set -eu; \
+	for target in $(FUZZ_TARGETS); do \
+		mkdir -p "fuzz/artifacts/$$target"; \
+		printf '%s\n' "fuzz: $$target ($(FUZZ_SECONDS)s)"; \
+		cargo $(FUZZ_TOOLCHAIN) fuzz run "$$target" -- \
+			-max_total_time=$(FUZZ_SECONDS) -timeout=5 -rss_limit_mb=2048 \
+			-max_len=4096 -detect_leaks=0 -print_final_stats=1 \
+			-artifact_prefix="fuzz/artifacts/$$target/"; \
+	done
