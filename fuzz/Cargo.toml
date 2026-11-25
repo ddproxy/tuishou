@@ -1,0 +1,42 @@
+[package]
+name = "tuishou-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1"
+toml = "1.2"
+tuishou = { path = "..", default-features = false }
+
+# Keep the fuzz crate outside the main workspace: cargo test --workspace must
+# never build or run libFuzzer targets.
+[workspace]
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "release_json"
+path = "fuzz_targets/release_json.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "node_json"
+path = "fuzz_targets/node_json.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "version_tag"
+path = "fuzz_targets/version_tag.rs"
+test = false
+doc = false

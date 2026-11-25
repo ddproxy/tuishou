@@ -159,6 +159,23 @@ if [ "$explicit_paths" -eq 0 ]; then
       fi
     done
   fi
+
+  # Fuzz smoke runs on a weekly schedule or dispatch, installs nightly through
+  # rustup, and keeps crash artifacts only for failed runs.
+  fuzz="$root/.github/workflows/fuzz.yml"
+  if [ ! -f "$fuzz" ]; then
+    echo "missing fuzz workflow" >&2
+    fail=1
+  else
+    for pattern in 'workflow_dispatch:' 'schedule:' 'cron: .0 6 \* \* 0.' \
+      'rustup toolchain install nightly' 'make fuzz-smoke' 'if: failure()' \
+      'path: fuzz/artifacts/'; do
+      if ! grep -q -- "$pattern" "$fuzz"; then
+        echo "fuzz workflow missing policy: $pattern" >&2
+        fail=1
+      fi
+    done
+  fi
 fi
 
 # Full syntax and expression check when actionlint is available (CI installs it).

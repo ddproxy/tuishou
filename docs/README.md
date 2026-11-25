@@ -12,6 +12,7 @@ One topic per page. Every page starts with who it is for. Commands in the quicks
 - [troubleshooting.md](troubleshooting.md) - for on-call users: exact messages and fixes.
 - [cli.md](cli.md) - for script authors: commands, flags, environment and exit codes.
 - [architecture.md](architecture.md) - for contributors: data flow and state locations.
+- [../fuzz/README.md](../fuzz/README.md) - for contributors: fuzz targets, seeds and how to run them.
 - [CHANGELOG.md](../CHANGELOG.md) - release notes and upgrade requirements.
 
 Earlier topic pages remain available: [components](components.md), [install and update](install-update.md), [node update](node-update.md), [verify a release](verify-release.md), [auto-update](auto-update.md), [dogfooding](dogfooding.md) and [FAQ](faq.md).
