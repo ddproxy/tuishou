@@ -12,6 +12,7 @@ The default path is `./tuishou.toml`. `--config <path>` or `TUISHOU_CONFIG` over
 | `[[component]] binaries` | per component | Expected archive members; `lu` requires `lu` and `ting`. |
 | `[[component]] auto_update` | `false` | Per-component opt-in for scheduled updates. |
 | `[auto_update] enabled` | `false` | Master switch; no scheduled update runs while false. |
+| `[auto_update] self` | `false` | Replace the running `tuishou` binary at the end of a cycle. Separate from the per-component opt-in. |
 | `prefix` | unset | Install root for binaries, state and verify cache. |
 | `interval` | `10m` | Timer interval; minimum `5m`. |
 | `components` | `reiki`, `lu`, `tuishou` | Components auto-update considers. |
@@ -65,6 +66,7 @@ min_release_age = "10m"
 channel = "stable"
 max_version = "v9.9.9"
 require_attestation = true
+self = true
 controller_policy = "manual"
 backup_keep = 5
 drain_timeout = "30m"
@@ -85,5 +87,7 @@ signer_workflow = ".github/workflows/release.yml"
 trust_root = "embedded"
 cache_ttl = "24h"
 ```
+
+`self = true` is opt-in: it replaces the running binary after the other components, reuses the configured attestation identity and channel rules, keeps `<binary>.prev`, and confirms the new version on the next scheduled pass. A `[[component]]` block named `tuishou` with `auto_update = true` does not enable it, and `self_update = true` is refused as an unknown key.
 
 Validate an example with `tuishou --config <file> auto-update install-timer`. That command prints systemd units and exits 0 without installing them; `scripts/docs-check.sh` runs it against both examples.

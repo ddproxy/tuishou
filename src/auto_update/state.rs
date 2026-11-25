@@ -28,6 +28,20 @@ pub struct AutoState {
     /// Checksum of the controller DB backup kept for manual restore.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub controller_backup: Option<ControllerBackup>,
+    /// A self-update waiting for its first scheduled pass to start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_pending: Option<SelfPending>,
+}
+
+/// A self-update whose first scheduled pass has not confirmed the new binary
+/// yet. The recorded path is the binary that the timer will start next.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfPending {
+    pub version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<String>,
+    pub path: PathBuf,
+    pub at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +433,27 @@ mod tests {
         let loaded = load(Some(td.path())).unwrap();
         assert_eq!(loaded.last_check.as_deref(), Some("old"));
         assert!(loaded.controller_backup.is_none());
+        assert!(loaded.self_pending.is_none());
+    }
+
+    #[test]
+    fn self_pending_record_round_trips() {
+        let td = tempfile::tempdir().unwrap();
+        let state = AutoState {
+            self_pending: Some(SelfPending {
+                version: "v0.3.6".to_string(),
+                previous_version: Some("v0.3.5".to_string()),
+                path: td.path().join("tuishou"),
+                at: "2026-01-01T00:00:00Z".to_string(),
+            }),
+            ..AutoState::default()
+        };
+        save(Some(td.path()), &state).unwrap();
+        let loaded = load(Some(td.path())).unwrap();
+        let pending = loaded.self_pending.expect("pending must persist");
+        assert_eq!(pending.version, "v0.3.6");
+        assert_eq!(pending.previous_version.as_deref(), Some("v0.3.5"));
+        assert_eq!(pending.path, td.path().join("tuishou"));
     }
 
     #[test]

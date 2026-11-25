@@ -262,6 +262,9 @@ pub struct AutoUpdateConfig {
     pub max_version: Option<String>,
     /// Attestation is mandatory in auto mode; `false` is a config error.
     pub require_attestation: bool,
+    /// Opt in to auto-updating the running tuishou binary itself. Off by default.
+    #[serde(rename = "self", default)]
+    pub self_update: bool,
     pub controller_policy: ControllerPolicy,
     pub backup_dir: Option<PathBuf>,
     pub backup_keep: usize,
@@ -304,6 +307,7 @@ impl Default for AutoUpdateConfig {
             channel: Channel::Stable,
             max_version: None,
             require_attestation: true,
+            self_update: false,
             controller_policy: ControllerPolicy::Manual,
             backup_dir: None,
             backup_keep: 5,
@@ -680,7 +684,25 @@ mod tests {
         assert_eq!(c.policy, AutoPolicy::Patch);
         assert_eq!(c.controller_policy, ControllerPolicy::Manual);
         assert!(c.require_attestation);
+        assert!(!c.self_update);
         c.validate().unwrap();
+    }
+
+    #[test]
+    fn self_update_is_opt_in_and_uses_the_self_key() {
+        assert!(
+            !cfg("[auto_update]\nenabled = true\n")
+                .unwrap()
+                .auto_update
+                .self_update
+        );
+        assert!(
+            cfg("[auto_update]\nself = true\n")
+                .unwrap()
+                .auto_update
+                .self_update
+        );
+        assert!(cfg("[auto_update]\nself_update = true\n").is_err());
     }
 
     #[test]

@@ -7,6 +7,7 @@
 
 pub mod apply;
 pub mod eligibility;
+pub mod self_apply;
 pub mod state;
 
 use crate::component::{resolve_component, Component};
@@ -15,6 +16,7 @@ use crate::duration::{format_duration, parse_duration};
 use crate::error::{Error, Result};
 use crate::logging::{journal, journal_err, notify, one_line};
 use crate::report::{self, ComponentReport, StatusText};
+use crate::self_update::SELF_COMPONENT;
 use crate::state::InstalledComponent;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -174,11 +176,13 @@ fn record(
 
 fn cycle_names(cfg: &AutoUpdateConfig) -> Vec<String> {
     let mut names = cfg.components.clone();
-    // Reiki is always applied before the Lu agent when both are due. Other
-    // components keep the configured/table order.
+    // Reiki precedes Lu, and a self-update is always last so it can never run
+    // while another component's apply path is in flight. Other components keep
+    // their configured order.
     names.sort_by_key(|name| match name.as_str() {
         "reiki" => 0,
         "lu" => 1,
+        SELF_COMPONENT => 3,
         _ => 2,
     });
     names
@@ -263,7 +267,7 @@ fn execute_cycle(
     let components = &loaded.components;
     let names = cycle_names(cfg);
     let mut st = state::load(prefix)?;
-    let installed = installed_versions(prefix)?;
+    let mut installed = installed_versions(prefix)?;
     st.last_check = Some(crate::state::now_rfc3339()?);
     journal(
         "auto_update_cycle_start",
@@ -279,12 +283,78 @@ fn execute_cycle(
         verify_config: Some(&loaded.verify),
     };
     let command_timeout = parse_duration(&cfg.command_timeout).unwrap_or(Duration::from_secs(30));
+    let mut any_failed = false;
+    let mut self_handled = false;
+
+    // A replaced binary must prove it can start on the first scheduled pass.
+    // This runs before hold/fleet gates so a broken binary is never left in
+    // place because the operator paused the rest of the cycle.
+    if cfg.self_update {
+        match resolve_component(SELF_COMPONENT, components) {
+            Ok(component) => {
+                let outcome =
+                    self_apply::confirm_pending(&component, &ctx, &mut st, &apply::SystemRunner);
+                installed = installed_versions(prefix)?;
+                match outcome {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        self_handled = true;
+                        journal_err("self_update_rollback", &[("reason", &one_line(&reason))]);
+                        record(
+                            &mut st,
+                            SELF_COMPONENT,
+                            StatusText::Failed { reason },
+                            installed.get(SELF_COMPONENT).map(|c| c.version.clone()),
+                            None,
+                            None,
+                        );
+                        any_failed = true;
+                    }
+                    Err(e) => {
+                        self_handled = true;
+                        let reason = one_line(&e.to_string());
+                        journal_err("self_update_confirm_failed", &[("reason", &reason)]);
+                        record(
+                            &mut st,
+                            SELF_COMPONENT,
+                            StatusText::Failed {
+                                reason: reason.clone(),
+                            },
+                            installed.get(SELF_COMPONENT).map(|c| c.version.clone()),
+                            None,
+                            None,
+                        );
+                        any_failed = true;
+                    }
+                }
+            }
+            Err(e) => {
+                self_handled = true;
+                let reason = one_line(&e.to_string());
+                record(
+                    &mut st,
+                    SELF_COMPONENT,
+                    StatusText::Failed {
+                        reason: reason.clone(),
+                    },
+                    installed.get(SELF_COMPONENT).map(|c| c.version.clone()),
+                    None,
+                    None,
+                );
+                any_failed = true;
+            }
+        }
+    }
+
     if let Some(reason) = crate::fleet::before_cycle(&loaded.update, command_timeout) {
         journal(
             "auto_update_fleet_skipped",
             &[("reason", &one_line(&reason))],
         );
         for name in &names {
+            if self_handled && name == SELF_COMPONENT {
+                continue;
+            }
             if resolve_component(name, components).is_ok() {
                 record(
                     &mut st,
@@ -312,6 +382,9 @@ fn execute_cycle(
         journal("auto_update_held", &[("reason", &one_line(&reason))]);
         let lu_is_controller = installed_lu_is_controller(&ctx, &installed);
         for name in &names {
+            if self_handled && name == SELF_COMPONENT {
+                continue;
+            }
             if let Ok(component) = resolve_component(name, components) {
                 let bad = st.bad_versions.get(name).cloned().unwrap_or_default();
                 let next = cached_next(
@@ -341,8 +414,10 @@ fn execute_cycle(
     }
 
     let agent = crate::http::agent();
-    let mut any_failed = false;
     for name in &names {
+        if self_handled && name == SELF_COMPONENT {
+            continue;
+        }
         let component = match resolve_component(name, components) {
             Ok(c) => c,
             Err(e) => {
@@ -365,7 +440,8 @@ fn execute_cycle(
                 continue;
             }
         };
-        if !component.auto_update {
+        let is_self = cfg.self_update && name == SELF_COMPONENT;
+        if !component.auto_update && !is_self {
             let reason =
                 format!("auto_update is disabled for {name}; set [[component]] auto_update = true");
             journal("component_auto_update_disabled", &[("component", name)]);
@@ -524,6 +600,16 @@ fn execute_cycle(
                 ));
             };
             apply::apply_lu(&component, &release.tag, &release.body, role, &ctx, &mut st)
+        } else if is_self {
+            // Self runs last in the cycle, under the same lock, so no component
+            // apply can overlap the binary replacement.
+            self_apply::apply_self(
+                &component,
+                &release.tag,
+                installed_version.as_deref(),
+                &ctx,
+                &mut st,
+            )
         } else {
             apply::plain_install(&component, &release.tag, &ctx).map(|_| None)
         };
@@ -634,6 +720,7 @@ struct StatusRow {
 #[derive(Debug, Serialize)]
 struct StatusOutput {
     enabled: bool,
+    self_update: bool,
     last_check: Option<String>,
     interval: String,
     policy: String,
@@ -730,12 +817,13 @@ fn handle_status_locked(
             next_eligible_version: next,
             last_check: entry.map(|e| e.at.clone()),
             bad_versions: bad,
-            auto_update: component.auto_update,
+            auto_update: component.auto_update || (*name == SELF_COMPONENT && cfg.self_update),
         });
     }
     if json {
         let out = StatusOutput {
             enabled: cfg.enabled,
+            self_update: cfg.self_update,
             last_check: st.last_check.clone(),
             interval: cfg.interval.clone(),
             policy: format!("{:?}", cfg.policy),
@@ -756,8 +844,9 @@ fn handle_status_locked(
     }
     if !quiet {
         println!(
-            "auto-update: enabled={} interval={} last_check={} hold={}",
+            "auto-update: enabled={} self={} interval={} last_check={} hold={}",
             cfg.enabled,
+            cfg.self_update,
             cfg.interval,
             st.last_check.as_deref().unwrap_or("never"),
             if hold.is_some() { "active" } else { "none" }

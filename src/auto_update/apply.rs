@@ -46,9 +46,7 @@ pub struct ApplyContext<'a> {
     pub config_path: Option<&'a Path>,
     /// Production callers inject the configured verifier; tests that replace
     /// `install` can leave it unset.
-    #[allow(dead_code)]
     pub verifier: Option<Arc<dyn AttestationVerifier>>,
-    #[allow(dead_code)]
     pub verify_config: Option<&'a VerifyConfig>,
 }
 
@@ -513,7 +511,12 @@ fn controller_healthy(
     Ok(lu::status_reports_version(&out.stdout, version))
 }
 
-fn mark_bad(state: &mut AutoState, component: &str, version: &str, prefix: Option<&Path>) {
+pub(crate) fn mark_bad(
+    state: &mut AutoState,
+    component: &str,
+    version: &str,
+    prefix: Option<&Path>,
+) {
     let entry = state.bad_versions.entry(component.to_string()).or_default();
     if !entry.iter().any(|v| v == version) {
         entry.push(version.to_string());

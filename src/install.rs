@@ -595,8 +595,20 @@ fn backup_if_present(path: &Path, dir: &Path, prefix: &str) -> Result<Option<Nam
 }
 
 fn persist_temp(temp: NamedTempFile, dest: &Path) -> Result<()> {
+    // The file is written next to its destination, so the rename below is
+    // atomic. Fsync before it so a crash cannot leave a half-written binary.
+    temp.as_file().sync_all().map_err(|source| Error::Write {
+        path: temp.path().to_path_buf(),
+        source,
+    })?;
     temp.persist(dest)
         .map_err(|e| Error::msg(format!("failed to commit {}: {}", dest.display(), e.error)))?;
+    if let Some(parent) = dest.parent() {
+        // Directory fsync is best-effort: some filesystems reject it.
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
