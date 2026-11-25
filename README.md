@@ -304,7 +304,7 @@ make docs-check
 make release-check
 ```
 
-`make test` runs workflow validation, the release version script tests when Python is available, the fake-server installer test and the Rust suite. `make docs-check` executes every quickstart command in a throwaway directory, validates both config examples with the real validator, and checks links, style and flag drift. CI runs the same checks. Tagged `v*` releases are built and attested by the release workflow. After CI succeeds on a code change pushed to `main`, a dev pre-release is tagged, built and attested through that same workflow; the newest 10 dev pre-releases are kept. Documentation-only changes do not create a dev build. Commit messages are terse and imperative, without personal names. See [AGENTS.md](AGENTS.md).
+`make test` runs workflow validation, the release version script tests when Python is available, the fake-server installer test and the Rust suite, including a repository hygiene check that refuses internal-looking identifiers in tracked files. Justified exceptions are listed with reasons in `tests/fixtures/repo-hygiene-allowlist.txt`. `make docs-check` executes every quickstart command in a throwaway directory, validates both config examples with the real validator, and checks links, style and flag drift. CI runs the same checks. Tagged `v*` releases are built and attested by the release workflow. After CI succeeds on a code change pushed to `main`, a dev pre-release is tagged, built and attested through that same workflow; the newest 10 dev pre-releases are kept. Documentation-only changes do not create a dev build. Commit messages are terse and imperative, without personal names. See [AGENTS.md](AGENTS.md).
 
 ## License and links
 

@@ -1,0 +1,4 @@
+# Justified exceptions for tests/repo_hygiene.rs.
+# Format: <category> <relative-path> <reason>
+# Keep entries path-scoped so a new occurrence elsewhere still fails.
+handle assets/sigstore-tuf-root.json Signed upstream trust-root metadata; key-owner fields are public upstream attribution and checksum-pinned wire data.

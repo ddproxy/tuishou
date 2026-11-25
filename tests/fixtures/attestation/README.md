@@ -35,11 +35,11 @@ tar -xzf sigstore-0.15.0.crate -C sigstore
 tar -xzf sigstore_protobuf_specs-0.5.2.crate -C sigstore_protobuf_specs
 
 cp sigstore/sigstore-0.15.0/tests/data/npm_slsa_bundle_v03.json \
-  /srv/work/lu/01M80YEF0S5C5FQP6YFVW47EFT/tests/fixtures/attestation/
+  tests/fixtures/attestation/
 cp sigstore_protobuf_specs/sigstore_protobuf_specs-0.5.2/assets/a.txt \
-  /srv/work/lu/01M80YEF0S5C5FQP6YFVW47EFT/tests/fixtures/attestation/
+  tests/fixtures/attestation/
 cp sigstore_protobuf_specs/sigstore_protobuf_specs-0.5.2/assets/a.txt.sigstore \
-  /srv/work/lu/01M80YEF0S5C5FQP6YFVW47EFT/tests/fixtures/attestation/
+  tests/fixtures/attestation/
 ```
 
 Verify the copies in the repository root:

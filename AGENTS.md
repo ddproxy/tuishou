@@ -35,6 +35,7 @@ Run checks through the Makefile. The targets are the CI contract.
 | `src/docs_static.rs`, `build.rs` | Completion and man-page sources, generated under `OUT_DIR`. |
 | `install.sh` | Shell bootstrap behavior: installer flags, staging and exit codes. |
 | `tests/fixtures/installer/`, `tests/installer_test.sh` | Fake release server, fake binary and installer cases. |
+| `tests/repo_hygiene.rs`, `tests/fixtures/repo-hygiene-allowlist.txt` | Scans repository files for internal-looking identifiers; allowlist entries require a reason. |
 | `scripts/docs-check.sh` | Executes the quickstart commands; keep examples runnable. |
 | `docs/README.md` | Documentation index: one topic per page. |
 
@@ -48,4 +49,5 @@ Run checks through the Makefile. The targets are the CI contract.
 - Do not add `sudo` execution. The installer prints a rerun command for an unwritable prefix; it never invokes `sudo`.
 - Preserve pinned workflow action SHAs in `.github/workflows/`. Keep full commit SHAs with version comments.
 - Commit no secret-shaped literals. Tokens are read from `GITHUB_TOKEN` or `GH_TOKEN` and redacted from errors.
+- Keep repository files free of internal-looking hosts, domains, private addresses and personal identifiers. Justified exceptions belong in `tests/fixtures/repo-hygiene-allowlist.txt` with a reason; see `tests/repo_hygiene.rs`.
 - Keep test hooks behind the `test-hooks` feature in `src/http.rs` and `src/verify/mod.rs`. Normal release binaries ignore those hooks. `TUISHOU_GITHUB_API_BASE` is honored by normal builds and is not a test-only hook.
