@@ -48,6 +48,22 @@ No subprocess is executed for attestation verification; there is no dependency o
 external GitHub CLI binary or CLI login. The source contains a test that fails if an
 external CLI subprocess is reintroduced.
 
+## Self-update boundary
+
+With `[auto_update] self = true`, auto-update may replace its own executable. The
+candidate `tuishou` release uses the same checksum and in-process attestation checks,
+including the workflow identity resolved for `tuishou` on `refs/tags/<tag>`; stable and
+dev channels do not weaken that identity check. The staged binary's `--version` output
+is checked before any installed file is replaced. A failed staged check leaves the
+installed binary untouched and marks the tag bad.
+
+Commit writes a private temp file beside the destination, fsyncs it, renames it
+atomically and keeps the previous binary as `<binary>.prev`. The next scheduled pass
+runs `--version` again before hold or fleet gates, restores `<binary>.prev` and marks
+the tag bad when the new binary cannot start or reports a different tag. Only
+`tuishou-auto-update.timer` is restarted; the running auto-update service is never
+restarted from its own pass.
+
 ## Credentials and network
 
 - `GITHUB_TOKEN` or `GH_TOKEN` is the only token source. It is sent only to

@@ -119,3 +119,60 @@ loopback URLs. The Makefile/CI contract is
 `cargo test --workspace --locked --features test-hooks`, which passes along with
 `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -D warnings`
 and `scripts/docs-check.sh`.
+
+## Self-update claim validation
+
+Each claim below was checked against the current source; no contradictory code path
+was found.
+
+- Opt-in: `AutoUpdateConfig.self_update` is field `self` with `default` and the
+  struct denies unknown fields (`src/config.rs`). Default is false, and
+  `self_update = true` is refused. Cycle execution also requires
+  `[auto_update] enabled = true` (`src/auto_update.rs`).
+
+- Component separation: the built-in `tuishou` entry keeps `auto_update = false`
+  (`src/component.rs`). `cycle_names` ranks it last, and the generic disabled
+  check exempts it only when `self_update` is set. The apply branch then calls
+  `self_apply::apply_self` only for that name (`src/auto_update.rs`).
+
+- Verification: `apply::install_options` sets `allow_unattested = false` and passes
+  the loaded verify config; `install_component` builds `AttestationRequest` with
+  `workflow_for("tuishou")`, the release tag and source digest (`src/install.rs`).
+  Stable and dev tags therefore use the same workflow identity check described in
+  the earlier dev tag note.
+
+- Atomic replacement: staged commit writes temp files beside the destination,
+  calls `sync_all()` before `NamedTempFile::persist`, then best-effort fsyncs the
+  parent directory (`src/install.rs`). `self_apply` sets the install prefix to the
+  running binary's directory and records the previous version before applying.
+
+- Timer safety: the only restart command is
+  `systemctl try-restart tuishou-auto-update.timer` (`src/auto_update/self_apply.rs`).
+  The oneshot `tuishou-auto-update.service` is not restarted, and a restart
+  failure is logged without rolling back.
+
+- Confirmation and rollback: `self_pending` holds path, version and previous
+  version in `auto.json` (`src/auto_update/state.rs`). The first scheduled pass
+  confirms `<binary> --version` before fleet and hold gates. A staged smoke
+  failure keeps the old binary and marks the tag bad; a first-pass start or tag
+  mismatch restores `.prev`, marks the tag bad and fails that cycle
+  (`src/auto_update/self_apply.rs`).
+
+- Test coverage: `tests/auto_update.rs` uses fake releases for the disabled
+  default, stable selection, dev selection, attestation failure, staged smoke
+  failure and first-pass rollback. `src/auto_update/self_apply.rs` adds runner
+  tests for timer-only restart, version matching and rollback from `.prev`.
+
+## Self-update validation run
+
+`cargo fmt --all -- --check`,
+`cargo clippy --workspace --all-targets --features test-hooks -- -D warnings`,
+`cargo test --workspace --features test-hooks` and `bash scripts/docs-check.sh`
+pass. The docs check runs the quickstart commands, validates 15 config examples,
+resolves local links and passes style, flag-drift and literal checks.
+
+`make check` and `make test` also pass: rustfmt, clippy, docs checks, workflow
+validation, 24 installer cases and 249 Rust tests (196 unit, 16 auto-update
+integration, 2 docs, 21 integration, 5 self-update, 4 top and 5 validator).
+Shellcheck is not installed in this environment and was skipped. Cargo reports
+an unrelated warning that the placeholder `fw-tui` patch is unused.

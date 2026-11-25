@@ -890,3 +890,311 @@ fn status_exposes_update_fields_in_json() {
     );
     assert!(lu["latest_version"].is_string());
 }
+
+fn write_self_config(dir: &Path, extra: &str) {
+    let contents = format!(
+        "[auto_update]\nenabled = true\ncomponents = [\"tuishou\"]\nmin_release_age = \"0s\"\ncommand_timeout = \"2s\"\n{extra}\n"
+    );
+    fs::write(dir.join("tuishou.toml"), contents).unwrap();
+}
+
+fn setup_self_prefix(dir: &Path, version: &str) -> PathBuf {
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    write_fake_tool(
+        &bin,
+        "tuishou",
+        &format!("#!/bin/sh\necho 'tuishou {version}'\n"),
+    );
+    let state = serde_json::json!({
+        "components": {
+            "tuishou": {
+                "version": version,
+                "target": current_target(),
+                "checksum": "0".repeat(64),
+                "installed_at": "2020-01-01T00:00:00Z"
+            }
+        }
+    });
+    fs::write(bin.join(".tuishou.json"), state.to_string()).unwrap();
+    bin
+}
+
+fn self_routes(base: &str, releases: &[(&str, &str)]) -> Vec<Route> {
+    let mut routes = Vec::new();
+    let mut release_jsons = Vec::new();
+    for (tag, script) in releases {
+        let asset = format!("tuishou-{tag}-{}.tar.gz", current_target());
+        let archive = make_tar_gz(&[("tuishou", script.as_bytes())]);
+        let tag_routes = release_routes(base, "ddproxy/tuishou", tag, &asset, &archive, "## ok\n");
+        let release = tag_routes
+            .iter()
+            .find(|r| r.path.ends_with("/releases/latest"))
+            .unwrap()
+            .body
+            .clone();
+        release_jsons.push(String::from_utf8(release).unwrap());
+        routes.extend(tag_routes);
+    }
+    let list = format!("[{}]", release_jsons.join(",")).into_bytes();
+    if let Some(route) = routes
+        .iter_mut()
+        .find(|r| r.path.contains("/releases?per_page=30"))
+    {
+        route.body = list;
+    }
+    routes
+}
+
+struct SelfFixture {
+    td: PathBuf,
+    bin: PathBuf,
+    server: FakeServer,
+    cmd_log: PathBuf,
+    shims: PathBuf,
+}
+
+impl SelfFixture {
+    fn new(releases: &[(&str, &str)], extra_config: &str, installed: &str) -> Self {
+        let td = tempfile::tempdir().unwrap().keep();
+        fs::create_dir_all(td.join("home")).unwrap();
+        write_self_config(&td, extra_config);
+        let bin = setup_self_prefix(&td, installed);
+        let server = FakeServer::start(Vec::new());
+        let routes = self_routes(&server.base, releases);
+        server.set_routes(routes);
+        let shims = td.join("shims");
+        fs::create_dir_all(&shims).unwrap();
+        let cmd_log = td.join("cmd.log");
+        let systemctl = format!(
+            "#!/bin/sh\necho \"systemctl $@\" >> {}\nexit 0\n",
+            cmd_log.display()
+        );
+        write_fake_tool(&shims, "systemctl", &systemctl);
+        Self {
+            td,
+            bin,
+            server,
+            cmd_log,
+            shims,
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut cmd = tuishou_cmd();
+        cmd.current_dir(&self.td)
+            .env("HOME", self.td.join("home"))
+            .env("XDG_STATE_HOME", self.td.join("home/.local/state"))
+            .env("TUISHOU_GITHUB_API_BASE", &self.server.base)
+            .env("TUISHOU_ALLOW_INSECURE_HTTP", "1")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    self.shims.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .args(["auto-update", "run", "--once", "--prefix"])
+            .arg(&self.bin);
+        cmd
+    }
+
+    fn auto_state(&self) -> serde_json::Value {
+        let path = self.bin.join(".tuishou/auto.json");
+        serde_json::from_str(&fs::read_to_string(path).unwrap_or_default()).unwrap_or_default()
+    }
+
+    fn installed_version(&self) -> String {
+        let state: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(self.bin.join(".tuishou.json")).unwrap())
+                .unwrap();
+        state["components"]["tuishou"]["version"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn cmd_log(&self) -> String {
+        fs::read_to_string(&self.cmd_log).unwrap_or_default()
+    }
+}
+
+#[test]
+fn self_update_is_disabled_by_default() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let fx = SelfFixture::new(
+        &[("v0.3.6", "#!/bin/sh\necho 'tuishou v0.3.6'\n")],
+        "",
+        "v0.3.5",
+    );
+    let out = fx.command().output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fx.server.hit_count("/dl/"), 0);
+    assert_eq!(
+        fs::read_to_string(fx.bin.join("tuishou")).unwrap(),
+        "#!/bin/sh\necho 'tuishou v0.3.5'\n"
+    );
+    assert!(fx.auto_state()["self_pending"].is_null());
+    assert!(fx.auto_state()["bad_versions"]["tuishou"].is_null());
+}
+
+#[test]
+fn self_update_uses_stable_release_and_restarts_only_the_timer() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let fx = SelfFixture::new(
+        &[
+            ("v0.3.6", "#!/bin/sh\necho 'tuishou v0.3.6'\n"),
+            (
+                "v0.3.7-dev.1.gabc",
+                "#!/bin/sh\necho 'tuishou v0.3.7-dev.1.gabc'\n",
+            ),
+        ],
+        "self = true\n",
+        "v0.3.5",
+    );
+    let out = fx.command().output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fx.bin.join("tuishou")).unwrap(),
+        "#!/bin/sh\necho 'tuishou v0.3.6'\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.bin.join("tuishou.prev")).unwrap(),
+        "#!/bin/sh\necho 'tuishou v0.3.5'\n"
+    );
+    assert_eq!(fx.auto_state()["self_pending"]["version"], "v0.3.6");
+    assert_eq!(fx.installed_version(), "v0.3.6");
+    let log = fx.cmd_log();
+    assert!(
+        log.contains("systemctl try-restart tuishou-auto-update.timer"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("restart tuishou-auto-update.service"),
+        "{log}"
+    );
+}
+
+#[test]
+fn self_update_dev_channel_takes_dev_release() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let fx = SelfFixture::new(
+        &[
+            ("v0.3.6", "#!/bin/sh\necho 'tuishou v0.3.6'\n"),
+            (
+                "v0.3.7-dev.1.gabc",
+                "#!/bin/sh\necho 'tuishou v0.3.7-dev.1.gabc'\n",
+            ),
+        ],
+        "self = true\nchannel = \"dev\"\n",
+        "v0.3.5",
+    );
+    let out = fx.command().output().unwrap();
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(fx.bin.join("tuishou")).unwrap(),
+        "#!/bin/sh\necho 'tuishou v0.3.7-dev.1.gabc'\n"
+    );
+    assert_eq!(
+        fx.auto_state()["self_pending"]["version"],
+        "v0.3.7-dev.1.gabc"
+    );
+}
+
+#[test]
+fn self_update_verification_failure_leaves_binary_in_place() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let fx = SelfFixture::new(
+        &[("v0.3.6", "#!/bin/sh\necho 'tuishou v0.3.6'\n")],
+        "self = true\n",
+        "v0.3.5",
+    );
+    let out = fx
+        .command()
+        .env("TUISHOU_FAKE_ATTESTATION_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("fake attestation verification failed"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(fx.bin.join("tuishou")).unwrap(),
+        "#!/bin/sh\necho 'tuishou v0.3.5'\n"
+    );
+    assert!(!fx.bin.join("tuishou.prev").exists());
+    assert!(fx.auto_state()["self_pending"].is_null());
+    assert!(fx.auto_state()["bad_versions"]["tuishou"].is_null());
+}
+
+#[test]
+fn self_update_smoke_failure_marks_bad_and_keeps_binary() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let fx = SelfFixture::new(
+        &[("v0.3.6", "#!/bin/sh\nexit 1\n")],
+        "self = true\n",
+        "v0.3.5",
+    );
+    let out = fx.command().output().unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("smoke check failed"), "{stderr}");
+    assert_eq!(
+        fs::read_to_string(fx.bin.join("tuishou")).unwrap(),
+        "#!/bin/sh\necho 'tuishou v0.3.5'\n"
+    );
+    assert!(!fx.bin.join("tuishou.prev").exists());
+    assert!(fx.auto_state()["self_pending"].is_null());
+    assert_eq!(fx.auto_state()["bad_versions"]["tuishou"][0], "v0.3.6");
+}
+
+#[test]
+fn self_update_rolls_back_when_first_scheduled_pass_cannot_start() {
+    let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+    // The staged binary passes `--version` with output, then reports the old
+    // tag on the first scheduled pass. That is a startup mismatch, not a smoke
+    // failure, so it must roll back from `.prev`.
+    let fx = SelfFixture::new(
+        &[("v0.3.6", "#!/bin/sh\necho 'tuishou v0.3.5'\n")],
+        "self = true\n",
+        "v0.3.5",
+    );
+    let applied = fx.command().output().unwrap();
+    assert!(
+        applied.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    assert_eq!(fx.auto_state()["self_pending"]["version"], "v0.3.6");
+    assert_eq!(fx.installed_version(), "v0.3.6");
+
+    let checked = fx.command().output().unwrap();
+    assert!(!checked.status.success());
+    let state = fx.auto_state();
+    assert!(state["self_pending"].is_null());
+    assert_eq!(state["bad_versions"]["tuishou"][0], "v0.3.6");
+    let result = state["results"]["tuishou"]["result"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(result.contains("restored .prev"), "result={result}");
+    assert_eq!(
+        fs::read_to_string(fx.bin.join("tuishou")).unwrap(),
+        "#!/bin/sh\necho 'tuishou v0.3.5'\n"
+    );
+    assert_eq!(fx.installed_version(), "v0.3.5");
+}
