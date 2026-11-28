@@ -26,7 +26,7 @@ test-hooks = []
 [dependencies]
 base64 = "=0.22.1"
 clap = { version = "4", features = ["derive", "env"] }
-const-oid = "=0.10.2"
+const-oid = "=0.10.3"
 crossterm = { version = "0.29", optional = true }
 flate2 = "1"
 portable-pty = { version = "0.9", optional = true }
