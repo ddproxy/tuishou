@@ -4359,7 +4359,7 @@ dependencies = [
 name = "tuishou"
 version = "0.3.6"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "clap",
  "const-oid 0.10.2",
  "crossterm",
