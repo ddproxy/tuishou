@@ -46,7 +46,7 @@ time = { version = "0.3", features = ["formatting", "parsing", "serde", "std"] }
 toml = "1.2"
 tui-term = { version = "0.3.4", optional = true }
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
-vt100 = { version = "=0.16.2", optional = true }
+vt100 = { version = "=0.18.1", optional = true }
 x509-cert = { version = "=0.3.0", features = ["pem"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -55,7 +55,7 @@ signal-hook = { version = "0.3", optional = true }
 
 [dev-dependencies]
 portable-pty = "0.9"
-vt100 = "=0.16.2"
+vt100 = "=0.18.1"
 
 [profile.release]
 lto = true
